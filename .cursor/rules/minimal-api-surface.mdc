@@ -1,0 +1,20 @@
+---
+description: Solo iteration — minimal API surface, no compatibility toggles, breaking changes OK
+alwaysApply: true
+---
+
+# Minimal surface area (solo iteration)
+
+**Audience:** Any AI or human editing this repo (Cursor, GitHub Copilot, Claude, Gemini, etc.).
+
+## Defaults
+
+1. **Prefer minimal surface area** — Fewer CLI flags, env vars, `**kwargs` passthroughs, feature toggles, and config structs. One obvious way to do things beats supporting every historical variant.
+
+2. **Avoid compatibility / migration flags** when iterating alone — Do not add “legacy mode”, version switches, dual paths (e.g. apply behavior in both Python and exported graph), deprecation shims, or `if old_package` branches unless the user explicitly asks. Prefer requiring an updated artifact (e.g. re-export CoreML) over runtime detection.
+
+3. **Breaking API changes are fine** — Rename or remove functions, delete flags, and change signatures without keeping obsolete aliases “for compatibility”.
+
+## When unsure
+
+Choose the simpler implementation and state required setup in comments or docs near the entrypoint — **not** a new flag to paper over two worlds.
