@@ -7,7 +7,7 @@
 uv sync
 
 # Export Gemma4-E2B to CoreML — one-time, takes 10–30 min
-uv run gemma-export-decode
+uv run gemma-export
 
 # Run the chat TUI (requires .mlpackage to exist)
 uv run gemma-chat
@@ -23,12 +23,12 @@ There is no test suite.
 
 This is a two-phase pipeline for running `google/gemma-4-E2B-it` locally on Apple Silicon via CoreML:
 
-**Phase 1 — Export (`gemma-export-decode`, run once):**
+**Phase 1 — Export (`gemma-export`, run once):**
 1. `weight_mapper.py` downloads HuggingFace safetensors and maps them to a nested Flax param dict (transposing all Linear kernels from `[out, in]` to `[in, out]`).
 2. `model.py` defines the full Gemma4 transformer in JAX/Flax (`Gemma4Transformer`).
 3. `decode_coreml.py` provides JAX-traceable `chunk_prefill_step` and `decode_step` functions that operate on a flat KV cache (30 arrays for 15 non-shared layers × k + v). These are designed for lowering to StableHLO.
 4. `cache_spec.py` defines the KV-cache layout: 15 caches (12 sliding ring-buffers + 3 global) for the 35-layer model. Layers 15–34 are KV-shared and read from layers 13 (sliding) and 14 (global).
-5. `export_decode.py` traces both functions with `jax.jit(...).lower(...).compiler_ir('stablehlo')`, converts each to CoreML MIL via `stablehlo-coreml`, then merges them into a single multifunction `.mlpackage` using `MultiFunctionDescriptor` with shared (int8-quantized) weights.
+5. `export.py` traces both functions with `jax.jit(...).lower(...).compiler_ir('stablehlo')`, converts each to CoreML MIL via `stablehlo-coreml`, then merges them into a single multifunction `.mlpackage` using `MultiFunctionDescriptor` with shared (int8-quantized) weights.
 
 **Phase 2 — Chat (`gemma-chat`, runtime):**
 - `generate.py` loads the multifunction `.mlpackage` (prefill + decode functions) and runs KV-cached autoregressive inference. Chunked prefill processes the prompt in `CHUNK_SIZE=8` token chunks, then single-token decode generates new tokens with temperature + top-p sampling. Also provides a legacy full-sequence `generate()` path.
@@ -45,9 +45,9 @@ This is a two-phase pipeline for running `google/gemma-4-E2B-it` locally on Appl
 - `RMSNorm` and `softmax` explicitly cast to `float32` before computing to prevent fp16 underflow/overflow (e.g., `exp(30) > fp16 max`). Return values stay `float32` so JAX inserts explicit casts in StableHLO — this is intentional and required.
 - `bfloat16` params are converted to `float16` before tracing because the MLIR Python bindings cannot extract raw bytes from `bfloat16 DenseFPElementsAttr`.
 
-**Export pipeline gotchas in `export_decode.py`:**
+**Export pipeline gotchas in `export.py`:**
 - Three passes are explicitly removed from the pipeline: `add_fp16_cast` (would override fp32 paths and cause NaN), `fuse_layernorm_or_instancenorm`, and `fuse_elementwise_to_batchnorm` (produce incorrect fusions for this model).
-- **On-the-fly weight compression:** PyPI stablehlo-coreml does not ship a constant-lowering hook. `gemma_chat/stablehlo_streaming_patch.py` monkey-patches `StableHloConverter.op_constant` so large weights become int8 `constexpr_blockwise_shift_scale` during StableHLO→MIL, capping how much fp16 MIL is resident at once (critical on ~16 GB hosts). Gemma-specific rules (threshold 2048, fp32→fp16+cast for XLA-folded constants) stay in `export_decode.py`.
+- **On-the-fly weight compression:** PyPI stablehlo-coreml does not ship a constant-lowering hook. `gemma_chat/stablehlo_streaming_patch.py` monkey-patches `StableHloConverter.op_constant` so large weights become int8 `constexpr_blockwise_shift_scale` during StableHLO→MIL, capping how much fp16 MIL is resident at once (critical on ~16 GB hosts). Gemma-specific rules (threshold 2048, fp32→fp16+cast for XLA-folded constants) stay in `export.py`.
 - **MIL pass pipeline:** `gemma_chat/mil_passes/ct_convert_pipeline.py` builds `deepcopy(PassPipeline.DEFAULT)`, inserts `quantize_const_weights` at index 0, then appends: `remove_noop_slice_update`, `replace_erf_gelu`, `collapse_reshape_chains`, `remove_redundant_maximum`, `remove_broadcast_tiles`. Additionally, `replace_scalar_broadcasts` is appended to the **backend** `_BACKEND_MIL_PASSES` pipeline (which runs after the main pipeline and contains `const_elimination` passes that re-fold `fill` ops). Export then removes the three problematic passes listed above.
 - The model must be saved **before** any `del`/`gc.collect()`. coremltools uses multiprocessing internally; GC can trigger `sys.exit()` on macOS/Python 3.12 before the save completes.
 - Always use a **fresh** pipeline object from `build_ct_convert_pass_pipeline()` before `remove_passes()` — do not mutate stablehlo-coreml’s module-level `DEFAULT_HLO_PIPELINE` in place.

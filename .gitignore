@@ -16,3 +16,9 @@ wheels/
 
 # IDE / editor
 .cursor/debug-*.log
+*.xcuserstate
+.DS_Store
+
+# Downloaded at build time (31 MB HuggingFace tokenizer vocab)
+ios/GemmaChat/GemmaChat/Resources/tokenizer.json
+.vscode/

@@ -28,7 +28,7 @@ dependencies = [
 
 [project.scripts]
 # Export prefill + decode CoreML models (run once, ~10-30 min):
-gemma-export-decode = "gemma_chat.export_decode:main"
+gemma-export = "gemma_chat.export:main"
 # Run the chat REPL (requires exported .mlpackage to exist):
 gemma-chat = "gemma_chat.chat:main"
 gemma-compare-inference = "gemma_chat.compare_inference:main"

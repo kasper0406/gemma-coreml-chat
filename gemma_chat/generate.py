@@ -28,7 +28,7 @@ def _validate_decode_step_inputs(_spec_m: ct.models.MLModel, package_path: str) 
         raise ValueError(
             f"The package {package_path!r} is a prefill model (first input shape {shape0}, rank 2). "
             "Use the decode-step .mlpackage with --decode-model "
-            "(e.g. gemma4-e2b-decode.mlpackage from `uv run gemma-export-decode`), "
+            "(e.g. gemma4-e2b-decode.mlpackage from `uv run gemma-export`), "
             "not *_prefill.mlpackage."
         )
 
@@ -44,7 +44,7 @@ def _validate_prefill_inputs(_spec_m: ct.models.MLModel, package_path: str) -> N
         raise ValueError(
             f"The package {package_path!r} does not look like a prefill model "
             f"(first input shape {shape0}, expected rank 2). "
-            "Use *_prefill.mlpackage from `uv run gemma-export-decode --prefill-only` "
+            "Use *_prefill.mlpackage from `uv run gemma-export --prefill-only` "
             "or the full export with prefill."
         )
 
@@ -141,7 +141,7 @@ def load_coreml_model(
     if not path.exists():
         raise FileNotFoundError(
             f"CoreML model not found at {path}.\n"
-            "Run  uv run gemma-export-decode  first to produce the .mlpackage."
+            "Run  uv run gemma-export  first to produce the .mlpackage."
         )
 
     fn_label = f" (function={function_name})" if function_name else ""
@@ -402,15 +402,18 @@ def generate_kvcached(
                     f"Prefill model token input shape is {_token_shape} but "
                     f"expected {_expected} (CHUNK_SIZE={CHUNK_SIZE}). "
                     f"The .mlpackage is stale — re-export with:  "
-                    f"uv run gemma-export-decode"
+                    f"uv run gemma-export"
                 )
 
-        _kv_inputs = _all_inputs[2:]
-        pref_kv_state = {
-            inp.name: np.zeros(tuple(inp.type.multiArrayType.shape), dtype=np.float16)
-            for inp in _kv_inputs
-        }
-        del _spec_m, _all_inputs, _kv_inputs
+        _state_inputs = _all_inputs[2:]
+        pref_kv_state = {}
+        for inp in _state_inputs:
+            shape = tuple(inp.type.multiArrayType.shape)
+            if len(shape) == 2:  # (1, W) — sliding_pos_ring
+                pref_kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
+            else:  # (1, cache_len, nkv, hd) — KV cache
+                pref_kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
+        del _spec_m, _all_inputs, _state_inputs
 
         # Pad prompt to a multiple of CHUNK_SIZE
         n_chunks = (n_real + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -474,10 +477,13 @@ def generate_kvcached(
                     break
         else:
             _kv_inputs = list(_spec_m._spec.description.input)[2:]
-        kv_state = {
-            inp.name: np.zeros(tuple(inp.type.multiArrayType.shape), dtype=np.float16)
-            for inp in _kv_inputs
-        }
+        kv_state = {}
+        for inp in _kv_inputs:
+            shape = tuple(inp.type.multiArrayType.shape)
+            if len(shape) == 2:  # (1, W) — sliding_pos_ring
+                kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
+            else:  # (1, cache_len, nkv, hd) — KV cache
+                kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
         del _spec_m, _kv_inputs
 
         if verbose:

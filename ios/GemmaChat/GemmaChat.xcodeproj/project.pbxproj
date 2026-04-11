@@ -1,0 +1,440 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0D38ADFB71D788D22DAC13A0 /* Sampling.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9206056C512B4DCEEFE732B9 /* Sampling.swift */; };
+		0EF5F0A7D09591A844EC8DF4 /* GemmaChatApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B207F2CD85633210FFEA839E /* GemmaChatApp.swift */; };
+		0F3B986759B5EA5648896819 /* GemmaTokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C9C76ACFC785CB033D9EF63 /* GemmaTokenizer.swift */; };
+		132907DAF33CF3D94834600C /* CoreMLModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE4027786B0488160649B6F /* CoreMLModel.swift */; };
+		143A5182C11E6A95E6D9967F /* tokenizer.json in Resources */ = {isa = PBXBuildFile; fileRef = DDF3991E8FA675F13C45EA33 /* tokenizer.json */; };
+		270D9ABF1FCCC6706138668F /* GemmaConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03CA86D053E179B0CA9EAAE2 /* GemmaConfig.swift */; };
+		35C03FF0BCC7DEF24DB101F0 /* MessageBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = 60D0BEA6428CC562BE8B8A7E /* MessageBubble.swift */; };
+		482677552DBA145345B4FD33 /* ChatMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5CB91BD73CC63ECF23B7262 /* ChatMessage.swift */; };
+		5A948A4CBA704F08D9416C5E /* EagerPrefillManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 301C1490FBACE054E8287E43 /* EagerPrefillManager.swift */; };
+		5DEFE9B80827603380AE4639 /* gemma4-e2b.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 9F6A5021B26F8BEE5664BF4E /* gemma4-e2b.mlpackage */; };
+		6F60A6A0878DAFCFE884FE9F /* config.json in Resources */ = {isa = PBXBuildFile; fileRef = E9FB0E31BD81B9397D163213 /* config.json */; };
+		7B057D2F74679227B2CF17E9 /* KVCacheState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 081C9D09BFB72F618F63DD36 /* KVCacheState.swift */; };
+		94C38FC1EEB03F785CD1D55F /* InferenceEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E4DE3D585F9805AF3A78641 /* InferenceEngine.swift */; };
+		9FAB898F1BE20CAE7B34DC8D /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 212C9030150A4483E72711EE /* ChatView.swift */; };
+		CCBFCB69EE6EBA9944C6F95B /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = DBE99217AA42A8768A68756F /* Transformers */; };
+		D55164855146D4118CDFC7E3 /* ChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFC71D0F71CB221FE0AE597C /* ChatViewModel.swift */; };
+		F3135014CE0F7AF95CCA47BF /* tokenizer_config.json in Resources */ = {isa = PBXBuildFile; fileRef = EE51E05D34E00FA9573429E4 /* tokenizer_config.json */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		03CA86D053E179B0CA9EAAE2 /* GemmaConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GemmaConfig.swift; sourceTree = "<group>"; };
+		081C9D09BFB72F618F63DD36 /* KVCacheState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KVCacheState.swift; sourceTree = "<group>"; };
+		212C9030150A4483E72711EE /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		301C1490FBACE054E8287E43 /* EagerPrefillManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EagerPrefillManager.swift; sourceTree = "<group>"; };
+		60D0BEA6428CC562BE8B8A7E /* MessageBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBubble.swift; sourceTree = "<group>"; };
+		6E4DE3D585F9805AF3A78641 /* InferenceEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceEngine.swift; sourceTree = "<group>"; };
+		9206056C512B4DCEEFE732B9 /* Sampling.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sampling.swift; sourceTree = "<group>"; };
+		99D203A78BE71B7A78428056 /* GemmaChat.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = GemmaChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9C9C76ACFC785CB033D9EF63 /* GemmaTokenizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GemmaTokenizer.swift; sourceTree = "<group>"; };
+		9F6A5021B26F8BEE5664BF4E /* gemma4-e2b.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "gemma4-e2b.mlpackage"; path = "../../gemma4-e2b.mlpackage"; sourceTree = SOURCE_ROOT; };
+		A5CB91BD73CC63ECF23B7262 /* ChatMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
+		B207F2CD85633210FFEA839E /* GemmaChatApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GemmaChatApp.swift; sourceTree = "<group>"; };
+		CFC71D0F71CB221FE0AE597C /* ChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatViewModel.swift; sourceTree = "<group>"; };
+		DDE4027786B0488160649B6F /* CoreMLModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreMLModel.swift; sourceTree = "<group>"; };
+		DDF3991E8FA675F13C45EA33 /* tokenizer.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = tokenizer.json; sourceTree = "<group>"; };
+		E9FB0E31BD81B9397D163213 /* config.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = config.json; sourceTree = "<group>"; };
+		EE51E05D34E00FA9573429E4 /* tokenizer_config.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = tokenizer_config.json; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		87FD223E9328E882B51ECE9A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CCBFCB69EE6EBA9944C6F95B /* Transformers in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		20B97DB073748D8AA78F3D84 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				99D203A78BE71B7A78428056 /* GemmaChat.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		2ACAAD9D575640D6ED1579C1 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				E9FB0E31BD81B9397D163213 /* config.json */,
+				EE51E05D34E00FA9573429E4 /* tokenizer_config.json */,
+				DDF3991E8FA675F13C45EA33 /* tokenizer.json */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		3DA8B755C3483AE934AFD4A9 = {
+			isa = PBXGroup;
+			children = (
+				E05382E43C1AF15465767EFA /* gemma-coreml-chat */,
+				5C4C56DC43A4AF0066B869FA /* GemmaChat */,
+				20B97DB073748D8AA78F3D84 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		5177EED4F2A34AF0A2FE9651 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				212C9030150A4483E72711EE /* ChatView.swift */,
+				CFC71D0F71CB221FE0AE597C /* ChatViewModel.swift */,
+				60D0BEA6428CC562BE8B8A7E /* MessageBubble.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		5BA0EB253FD8155D71EEC695 /* EagerPrefill */ = {
+			isa = PBXGroup;
+			children = (
+				301C1490FBACE054E8287E43 /* EagerPrefillManager.swift */,
+			);
+			path = EagerPrefill;
+			sourceTree = "<group>";
+		};
+		5C4C56DC43A4AF0066B869FA /* GemmaChat */ = {
+			isa = PBXGroup;
+			children = (
+				B207F2CD85633210FFEA839E /* GemmaChatApp.swift */,
+				5BA0EB253FD8155D71EEC695 /* EagerPrefill */,
+				ABF8B89D803C2762ACD6DBDF /* Model */,
+				2ACAAD9D575640D6ED1579C1 /* Resources */,
+				5177EED4F2A34AF0A2FE9651 /* Views */,
+			);
+			path = GemmaChat;
+			sourceTree = "<group>";
+		};
+		ABF8B89D803C2762ACD6DBDF /* Model */ = {
+			isa = PBXGroup;
+			children = (
+				A5CB91BD73CC63ECF23B7262 /* ChatMessage.swift */,
+				DDE4027786B0488160649B6F /* CoreMLModel.swift */,
+				03CA86D053E179B0CA9EAAE2 /* GemmaConfig.swift */,
+				9C9C76ACFC785CB033D9EF63 /* GemmaTokenizer.swift */,
+				6E4DE3D585F9805AF3A78641 /* InferenceEngine.swift */,
+				081C9D09BFB72F618F63DD36 /* KVCacheState.swift */,
+				9206056C512B4DCEEFE732B9 /* Sampling.swift */,
+			);
+			path = Model;
+			sourceTree = "<group>";
+		};
+		E05382E43C1AF15465767EFA /* gemma-coreml-chat */ = {
+			isa = PBXGroup;
+			children = (
+				9F6A5021B26F8BEE5664BF4E /* gemma4-e2b.mlpackage */,
+			);
+			name = "gemma-coreml-chat";
+			path = ../..;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		FE4756A868FB061E8E2BCAED /* GemmaChat */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 04184034176D3B68C329A079 /* Build configuration list for PBXNativeTarget "GemmaChat" */;
+			buildPhases = (
+				40BC2699CBA4970D3CF2A9FA /* Sources */,
+				BE276FA614DCE73BBF7AFAAD /* Resources */,
+				87FD223E9328E882B51ECE9A /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = GemmaChat;
+			packageProductDependencies = (
+				DBE99217AA42A8768A68756F /* Transformers */,
+			);
+			productName = GemmaChat;
+			productReference = 99D203A78BE71B7A78428056 /* GemmaChat.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		BDE7A0DFB1AE8E7D30DB3E75 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = 69B405611ED2DFD8A453882A /* Build configuration list for PBXProject "GemmaChat" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 3DA8B755C3483AE934AFD4A9;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				39696FEF65248C1EBD344EA8 /* XCRemoteSwiftPackageReference "swift-transformers" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 20B97DB073748D8AA78F3D84 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				FE4756A868FB061E8E2BCAED /* GemmaChat */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		BE276FA614DCE73BBF7AFAAD /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6F60A6A0878DAFCFE884FE9F /* config.json in Resources */,
+				5DEFE9B80827603380AE4639 /* gemma4-e2b.mlpackage in Resources */,
+				143A5182C11E6A95E6D9967F /* tokenizer.json in Resources */,
+				F3135014CE0F7AF95CCA47BF /* tokenizer_config.json in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		40BC2699CBA4970D3CF2A9FA /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				482677552DBA145345B4FD33 /* ChatMessage.swift in Sources */,
+				9FAB898F1BE20CAE7B34DC8D /* ChatView.swift in Sources */,
+				D55164855146D4118CDFC7E3 /* ChatViewModel.swift in Sources */,
+				132907DAF33CF3D94834600C /* CoreMLModel.swift in Sources */,
+				5A948A4CBA704F08D9416C5E /* EagerPrefillManager.swift in Sources */,
+				0EF5F0A7D09591A844EC8DF4 /* GemmaChatApp.swift in Sources */,
+				270D9ABF1FCCC6706138668F /* GemmaConfig.swift in Sources */,
+				0F3B986759B5EA5648896819 /* GemmaTokenizer.swift in Sources */,
+				94C38FC1EEB03F785CD1D55F /* InferenceEngine.swift in Sources */,
+				7B057D2F74679227B2CF17E9 /* KVCacheState.swift in Sources */,
+				35C03FF0BCC7DEF24DB101F0 /* MessageBubble.swift in Sources */,
+				0D38ADFB71D788D22DAC13A0 /* Sampling.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		131CB6228B760D805296EB77 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Gemma Chat";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gemma.chat;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		1A18C86CE989655FCF107194 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		423934B7380C288E041FA91D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		F55F863DB038E266FDCE9494 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Gemma Chat";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gemma.chat;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		04184034176D3B68C329A079 /* Build configuration list for PBXNativeTarget "GemmaChat" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F55F863DB038E266FDCE9494 /* Debug */,
+				131CB6228B760D805296EB77 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		69B405611ED2DFD8A453882A /* Build configuration list for PBXProject "GemmaChat" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A18C86CE989655FCF107194 /* Debug */,
+				423934B7380C288E041FA91D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		39696FEF65248C1EBD344EA8 /* XCRemoteSwiftPackageReference "swift-transformers" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/huggingface/swift-transformers";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.1.12;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		DBE99217AA42A8768A68756F /* Transformers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 39696FEF65248C1EBD344EA8 /* XCRemoteSwiftPackageReference "swift-transformers" */;
+			productName = Transformers;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = BDE7A0DFB1AE8E7D30DB3E75 /* Project object */;
+}

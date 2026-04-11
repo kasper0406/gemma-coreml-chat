@@ -44,7 +44,7 @@ def main() -> None:
         "--decode-model",
         type=Path,
         required=True,
-        help="Decode-step .mlpackage from gemma-export-decode",
+        help="Decode-step .mlpackage from gemma-export",
     )
     parser.add_argument(
         "--prompt",
