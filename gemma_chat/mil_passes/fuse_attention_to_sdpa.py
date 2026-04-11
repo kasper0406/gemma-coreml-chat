@@ -1,25 +1,28 @@
 """MIL pass: fuse decomposed attention into ``scaled_dot_product_attention``.
 
-After ``replace_decomposed_softmax`` runs, each attention layer appears as::
+After ``replace_decomposed_softmax`` runs (and with cleanup passes having
+removed noop slice_updates, broadcast tiles, and redundant maximums), each
+attention layer appears as::
 
-    K_t = transpose(K, perm=..., -2, -1)         # swap last two dims
-    scores = matmul(Q, K_t)                       # [B, H, L, S]
-    masked = select(bool_mask, scores, -10000.0)  # causal/sliding mask
-    [casted = cast(masked, fp32)]                  # optional fp32 cast
-    weights = softmax(casted_or_masked, axis=-1)   # attention weights
-    out = matmul(weights, V)                       # [B, H, L, Hd]
+    Q_4d [B,H,L,E]   → reshape → Q_3d [BH,L,E]
+    K_4d [B,H,S,E]   → transpose(swap B↔H) → reshape → K_3d [BH,S,E]
+    matmul(Q_3d, K_3d, transpose_y=True) → scores_3d [BH,L,S]
+      → reshape → transpose → scores_4d [B,H,L,S]
+    select(mask, scores_4d, -10000)
+    [cast(fp32)]
+    softmax(axis=-1) → weights_4d [B,H,L,S]
+      → reshape → weights_3d [BH,L,S]
+    V_4d [B,H,S,EV]  → transpose(swap B↔H, swap S↔EV) → reshape → V_3d [BH,EV,S]
+    matmul(weights_3d, V_3d, transpose_y=True) → out_3d [BH,L,EV]
+      → reshape → transpose → out_4d [B,H,L,EV]
 
-CoreML iOS18 has a native ``scaled_dot_product_attention`` op that fuses
-the entire chain into a single hardware-accelerated instruction::
+This pass replaces the entire chain with a single SDPA op at rank 4::
 
-    out = sdpa(Q_scaled, K, V, attn_mask)
+    Q_prescaled = Q_4d * sqrt(E)
+    out_4d = sdpa(Q_prescaled, K_4d, V_4d, attn_mask=mask)
 
-The op always applies ``1/sqrt(E)`` scaling.  Gemma4 uses ``scale=1.0``
-(QK-norm absorbs the scaling), so Q is pre-multiplied by ``sqrt(E)``
-to cancel the built-in divisor:  ``(Q·√E) @ K^T / √E  =  Q @ K^T``.
-
-Counts from gemma4-e2b: 35 attention layers per function × 2 functions
-= 70 SDPA fusions expected.
+The ``sqrt(E)`` pre-scaling cancels SDPA's built-in ``1/sqrt(E)`` divisor,
+since Gemma4 uses ``scale=1.0`` (QK-norm absorbs the scaling).
 """
 
 from __future__ import annotations
@@ -30,190 +33,169 @@ from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-# Mask fill values in the range (-inf, -1000] are treated as "masked out".
 _MASK_FILL_THRESHOLD = -1000.0
-
-
-def _get_scalar_value(var):
-    """Return the uniform scalar value of a const/fill var, or None."""
-    val = var.val
-    if val is not None:
-        arr = np.asarray(val)
-        if arr.size == 0:
-            return None
-        first = float(arr.flat[0])
-        if arr.size == 1 or np.all(arr == first):
-            return first
-        return None
-    if var.op is not None and var.op.op_type == "fill":
-        v = var.op.inputs.get("value")
-        if v is not None and v.val is not None:
-            return float(v.val)
-    return None
 
 
 def _is_large_negative(var) -> bool:
     """True if var is a scalar/uniform constant ≤ -1000."""
-    sv = _get_scalar_value(var)
-    return sv is not None and sv <= _MASK_FILL_THRESHOLD
+    val = var.val
+    if val is not None:
+        arr = np.asarray(val)
+        if arr.size == 0:
+            return False
+        first = float(arr.flat[0])
+        if arr.size == 1 or np.all(arr == first):
+            return first <= _MASK_FILL_THRESHOLD
+        return False
+    if var.op is not None and var.op.op_type == "fill":
+        v = var.op.inputs.get("value")
+        if v is not None and v.val is not None:
+            return float(v.val) <= _MASK_FILL_THRESHOLD
+    return False
 
 
-def _peel_transpose(var):
-    """If *var* is produced by a transpose that swaps the last two dims,
-    return the un-transposed input.  Otherwise return None."""
-    if var.op is None or var.op.op_type != "transpose":
-        return None
-    perm_var = var.op.inputs.get("perm")
-    if perm_var is None or perm_var.val is None:
-        return None
-    perm = list(perm_var.val)
-    rank = len(perm)
-    if rank < 2:
-        return None
-    # Check that only the last two dims are swapped.
-    expected = list(range(rank))
-    expected[-2], expected[-1] = expected[-1], expected[-2]
-    if perm != expected:
-        return None
-    return var.op.inputs["x"]
+def _peel_back(var, *op_types):
+    """Trace backward through a sequence of ops, returning the ultimate input.
 
-
-def _match_attention(matmul2_op):
-    """Match a full attention pattern ending at *matmul2_op*.
-
-    Expected chain (working backward from matmul2_op)::
-
-        matmul2(weights, V)                    ← anchor
-          weights = softmax(·, axis=-1)
-            [· = cast(·, fp32)]                ← optional
-              · = select(mask, scores, -BIG)   ← optional mask
-                scores = matmul1(Q, K_t)
-                  K_t = transpose(K, swap_last_2)
-
-    Returns ``(Q_var, K_var, V_var, mask_var_or_None, all_dead_ops)`` or
-    ``None`` if the pattern does not match.
+    Returns ``(original_input, [op1, op2, ...])`` or ``(var, [])`` if
+    the chain doesn't match.  Each op must have its output consumed by the
+    next op in the chain (or be the starting var).
     """
-    if matmul2_op.op_type != "matmul":
+    ops = []
+    for ot in op_types:
+        if var.op is None or var.op.op_type != ot:
+            return var, ops
+        ops.append(var.op)
+        var = var.op.inputs["x"]
+    return var, ops
+
+
+def _peel_fwd_single(var, op_type):
+    """If *var* has exactly one consumer of type *op_type*, return its output."""
+    consumers = list(var.child_ops)
+    if len(consumers) == 1 and consumers[0].op_type == op_type:
+        return consumers[0].outputs[0], consumers[0]
+    return None, None
+
+
+def _match_sdpa(softmax_op):
+    """Match attention pattern anchored at a softmax op.
+
+    Returns ``(Q_4d, K_4d, V_4d, mask_var, E, out_4d, anchor_op, dead_ops)``
+    or ``None``.
+    """
+    if softmax_op.op_type != "softmax":
         return None
 
-    weights_var = matmul2_op.inputs["x"]
-    V_var = matmul2_op.inputs["y"]
-
-    # weights must come from softmax
-    if weights_var.op is None or weights_var.op.op_type != "softmax":
-        return None
-    softmax_op = weights_var.op
-
-    # Verify softmax axis is -1 (or last dim)
-    axis_var = softmax_op.inputs.get("axis")
-    if axis_var is not None and axis_var.val is not None:
-        axis = int(axis_var.val)
-        sm_input = softmax_op.inputs["x"]
-        if sm_input.rank is not None:
-            if axis < 0:
-                axis += sm_input.rank
-            if axis != sm_input.rank - 1:
-                return None
-        elif axis != -1:
-            return None
-
-    # Trace backward through optional cast(fp32)
-    pre_softmax = softmax_op.inputs["x"]
+    # ── backward from softmax: optional cast, optional select ────────
+    pre = softmax_op.inputs["x"]
     cast_op = None
-    if pre_softmax.op is not None and pre_softmax.op.op_type == "cast":
-        cast_op = pre_softmax.op
-        pre_softmax = cast_op.inputs["x"]
+    if pre.op is not None and pre.op.op_type == "cast":
+        cast_op = pre.op
+        pre = cast_op.inputs["x"]
 
-    # Look for select(mask, scores, large_negative) — the masking step
-    mask_var = None
     select_op = None
-    scores_var = pre_softmax
-
-    if pre_softmax.op is not None and pre_softmax.op.op_type == "select":
-        sel = pre_softmax.op
-        # select(cond=mask, a=scores, b=fill_value)
+    mask_var = None
+    scores_4d = pre
+    if pre.op is not None and pre.op.op_type == "select":
+        sel = pre.op
         if _is_large_negative(sel.inputs["b"]):
             mask_var = sel.inputs["cond"]
-            scores_var = sel.inputs["a"]
+            scores_4d = sel.inputs["a"]
             select_op = sel
-        # Also handle swapped: select(cond=mask, a=fill_value, b=scores)
-        # with inverted mask semantics — unlikely but defensive.
-        elif _is_large_negative(sel.inputs["a"]):
-            # Inverted: cond=True means masked-out. We'd need to negate.
-            # Skip for now — our JAX code always uses (cond, scores, fill).
-            pass
 
-    # scores must come from matmul1(Q, K_transposed)
-    if scores_var.op is None or scores_var.op.op_type != "matmul":
-        return None
-    matmul1_op = scores_var.op
-    Q_var = matmul1_op.inputs["x"]
-    K_t_var = matmul1_op.inputs["y"]
+    # ── scores_4d ← transpose ← reshape ← matmul_0 ─────────────────
+    scores_src, scores_unwrap = _peel_back(scores_4d, "transpose", "reshape")
+    if scores_src.op is None or scores_src.op.op_type != "matmul":
+        # Try without transpose (scores might be directly from reshape)
+        scores_src, scores_unwrap = _peel_back(scores_4d, "reshape")
+        if scores_src.op is None or scores_src.op.op_type != "matmul":
+            return None
 
-    # Check if matmul1 uses transpose_y=True
-    transpose_y = matmul1_op.inputs.get("transpose_y")
-    if transpose_y is not None and transpose_y.val is not None and transpose_y.val:
-        # K is passed directly with transpose_y=True
-        K_var = K_t_var
+    matmul_0 = scores_src.op
+    Q_3d = matmul_0.inputs["x"]
+    K_3d = matmul_0.inputs["y"]
+
+    # ── Q_4d ← reshape ← Q_3d ───────────────────────────────────────
+    Q_4d, q_prep = _peel_back(Q_3d, "reshape")
+
+    # ── K_4d ← transpose ← reshape ← K_3d ──────────────────────────
+    K_4d, k_prep = _peel_back(K_3d, "reshape", "transpose")
+    if not k_prep:
+        K_4d, k_prep = _peel_back(K_3d, "reshape")
+
+    # ── forward from softmax: reshape → matmul_1 ────────────────────
+    sm_out = softmax_op.outputs[0]
+    weights_3d, weights_reshape = _peel_fwd_single(sm_out, "reshape")
+    if weights_3d is not None:
+        # weights_3d → matmul_1
+        w_consumers = list(weights_3d.child_ops)
+        if len(w_consumers) != 1 or w_consumers[0].op_type != "matmul":
+            return None
+        matmul_1 = w_consumers[0]
     else:
-        # K_t must be produced by a transpose that swaps last two dims
-        K_var = _peel_transpose(K_t_var)
-        if K_var is None:
+        # Direct: softmax → matmul_1
+        consumers = list(sm_out.child_ops)
+        if len(consumers) != 1 or consumers[0].op_type != "matmul":
             return None
+        matmul_1 = consumers[0]
+        weights_reshape = None
 
-    # Validate shapes: Q, K, V must be rank >= 3
-    for v in (Q_var, K_var, V_var):
-        if v.rank is not None and v.rank < 3:
-            return None
+    # ── V_4d ← transpose ← reshape ← V_3d ──────────────────────────
+    V_3d = matmul_1.inputs["y"]
+    V_4d, v_prep = _peel_back(V_3d, "reshape", "transpose")
+    if not v_prep:
+        V_4d, v_prep = _peel_back(V_3d, "reshape")
 
-    # Validate: Q and K must share embedding dim (last dim)
-    q_shape = Q_var.shape
-    k_shape = K_var.shape
-    if (q_shape is not None and k_shape is not None
-            and q_shape[-1] is not None and k_shape[-1] is not None
-            and q_shape[-1] != k_shape[-1]):
+    # ── forward from matmul_1: reshape → transpose → out_4d ─────────
+    out_3d = matmul_1.outputs[0]
+    out_reshaped, out_reshape_op = _peel_fwd_single(out_3d, "reshape")
+    if out_reshaped is None:
+        return None
+    out_4d, out_transpose_op = _peel_fwd_single(out_reshaped, "transpose")
+    if out_4d is None:
         return None
 
-    # Collect all ops that will be dead after fusion
-    dead_ops = {matmul2_op, softmax_op, matmul1_op}
-    if cast_op is not None:
-        dead_ops.add(cast_op)
-    if select_op is not None:
-        dead_ops.add(select_op)
-    # The K transpose op (if it exists and has no other consumers)
-    if K_t_var.op is not None and K_t_var.op.op_type == "transpose":
-        k_transpose_op = K_t_var.op
-        all_consumers_dead = all(
-            child in dead_ops
-            for out in k_transpose_op.outputs
-            for child in out.child_ops
-        )
-        if all_consumers_dead:
-            dead_ops.add(k_transpose_op)
-    # The fill/const for the mask fill value
-    if select_op is not None:
+    # ── validate shapes ──────────────────────────────────────────────
+    if Q_4d.rank is not None and Q_4d.rank < 3:
+        return None
+    E = Q_4d.shape[-1] if Q_4d.shape is not None else None
+    if E is None or not isinstance(E, int):
+        return None
+
+    # ── collect dead ops ─────────────────────────────────────────────
+    dead = {matmul_0, matmul_1, softmax_op, out_reshape_op, out_transpose_op}
+    for op in scores_unwrap:
+        dead.add(op)
+    if select_op:
+        dead.add(select_op)
+    if cast_op:
+        dead.add(cast_op)
+    if weights_reshape:
+        dead.add(weights_reshape)
+
+    # Prep ops only if all their consumers are dead
+    for prep_op in list(q_prep) + list(k_prep) + list(v_prep):
+        if all(c in dead for o in prep_op.outputs for c in o.child_ops):
+            dead.add(prep_op)
+
+    # Fill value const for select
+    if select_op:
         fill_var = select_op.inputs["b"]
         if fill_var.op is not None:
-            all_consumers_dead = all(
-                child in dead_ops
-                for out in fill_var.op.outputs
-                for child in out.child_ops
-            )
-            if all_consumers_dead:
-                dead_ops.add(fill_var.op)
+            if all(c in dead for o in fill_var.op.outputs for c in o.child_ops):
+                dead.add(fill_var.op)
 
-    # Verify that intermediate vars have no consumers outside the dead set.
-    # If they do, we can't safely remove them.
-    for dead_op in list(dead_ops):
-        if dead_op is matmul2_op:
-            continue  # output of matmul2 will be replaced
-        for out_var in dead_op.outputs:
-            for consumer in out_var.child_ops:
-                if consumer not in dead_ops:
-                    # This op's output is used elsewhere — can't fuse.
+    # Safety: no dead op (except the final output) should have external consumers
+    for op in list(dead):
+        if op is out_transpose_op:
+            continue
+        for out in op.outputs:
+            for consumer in out.child_ops:
+                if consumer not in dead:
                     return None
 
-    return Q_var, K_var, V_var, mask_var, dead_ops
+    return Q_4d, K_4d, V_4d, mask_var, E, out_4d, out_transpose_op, dead
 
 
 @block_context_manager
@@ -225,49 +207,36 @@ def _replace_in_block(block):
         for b in op.blocks:
             changed |= _replace_in_block(b)
 
-        if op in removed:
+        if op in removed or op.op_type != "softmax":
             continue
 
-        result = _match_attention(op)
+        result = _match_sdpa(op)
         if result is None:
             continue
-        Q_var, K_var, V_var, mask_var, dead_ops = result
+        Q_4d, K_4d, V_4d, mask_var, E, out_4d, anchor_op, dead_ops = result
 
-        # Determine embedding dim for pre-scaling Q
-        E = Q_var.shape[-1] if Q_var.shape is not None else None
-        if E is None or isinstance(E, type(Q_var.shape[-1])) and not isinstance(E, int):
-            # Symbolic or unknown — skip fusion
-            continue
-
-        # Pre-scale Q by sqrt(E) to cancel SDPA's built-in 1/sqrt(E).
         from coremltools.converters.mil.mil import types as mil_types
-        q_dtype = Q_var.dtype
+        q_dtype = Q_4d.dtype
         scale_val = np.sqrt(float(E))
-        if q_dtype == mil_types.fp16:
-            scale_np = np.float16(scale_val)
-        else:
-            scale_np = np.float32(scale_val)
+        scale_np = np.float16(scale_val) if q_dtype == mil_types.fp16 else np.float32(scale_val)
 
         q_scaled = mb.mul(
-            x=Q_var,
-            y=scale_np,
-            before_op=op,
-            name=op.name + "_q_prescale",
+            x=Q_4d, y=scale_np,
+            before_op=anchor_op,
+            name=anchor_op.name + "_q_prescale",
         )
 
-        sdpa_var = mb.scaled_dot_product_attention(
-            query=q_scaled,
-            key=K_var,
-            value=V_var,
+        sdpa_out = mb.scaled_dot_product_attention(
+            query=q_scaled, key=K_4d, value=V_4d,
             attn_mask=mask_var,
-            before_op=op,
-            name=op.name + "_sdpa",
+            before_op=anchor_op,
+            name=anchor_op.name + "_sdpa",
         )
 
         block.replace_uses_of_var_after_op(
-            anchor_op=op,
-            old_var=op.outputs[0],
-            new_var=sdpa_var,
+            anchor_op=anchor_op,
+            old_var=out_4d,
+            new_var=sdpa_out,
             no_check_var_types=True,
         )
 

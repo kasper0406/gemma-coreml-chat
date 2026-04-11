@@ -36,21 +36,23 @@ def build_ct_convert_pass_pipeline():
     )
     import gemma_chat.mil_passes.quantize_const_weights  # noqa: F401
     import gemma_chat.mil_passes.replace_erf_gelu  # noqa: F401
-    import gemma_chat.mil_passes.replace_decomposed_softmax  # noqa: F401
-    import gemma_chat.mil_passes.fuse_attention_to_sdpa  # noqa: F401
     import gemma_chat.mil_passes.collapse_reshape_chains  # noqa: F401
     import gemma_chat.mil_passes.remove_redundant_maximum  # noqa: F401
     import gemma_chat.mil_passes.remove_broadcast_tiles  # noqa: F401
+    import gemma_chat.mil_passes.replace_decomposed_softmax  # noqa: F401
+    import gemma_chat.mil_passes.fuse_attention_to_sdpa  # noqa: F401
 
     _patch_backend_pipeline()
 
     pipeline = copy.deepcopy(ct.PassPipeline.DEFAULT)
     pipeline.insert_pass(0, "common::quantize_const_weights")
+    # Cleanup passes first — simplify the graph for fusion
     pipeline.append_pass("common::remove_noop_slice_update")
     pipeline.append_pass("common::replace_erf_gelu")
-    pipeline.append_pass("common::replace_decomposed_softmax")
-    pipeline.append_pass("common::fuse_attention_to_sdpa")
     pipeline.append_pass("common::collapse_reshape_chains")
     pipeline.append_pass("common::remove_redundant_maximum")
     pipeline.append_pass("common::remove_broadcast_tiles")
+    # Fusion passes — must run after cleanup
+    pipeline.append_pass("common::replace_decomposed_softmax")
+    pipeline.append_pass("common::fuse_attention_to_sdpa")
     return pipeline
