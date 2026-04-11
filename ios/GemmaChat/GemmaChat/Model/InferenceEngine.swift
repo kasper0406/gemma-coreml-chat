@@ -35,7 +35,6 @@ struct InferenceEngine: Sendable {
                         reserveForGeneration: maxNewTokens
                     )
                     let nReal = ids.count
-
                     // --- Chunked Prefill ---
                     var kvState: KVCacheState
                     var logits: MLMultiArray
