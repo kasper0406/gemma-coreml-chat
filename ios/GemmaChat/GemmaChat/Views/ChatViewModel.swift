@@ -148,6 +148,11 @@ final class ChatViewModel {
         streamingText = ""
         generatedTokenCount = 0
 
+        // Cancel any pending eager-prefill debounce to prevent a stale
+        // textChanged from running concurrently with generation.
+        prefillDebounceTask?.cancel()
+        prefillDebounceTask = nil
+
         generateTask = Task { [weak self] in
             guard let self else { return }
 
