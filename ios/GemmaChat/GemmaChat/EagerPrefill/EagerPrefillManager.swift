@@ -284,7 +284,7 @@ actor EagerPrefillManager {
                 kvState = newKV
                 lastLogits = logits
                 completedChunks = chunkIdx + 1
-                checkpoints.append(kvState)
+                checkpoints.append(kvState.deepCopy())
                 prefillTokens = tokens
 
                 let chunkTime = CFAbsoluteTimeGetCurrent() - chunkStart
