@@ -271,8 +271,8 @@ def export_chunk_prefill(
              k_0, v_0, ..., k_14, v_14 — current KV cache arrays float16
              sliding_pos_ring (1, sliding_window_size) int32 — ring position tracker
     Outputs: logits (chunk_size, vocab_size) float32
-             k_0, v_0, ..., k_14, v_14 — updated KV cache arrays float16
-             sliding_pos_ring (1, sliding_window_size) int32 — updated ring tracker
+             k_0_out, v_0_out, ..., k_14_out, v_14_out — updated KV cache float16
+             sliding_pos_ring_out (1, sliding_window_size) int32 — updated ring
     """
     import gc
     import numpy as np
@@ -356,10 +356,13 @@ def export_chunk_prefill(
         print("=" * 60)
         n_kv = len(kv_shapes)
         kv_names = _build_kv_names(n_kv)
+        # Output names use _out suffix to avoid SSA variable shadowing in MLProgram
+        # (input and output cannot share a name in the same scope).
+        kv_out_names = [n + "_out" for n in kv_names]
         _hlo_to_mlpackage(
             hlo_module, output_path,
             input_names=["tokens", "start_position"] + kv_names + ["sliding_pos_ring"],
-            output_names=["logits"] + kv_names + ["sliding_pos_ring"],
+            output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
         )
     finally:
         gc.enable()
@@ -381,8 +384,8 @@ def export_decode_step(
              k_0, v_0, ..., k_14, v_14 — current KV cache arrays float16
              sliding_pos_ring (1, sliding_window_size) int32 — ring position tracker
     Outputs: logits (vocab_size,) float32
-             k_0, v_0, ..., k_14, v_14 — updated KV cache arrays float16
-             sliding_pos_ring (1, sliding_window_size) int32 — updated ring tracker
+             k_0_out, v_0_out, ..., k_14_out, v_14_out — updated KV cache float16
+             sliding_pos_ring_out (1, sliding_window_size) int32 — updated ring
     """
     import numpy as np
     import gc
@@ -472,10 +475,11 @@ def export_decode_step(
         print("=" * 60)
         n_kv = len(kv_shapes)
         kv_names = _build_kv_names(n_kv)
+        kv_out_names = [n + "_out" for n in kv_names]
         _hlo_to_mlpackage(
             hlo_module, output_path,
             input_names=["token_id", "position"] + kv_names + ["sliding_pos_ring"],
-            output_names=["logits"] + kv_names + ["sliding_pos_ring"],
+            output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
         )
     finally:
         gc.enable()

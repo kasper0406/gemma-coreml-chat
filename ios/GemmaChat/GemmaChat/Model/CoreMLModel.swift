@@ -222,12 +222,12 @@ final class CoreMLModel: @unchecked Sendable {
         }
         kvOutputs.sort { naturalCompare($0, $1) }
 
-        // Try name matching: input name ∈ output names → state
+        // Try name matching: input name ∈ output names (exact or with _out suffix) → state
         let stateOutputSet = Set(kvOutputs)
         var controlInputs: [String] = []
         var kvInputs: [String] = []
         for name in inputDescs.keys {
-            if stateOutputSet.contains(name) {
+            if stateOutputSet.contains(name) || stateOutputSet.contains(name + "_out") {
                 kvInputs.append(name)
             } else {
                 controlInputs.append(name)
