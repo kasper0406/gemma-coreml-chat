@@ -13,7 +13,7 @@ This project re-implements the Gemma 4 transformer in **JAX/Flax**, exports it t
 uv sync
 
 # 2. Export the model to CoreML (one-time, ~10-30 min)
-uv run gemma-export-decode
+uv run gemma-export
 
 # 3. Chat!
 uv run gemma-chat
@@ -23,9 +23,9 @@ uv run gemma-chat
 
 ## How it works
 
-**Step 1 — Export** (`gemma-export-decode`, run once):
+**Step 1 — Export** (`gemma-export`, run once):
 
-`weight_mapper.py` downloads the HF checkpoint, `model.py` defines the full transformer in JAX/Flax, and `export_decode.py` traces it via `jax.jit` → StableHLO → CoreML MIL, producing a single multifunction `.mlpackage` with both **chunked prefill** and **KV-cached decode** functions.
+`weight_mapper.py` downloads the HF checkpoint, `model.py` defines the full transformer in JAX/Flax, and `export.py` traces it via `jax.jit` → StableHLO → CoreML MIL, producing a single multifunction `.mlpackage` with both **chunked prefill** and **KV-cached decode** functions.
 
 **Step 2 — Chat** (`gemma-chat`):
 
@@ -36,7 +36,7 @@ Loads the `.mlpackage`, runs autoregressive inference with KV caching, and provi
 **Export options:**
 
 ```bash
-uv run gemma-export-decode                    # int8 weights → gemma4-e2b.mlpackage
+uv run gemma-export                            # int8 weights → gemma4-e2b.mlpackage
 ```
 
 **Chat options:**
@@ -71,6 +71,12 @@ uv run gemma-compare-inference --prompt "Hi"
 # JAX vs CoreML logit parity after prefill
 uv run gemma-parity-decode --max-tokens 8
 ```
+
+## iOS app
+
+An iOS SwiftUI chat app lives in `ios/GemmaChat/`. It uses the same exported `.mlpackage` for on-device inference.
+
+**First build:** The Xcode build phase automatically downloads `tokenizer.json` (~31 MB) from HuggingFace if it isn't already present. This requires network access once; subsequent builds are offline.
 
 ## License
 

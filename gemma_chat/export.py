@@ -6,9 +6,9 @@ processes CHUNK_SIZE tokens per call instead of the full sequence, enabling
 arbitrarily long contexts without quadratic memory growth.
 
 Usage:
-    uv run gemma-export-decode
-    uv run gemma-export-decode --output gemma4-e2b.mlpackage
-    uv run gemma-export-decode --skip-warmup   # save RAM on constrained machines
+    uv run gemma-export
+    uv run gemma-export --output gemma4-e2b.mlpackage
+    uv run gemma-export --skip-warmup   # save RAM on constrained machines
 """
 
 from __future__ import annotations
@@ -65,14 +65,63 @@ from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN
 from gemma_chat.model import Gemma4Transformer, Gemma4Config
 from gemma_chat.weight_mapper import load_params
 from gemma_chat.decode_coreml import (
-    chunk_prefill_step, decode_step, kv_cache_shapes, kv_non_shared_layers,
+    chunk_prefill_step, decode_step, empty_pos_ring, kv_cache_shapes,
+    kv_non_shared_layers,
 )
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────
 
 
-def _hlo_to_mlpackage(hlo_module, output_path: Path) -> None:
+def _build_kv_names(n_layers: int) -> list[str]:
+    """Return 30 KV cache names: ['k_0', 'v_0', 'k_1', 'v_1', ..., 'k_14', 'v_14']."""
+    names: list[str] = []
+    for i in range(n_layers):
+        names.append(f"k_{i}")
+        names.append(f"v_{i}")
+    return names
+
+
+def _rename_model_io(
+    cml_model,
+    input_names: list[str],
+    output_names: list[str],
+) -> None:
+    """Rename inputs and outputs on a single-function CoreML model (in-place).
+
+    Uses ``ct.utils.rename_feature`` which updates both the spec-level
+    ``FeatureDescription`` names **and** the MLProgram function input/output
+    names.  This is required for ``save_multifunction`` — its validator
+    checks that spec names and MLProgram names match.
+    """
+    from coremltools.models.utils import rename_feature
+
+    spec = cml_model._spec
+    desc = spec.description
+    if len(input_names) != len(desc.input):
+        raise ValueError(
+            f"input_names length {len(input_names)} != spec inputs {len(desc.input)}"
+        )
+    if len(output_names) != len(desc.output):
+        raise ValueError(
+            f"output_names length {len(output_names)} != spec outputs {len(desc.output)}"
+        )
+    # Rename inputs (old positional _argN → meaningful name).
+    for feat, new_name in zip(list(desc.input), input_names):
+        if feat.name != new_name:
+            rename_feature(spec, feat.name, new_name, rename_outputs=False)
+    # Rename outputs (old MIL op names → meaningful name).
+    for feat, new_name in zip(list(desc.output), output_names):
+        if feat.name != new_name:
+            rename_feature(spec, feat.name, new_name, rename_inputs=False)
+
+
+def _hlo_to_mlpackage(
+    hlo_module,
+    output_path: Path,
+    input_names: list[str] | None = None,
+    output_names: list[str] | None = None,
+) -> None:
     """Run hlo_to_mil → ct.convert → save in the current process.
 
     Streaming int8 quantization runs during HLO→MIL conversion and
@@ -191,6 +240,9 @@ def _hlo_to_mlpackage(hlo_module, output_path: Path) -> None:
 
     del mil_program, pipeline
 
+    if input_names or output_names:
+        _rename_model_io(cml_model, input_names or [], output_names or [])
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"  [convert {_os.getpid()}] saving to {output_path} …", flush=True)
     try:
@@ -217,8 +269,10 @@ def export_chunk_prefill(
     Inputs:  tokens (1, chunk_size) int32
              start_position (1,) int32  — absolute position of first token in chunk
              k_0, v_0, ..., k_14, v_14 — current KV cache arrays float16
+             sliding_pos_ring (1, sliding_window_size) int32 — ring position tracker
     Outputs: logits (chunk_size, vocab_size) float32
              k_0, v_0, ..., k_14, v_14 — updated KV cache arrays float16
+             sliding_pos_ring (1, sliding_window_size) int32 — updated ring tracker
     """
     import gc
     import numpy as np
@@ -252,30 +306,35 @@ def export_chunk_prefill(
     gc.disable()
     try:
         kv_shapes = kv_cache_shapes(config, max_seq_len)
+        pos_ring_shape = (1, config.sliding_window_size)
 
-        def chunk_prefill_fn(tokens, start_pos_1d, *kv_flat):
+        def chunk_prefill_fn(tokens, start_pos_1d, *kv_and_ring):
             """
             tokens: (1, chunk_size) int32
             start_pos_1d: (1,) int32 — absolute position of first token
-            kv_flat: 30 arrays of shape (1, max_seq_len, nkv, hd) float16
+            kv_and_ring: 30 KV arrays + 1 sliding_pos_ring
             """
+            kv_flat = list(kv_and_ring[:-1])
+            sliding_pos_ring = kv_and_ring[-1]
             start_pos = start_pos_1d[0]
-            logits, kv_new = chunk_prefill_step(
-                params, tokens, start_pos, list(kv_flat),
+            logits, kv_new, ring_new = chunk_prefill_step(
+                params, tokens, start_pos, kv_flat, sliding_pos_ring,
                 cfg=config, chunk_size=chunk_size, max_seq_len=max_seq_len,
             )
-            return (logits,) + tuple(kv_new)
+            return (logits,) + tuple(kv_new) + (ring_new,)
 
         kv_flat_shapes = []
         for shape in kv_shapes:
             kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # k
             kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # v
+        ring_shape = jax.ShapeDtypeStruct(pos_ring_shape, jnp.int32)
 
         print("  Lowering chunk_prefill_step to StableHLO …", flush=True)
         lowered = jax.jit(chunk_prefill_fn).lower(
             jax.ShapeDtypeStruct((1, chunk_size), jnp.int32),  # tokens
             jax.ShapeDtypeStruct((1,), jnp.int32),            # start_position
             *kv_flat_shapes,
+            ring_shape,                                        # sliding_pos_ring
         )
         hlo_module = lowered.compiler_ir('stablehlo')
         print("  Lowering OK.", flush=True)
@@ -295,7 +354,13 @@ def export_chunk_prefill(
         print("=" * 60)
         print("Chunk-prefill export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        _hlo_to_mlpackage(hlo_module, output_path)
+        n_kv = len(kv_shapes)
+        kv_names = _build_kv_names(n_kv)
+        _hlo_to_mlpackage(
+            hlo_module, output_path,
+            input_names=["tokens", "start_position"] + kv_names + ["sliding_pos_ring"],
+            output_names=["logits"] + kv_names + ["sliding_pos_ring"],
+        )
     finally:
         gc.enable()
 
@@ -314,8 +379,10 @@ def export_decode_step(
     Inputs:  token_id (1,) int32
              position (1,) int32  — absolute position of this token
              k_0, v_0, ..., k_14, v_14 — current KV cache arrays float16
+             sliding_pos_ring (1, sliding_window_size) int32 — ring position tracker
     Outputs: logits (vocab_size,) float32
              k_0, v_0, ..., k_14, v_14 — updated KV cache arrays float16
+             sliding_pos_ring (1, sliding_window_size) int32 — updated ring tracker
     """
     import numpy as np
     import gc
@@ -353,31 +420,37 @@ def export_decode_step(
     try:
         # Build KV cache shapes: one per non-shared layer; k and v share shape.
         kv_shapes = kv_cache_shapes(config, max_seq_len)  # list of 15 shapes
+        pos_ring_shape = (1, config.sliding_window_size)
 
-        def decode_fn(token_id_1d, position_1d, *kv_flat):
+        def decode_fn(token_id_1d, position_1d, *kv_and_ring):
             """
             token_id_1d: (1,) int32
             position_1d: (1,) int32 — absolute decode position
-            kv_flat: 30 arrays of shape (1, max_seq_len, nkv, hd) float16
+            kv_and_ring: 30 KV arrays + 1 sliding_pos_ring
             """
+            kv_flat = list(kv_and_ring[:-1])
+            sliding_pos_ring = kv_and_ring[-1]
             token_id = token_id_1d[0]
             position = position_1d[0]
-            logits, kv_new = decode_step(
-                params, token_id, position, list(kv_flat), cfg=config, max_seq_len=max_seq_len
+            logits, kv_new, ring_new = decode_step(
+                params, token_id, position, kv_flat, sliding_pos_ring,
+                cfg=config, max_seq_len=max_seq_len,
             )
-            return (logits,) + tuple(kv_new)
+            return (logits,) + tuple(kv_new) + (ring_new,)
 
         # Build shape specs for all inputs.
         kv_flat_shapes = []
         for shape in kv_shapes:
             kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # k
             kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # v
+        ring_shape = jax.ShapeDtypeStruct(pos_ring_shape, jnp.int32)
 
         print("  Lowering decode_step to StableHLO …", flush=True)
         lowered = jax.jit(decode_fn).lower(
             jax.ShapeDtypeStruct((1,), jnp.int32),   # token_id
             jax.ShapeDtypeStruct((1,), jnp.int32),   # position
             *kv_flat_shapes,
+            ring_shape,                               # sliding_pos_ring
         )
         hlo_module = lowered.compiler_ir('stablehlo')
         print("  Lowering OK.", flush=True)
@@ -397,7 +470,13 @@ def export_decode_step(
         print("=" * 60)
         print("Decode export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        _hlo_to_mlpackage(hlo_module, output_path)
+        n_kv = len(kv_shapes)
+        kv_names = _build_kv_names(n_kv)
+        _hlo_to_mlpackage(
+            hlo_module, output_path,
+            input_names=["token_id", "position"] + kv_names + ["sliding_pos_ring"],
+            output_names=["logits"] + kv_names + ["sliding_pos_ring"],
+        )
     finally:
         gc.enable()
 
