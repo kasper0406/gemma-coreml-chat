@@ -2,22 +2,31 @@
 
 After ``replace_decomposed_softmax`` runs (and with cleanup passes having
 removed noop slice_updates, broadcast tiles, and redundant maximums), each
-attention layer appears as::
+attention layer appears as a 3D batch-folded matmul pattern::
 
-    Q_4d [B,H,L,E]   → reshape → Q_3d [BH,L,E]
-    K_4d [B,H,S,E]   → transpose(swap B↔H) → reshape → K_3d [BH,S,E]
+    Q_raw [B,H,L,E]   → reshape → Q_3d [BH,L,E]
+    K_raw [H,B,S,E]   → reshape → K_3d [HB,S,E]
     matmul(Q_3d, K_3d, transpose_y=True) → scores_3d [BH,L,S]
       → reshape → transpose → scores_4d [B,H,L,S]
     select(mask, scores_4d, -10000)
     [cast(fp32)]
     softmax(axis=-1) → weights_4d [B,H,L,S]
       → reshape → weights_3d [BH,L,S]
-    V_4d [B,H,S,EV]  → transpose(swap B↔H, swap S↔EV) → reshape → V_3d [BH,EV,S]
+    V_raw [H,B,EV,S]  → reshape → V_3d [HB,EV,S]
     matmul(weights_3d, V_3d, transpose_y=True) → out_3d [BH,L,EV]
       → reshape → transpose → out_4d [B,H,L,EV]
 
+The batch-fold transposes before K and V reshapes have varying permutations
+depending on whether GQA repeat (``jnp.repeat``) precedes the layout
+transpose.  This pass peels back only through the reshape to get the raw
+4D tensors, then inserts explicit transposes to reach SDPA's required
+``[B, H, ?, ?]`` layout.
+
 This pass replaces the entire chain with a single SDPA op at rank 4::
 
+    Q_4d  = transpose(Q_raw) if needed     # [B,H,L,E]
+    K_4d  = transpose(K_raw, [1,0,2,3])    # [B,H,S,E]
+    V_4d  = transpose(V_raw, [1,0,3,2])    # [B,H,S,EV]
     Q_prescaled = Q_4d * sqrt(E)
     out_4d = sdpa(Q_prescaled, K_4d, V_4d, attn_mask=mask)
 
@@ -116,13 +125,15 @@ def _match_sdpa(softmax_op):
     Q_3d = matmul_0.inputs["x"]
     K_3d = matmul_0.inputs["y"]
 
-    # ── Q_4d ← reshape ← Q_3d ───────────────────────────────────────
-    Q_4d, q_prep = _peel_back(Q_3d, "reshape")
+    # ── Q_raw ← reshape ← Q_3d ──────────────────────────────────────
+    Q_raw, q_prep = _peel_back(Q_3d, "reshape")
+    if Q_raw.rank is None or Q_raw.rank < 4:
+        return None
 
-    # ── K_4d ← transpose ← reshape ← K_3d ──────────────────────────
-    K_4d, k_prep = _peel_back(K_3d, "reshape", "transpose")
-    if not k_prep:
-        K_4d, k_prep = _peel_back(K_3d, "reshape")
+    # ── K_raw ← reshape ← K_3d (peel reshape only, not transpose) ──
+    K_raw, k_prep = _peel_back(K_3d, "reshape")
+    if K_raw.rank is None or K_raw.rank < 4:
+        return None
 
     # ── forward from softmax: reshape → matmul_1 ────────────────────
     sm_out = softmax_op.outputs[0]
@@ -141,11 +152,11 @@ def _match_sdpa(softmax_op):
         matmul_1 = consumers[0]
         weights_reshape = None
 
-    # ── V_4d ← transpose ← reshape ← V_3d ──────────────────────────
+    # ── V_raw ← reshape ← V_3d (peel reshape only, not transpose) ──
     V_3d = matmul_1.inputs["y"]
-    V_4d, v_prep = _peel_back(V_3d, "reshape", "transpose")
-    if not v_prep:
-        V_4d, v_prep = _peel_back(V_3d, "reshape")
+    V_raw, v_prep = _peel_back(V_3d, "reshape")
+    if V_raw.rank is None or V_raw.rank < 4:
+        return None
 
     # ── forward from matmul_1: reshape → transpose → out_4d ─────────
     out_3d = matmul_1.outputs[0]
@@ -157,10 +168,15 @@ def _match_sdpa(softmax_op):
         return None
 
     # ── validate shapes ──────────────────────────────────────────────
-    if Q_4d.rank is not None and Q_4d.rank < 3:
+    if Q_raw.rank is not None and Q_raw.rank < 3:
         return None
-    E = Q_4d.shape[-1] if Q_4d.shape is not None else None
+    E = Q_raw.shape[-1] if Q_raw.shape is not None else None
     if E is None or not isinstance(E, int):
+        return None
+
+    # K embedding dim must match Q
+    K_E = K_raw.shape[-1] if K_raw.shape is not None else None
+    if K_E is not None and isinstance(K_E, int) and K_E != E:
         return None
 
     # ── collect dead ops ─────────────────────────────────────────────
@@ -195,7 +211,7 @@ def _match_sdpa(softmax_op):
                 if consumer not in dead:
                     return None
 
-    return Q_4d, K_4d, V_4d, mask_var, E, out_4d, out_transpose_op, dead
+    return Q_raw, K_raw, V_raw, mask_var, E, out_4d, out_transpose_op, dead
 
 
 @block_context_manager
@@ -213,7 +229,45 @@ def _replace_in_block(block):
         result = _match_sdpa(op)
         if result is None:
             continue
-        Q_4d, K_4d, V_4d, mask_var, E, out_4d, anchor_op, dead_ops = result
+        Q_raw, K_raw, V_raw, mask_var, E, out_4d, anchor_op, dead_ops = result
+
+        # ── Fix Q/K/V layouts for SDPA [B, H, ?, ?] ─────────────
+        # out_4d is always [B, H, L, EV] — use shape[0] as B reference.
+        B_ref = out_4d.shape[0] if out_4d.shape is not None else 1
+
+        # Q_raw: [B, H, L, E] (typical) or [H, B, L, E] (rare)
+        if Q_raw.shape[0] != B_ref:
+            Q_4d = mb.transpose(
+                x=Q_raw, perm=[1, 0, 2, 3],
+                before_op=anchor_op,
+                name=anchor_op.name + "_q_layout",
+            )
+        else:
+            Q_4d = Q_raw
+
+        # K_raw: [H, B, S, E] from batch-fold reshape
+        if K_raw.shape[0] != B_ref:
+            K_4d = mb.transpose(
+                x=K_raw, perm=[1, 0, 2, 3],
+                before_op=anchor_op,
+                name=anchor_op.name + "_k_layout",
+            )
+        else:
+            K_4d = K_raw
+
+        # V_raw: [..., EV, S] — always needs S↔EV swap, plus batch swap
+        if V_raw.shape[0] != B_ref:
+            V_4d = mb.transpose(
+                x=V_raw, perm=[1, 0, 3, 2],
+                before_op=anchor_op,
+                name=anchor_op.name + "_v_layout",
+            )
+        else:
+            V_4d = mb.transpose(
+                x=V_raw, perm=[0, 1, 3, 2],
+                before_op=anchor_op,
+                name=anchor_op.name + "_v_layout",
+            )
 
         from coremltools.converters.mil.mil import types as mil_types
         q_dtype = Q_4d.dtype

@@ -201,19 +201,25 @@ def test_softmax_alone():
 
 
 def test_gqa_attention():
-    """GQA with num_kv_heads=1, num_heads=8 (jnp.repeat before attention)."""
+    """GQA 8:1 with jnp.repeat + transpose (real Gemma4 pattern)."""
     def gqa_attention(q, k, v, mask):
-        k = jnp.repeat(k, 8, axis=1)  # [1,1,S,E] → [1,8,S,E]
-        v = jnp.repeat(v, 8, axis=1)
-        scores = jnp.matmul(q, jnp.swapaxes(k, -2, -1))
-        scores = jnp.where(mask, scores, jnp.float32(-10000.0))
+        # Real Gemma4 pattern: repeat on axis=2, then transpose to heads-first
+        k = jnp.repeat(k, 8, axis=2)   # [B,S,1,E] → [B,S,8,E]
+        v = jnp.repeat(v, 8, axis=2)
+        qt = jnp.transpose(q, (0, 2, 1, 3))  # [B,L,H,E] → [B,H,L,E]
+        kt = jnp.transpose(k, (0, 2, 1, 3))
+        vt = jnp.transpose(v, (0, 2, 1, 3))
+        scores = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))
+        scores = jnp.where(mask[jnp.newaxis, jnp.newaxis], scores, jnp.float32(-10000.0))
         weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
-        return jnp.matmul(weights, v)
+        out = jnp.matmul(weights, vt)
+        return jnp.transpose(out, (0, 2, 1, 3))
 
-    q = jnp.ones((1, 8, 1, 256), dtype=jnp.float32)
-    k = jnp.ones((1, 1, 128, 256), dtype=jnp.float32)
-    v = jnp.ones((1, 1, 128, 256), dtype=jnp.float32)
-    mask = jnp.ones((1, 1, 1, 128), dtype=jnp.bool_)
+    B, L, S, H, hd = 1, 8, 128, 8, 256
+    q = jnp.ones((B, L, H, hd), dtype=jnp.float32)
+    k = jnp.ones((B, S, 1, hd), dtype=jnp.float32)
+    v = jnp.ones((B, S, 1, hd), dtype=jnp.float32)
+    mask = jnp.ones((L, S), dtype=jnp.bool_)
 
     prog = _jax_to_mil(gqa_attention, q, k, v, mask)
     _full_pipeline(prog)
@@ -226,6 +232,45 @@ def test_gqa_attention():
     assert _count_ops(prog, "matmul") == 0
 
     print("  ✓ test_gqa_attention passed")
+
+
+def test_gqa_global_attention():
+    """GQA 8:1 with head_dim=512 (global attention layers)."""
+    def gqa_attention_global(q, k, v, mask):
+        k = jnp.repeat(k, 8, axis=2)
+        v = jnp.repeat(v, 8, axis=2)
+        qt = jnp.transpose(q, (0, 2, 1, 3))
+        kt = jnp.transpose(k, (0, 2, 1, 3))
+        vt = jnp.transpose(v, (0, 2, 1, 3))
+        scores = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))
+        scores = jnp.where(mask[jnp.newaxis, jnp.newaxis], scores, jnp.float32(-10000.0))
+        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
+        out = jnp.matmul(weights, vt)
+        return jnp.transpose(out, (0, 2, 1, 3))
+
+    B, L, S, H, hd = 1, 8, 128, 8, 512
+    q = jnp.ones((B, L, H, hd), dtype=jnp.float32)
+    k = jnp.ones((B, S, 1, hd), dtype=jnp.float32)
+    v = jnp.ones((B, S, 1, hd), dtype=jnp.float32)
+    mask = jnp.ones((L, S), dtype=jnp.bool_)
+
+    prog = _jax_to_mil(gqa_attention_global, q, k, v, mask)
+    _full_pipeline(prog)
+
+    sdpa_count = _count_ops(prog, "scaled_dot_product_attention")
+    assert sdpa_count == 1, f"Expected 1 SDPA for global GQA, got {sdpa_count}"
+    assert _count_ops(prog, "softmax") == 0
+    assert _count_ops(prog, "matmul") == 0
+
+    # Check scale factor: sqrt(512) ≈ 22.6
+    for op in prog.functions["main"].operations:
+        if op.op_type == "mul":
+            scale = float(op.inputs["y"].val)
+            expected = np.sqrt(512.0)
+            assert abs(scale - expected) < 0.1, \
+                f"Expected scale≈{expected:.1f}, got {scale}"
+
+    print("  ✓ test_gqa_global_attention passed")
 
 
 def test_graph_dump():
@@ -264,4 +309,5 @@ if __name__ == "__main__":
     test_sdpa_different_head_dim()
     test_softmax_alone()
     test_gqa_attention()
+    test_gqa_global_attention()
     print("\nAll tests passed ✓")
