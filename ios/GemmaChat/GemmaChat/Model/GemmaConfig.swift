@@ -24,6 +24,12 @@ enum GemmaConfig {
     /// EOS token ID for Gemma4.
     static let eosTokenID: Int32 = 1
 
+    /// End-of-turn token ID (``<turn|>``).
+    static let eotTokenID: Int32 = 106
+
+    /// All token IDs that should stop generation.
+    static let stopTokenIDs: Set<Int32> = [eosTokenID, eotTokenID]
+
     /// Pad token ID.
     static let padTokenID: Int32 = 0
 }

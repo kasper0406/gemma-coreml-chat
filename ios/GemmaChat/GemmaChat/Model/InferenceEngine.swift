@@ -99,7 +99,7 @@ struct InferenceEngine: Sendable {
                         )
                         continuation.yield(nextID)
 
-                        if nextID == GemmaConfig.eosTokenID { break }
+                        if GemmaConfig.stopTokenIDs.contains(nextID) { break }
                         if Task.isCancelled { break }
 
                         let position = Int32(nReal + step)

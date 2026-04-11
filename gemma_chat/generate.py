@@ -85,6 +85,20 @@ def load_tokenizer(model_id: str = HF_MODEL_ID):
     return tok
 
 
+def stop_token_ids(tokenizer) -> set[int]:
+    """Return the set of token IDs that should terminate generation.
+
+    Includes the EOS token and the end-of-turn token (``<turn|>`` for Gemma4).
+    """
+    ids = {tokenizer.eos_token_id}
+    eot = tokenizer.special_tokens_map.get("eot_token")
+    if eot is not None:
+        eot_id = tokenizer.convert_tokens_to_ids(eot)
+        if isinstance(eot_id, int) and eot_id != tokenizer.unk_token_id:
+            ids.add(eot_id)
+    return ids
+
+
 # ── CoreML model ───────────────────────────────────────────────────────────
 
 import re as _re
@@ -261,20 +275,20 @@ def generate(
     prompt_ids: list[int],
     cml_model: ct.models.MLModel,
     pad_id: int,
-    eos_id: int,
+    stop_ids: set[int],
     max_new_tokens: int = 256,
     temperature: float = 1.0,
     top_p: float = 0.9,
     max_seq_len: int = MAX_SEQ_LEN,
 ) -> Iterator[int]:
-    """Yield generated token IDs one at a time until EOS or max_new_tokens."""
+    """Yield generated token IDs one at a time until a stop token or max_new_tokens."""
     token_ids = list(prompt_ids)
 
     for _ in range(max_new_tokens):
         logits = _logits_at_last_token(cml_model, token_ids, pad_id, max_seq_len)
         next_id = sample_next_token(logits, temperature=temperature, top_p=top_p)
         yield next_id
-        if next_id == eos_id:
+        if next_id in stop_ids:
             break
         token_ids.append(next_id)
 
@@ -296,20 +310,20 @@ def generate_text(
     if prompt_ids is None:
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     pad_id = tokenizer.pad_token_id or 0
-    eos_id = tokenizer.eos_token_id
+    stop_ids = stop_token_ids(tokenizer)
 
     generated = []
     for token_id in generate(
         prompt_ids,
         cml_model=cml_model,
         pad_id=pad_id,
-        eos_id=eos_id,
+        stop_ids=stop_ids,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
         max_seq_len=max_seq_len,
     ):
-        if token_id == eos_id:
+        if token_id in stop_ids:
             break
         generated.append(token_id)
 
@@ -322,7 +336,7 @@ def generate_kvcached(
     prompt_ids: list[int],
     model_path: str | Path,
     pad_id: int = 0,
-    eos_id: int = 1,
+    stop_ids: set[int] | None = None,
     max_new_tokens: int = 256,
     temperature: float = 1.0,
     top_p: float = 0.9,
@@ -344,6 +358,8 @@ def generate_kvcached(
     Pre-loaded models can be passed via ``decode_model`` / ``prefill_model``
     to avoid reloading on every call (used by the TUI chat app).
     """
+    if stop_ids is None:
+        stop_ids = {1}
     prompt_ids = truncate_prompt_ids(
         list(prompt_ids),
         max_seq_len,
@@ -512,7 +528,7 @@ def generate_kvcached(
     for step in range(max_steps):
         next_id = sample_next_token(logits, temperature=temperature, top_p=top_p)
         yield next_id
-        if next_id == eos_id:
+        if next_id in stop_ids:
             break
 
         position = n_real + step
@@ -547,14 +563,14 @@ def generate_text_kvcached(
     if prompt_ids is None:
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     pad_id = tokenizer.pad_token_id or 0
-    eos_id = tokenizer.eos_token_id
+    stop_ids_ = stop_token_ids(tokenizer)
 
     generated = []
     for token_id in generate_kvcached(
         prompt_ids,
         model_path=model_path,
         pad_id=pad_id,
-        eos_id=eos_id,
+        stop_ids=stop_ids_,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
@@ -562,7 +578,7 @@ def generate_text_kvcached(
         decode_only=decode_only,
         verbose=verbose,
     ):
-        if token_id == eos_id:
+        if token_id in stop_ids_:
             break
         generated.append(token_id)
 

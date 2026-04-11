@@ -12,7 +12,7 @@ from textual.widgets import Input, RichLog, Static
 
 from gemma_chat.chat import HELP_TEXT, format_chat_prompt
 from gemma_chat.config import MAX_SEQ_LEN
-from gemma_chat.generate import generate_kvcached, truncate_prompt_ids
+from gemma_chat.generate import generate_kvcached, stop_token_ids, truncate_prompt_ids
 from gemma_chat.jax_generate import generate_jax_stream
 
 
@@ -172,7 +172,7 @@ class GemmaChatApp(App[None]):
         )
         fed_len = len(fed_ids)
         truncated = fed_len < raw_len
-        eos_id = tok.eos_token_id
+        stop_ids = stop_token_ids(tok)
         pad_id = tok.pad_token_id or 0
 
         def ui(callable_thunk) -> None:
@@ -188,7 +188,7 @@ class GemmaChatApp(App[None]):
                     prefill_model=cfg.prefill_model,
                     decode_only=cfg.decode_only,
                     pad_id=pad_id,
-                    eos_id=eos_id,
+                    stop_ids=stop_ids,
                     max_new_tokens=cfg.max_new_tokens,
                     temperature=cfg.temperature,
                     top_p=cfg.top_p,
@@ -211,7 +211,7 @@ class GemmaChatApp(App[None]):
             gen_ids: list[int] = []
             n_gen = 0
             for tid in it:
-                if tid == eos_id:
+                if tid in stop_ids:
                     break
                 gen_ids.append(tid)
                 n_gen = len(gen_ids)

@@ -174,7 +174,7 @@ final class ChatViewModel {
                 for await tokenID in stream {
                     if Task.isCancelled { break }
 
-                    if tokenID == GemmaConfig.eosTokenID { break }
+                    if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
                     genIDs.append(tokenID)
 
                     let decoded = tokenizer.decode(genIDs.map { Int($0) })

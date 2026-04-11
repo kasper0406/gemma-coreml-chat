@@ -10,7 +10,7 @@ import numpy as np
 
 from gemma_chat.config import MAX_SEQ_LEN
 from gemma_chat.decode_jax import decode_step, prefill
-from gemma_chat.generate import sample_next_token, truncate_prompt_ids
+from gemma_chat.generate import sample_next_token, stop_token_ids, truncate_prompt_ids
 from gemma_chat.model import Gemma4Config
 
 
@@ -25,7 +25,7 @@ def generate_jax_stream(
     max_seq_len: int = MAX_SEQ_LEN,
 ) -> Iterator[int]:
     """Yield generated token IDs (same contract as ``generate_kvcached``)."""
-    eos_id = tokenizer.eos_token_id
+    stop_ids = stop_token_ids(tokenizer)
     prompt_ids = truncate_prompt_ids(
         list(prompt_ids),
         max_seq_len,
@@ -40,7 +40,7 @@ def generate_jax_stream(
     for _ in range(max_steps):
         next_id = sample_next_token(logits, temperature=temperature, top_p=top_p)
         yield next_id
-        if next_id == eos_id:
+        if next_id in stop_ids:
             break
         logits, kv = decode_step(params, next_id, kv, cfg)
         logits = np.asarray(logits, dtype=np.float32).reshape(-1)
