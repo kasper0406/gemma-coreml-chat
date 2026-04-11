@@ -177,8 +177,9 @@ final class ChatViewModel {
                     if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
                     genIDs.append(tokenID)
 
-                    let decoded = tokenizer.decode(genIDs.map { Int($0) })
-                    streamingText = decoded
+                    // O(1) per token: decode only the new token for streaming.
+                    // Full-sequence decode at finalization ensures accuracy.
+                    streamingText += tokenizer.decode([Int(tokenID)])
                     generatedTokenCount = genIDs.count
                 }
 

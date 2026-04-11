@@ -75,13 +75,13 @@ struct KVCacheState: @unchecked Sendable {
                      "KV output count (\(outputNames.count)) != input count (\(inputNames.count))")
 
         var dict: [String: MLMultiArray] = [:]
+        dict.reserveCapacity(inputNames.count)
 
-        // Try name-based matching first: output name == input name
-        let allInputsInOutput = inputNames.allSatisfy { name in
-            prediction.featureValue(for: name)?.multiArrayValue != nil
-        }
+        // Probe first name to decide matching strategy (avoid full allSatisfy scan)
+        let useNameMatching = !inputNames.isEmpty
+            && prediction.featureValue(for: inputNames[0])?.multiArrayValue != nil
 
-        if allInputsInOutput {
+        if useNameMatching {
             for name in inputNames {
                 dict[name] = prediction.featureValue(for: name)!.multiArrayValue!
             }

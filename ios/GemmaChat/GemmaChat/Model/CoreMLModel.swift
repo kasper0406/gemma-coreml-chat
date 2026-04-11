@@ -29,6 +29,11 @@ final class CoreMLModel: @unchecked Sendable {
     let prefillKVInputNames: [String]
     let prefillKVOutputNames: [String]
 
+    /// Pre-allocated reusable scalars to avoid per-step allocation.
+    private let decodeTokenScalar: MLMultiArray
+    private let decodePositionScalar: MLMultiArray
+    private let prefillPositionScalar: MLMultiArray
+
     private init(
         prefillModel: MLModel,
         decodeModel: MLModel,
@@ -47,6 +52,9 @@ final class CoreMLModel: @unchecked Sendable {
         self.prefillKVOutputNames = prefillIO.kvOutputNames
         self.decodeKVInputNames = decodeIO.kvInputNames
         self.decodeKVOutputNames = decodeIO.kvOutputNames
+        self.decodeTokenScalar = try! MLMultiArray(shape: [1], dataType: .int32)
+        self.decodePositionScalar = try! MLMultiArray(shape: [1], dataType: .int32)
+        self.prefillPositionScalar = try! MLMultiArray(shape: [1], dataType: .int32)
     }
 
     /// Load the multifunction model from the app bundle.
@@ -141,9 +149,11 @@ final class CoreMLModel: @unchecked Sendable {
         seqLen: Int32,
         kvState: KVCacheState
     ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+        prefillPositionScalar.dataPointer.bindMemory(to: Int32.self, capacity: 1).pointee = seqLen
+
         var features: [String: MLMultiArray] = [:]
         features[prefillTokenInputName] = tokens
-        features[prefillPositionInputName] = MLMultiArray.int32Scalar(seqLen)
+        features[prefillPositionInputName] = prefillPositionScalar
 
         let provider = try CoreMLInputProvider(
             features: features,
@@ -171,9 +181,12 @@ final class CoreMLModel: @unchecked Sendable {
         position: Int32,
         kvState: KVCacheState
     ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+        decodeTokenScalar.dataPointer.bindMemory(to: Int32.self, capacity: 1).pointee = token
+        decodePositionScalar.dataPointer.bindMemory(to: Int32.self, capacity: 1).pointee = position
+
         var features: [String: MLMultiArray] = [:]
-        features[decodeTokenInputName] = MLMultiArray.int32Scalar(token)
-        features[decodePositionInputName] = MLMultiArray.int32Scalar(position)
+        features[decodeTokenInputName] = decodeTokenScalar
+        features[decodePositionInputName] = decodePositionScalar
 
         let provider = try CoreMLInputProvider(
             features: features,
@@ -355,6 +368,7 @@ private final class CoreMLInputProvider: MLFeatureProvider {
         kvState: KVCacheState
     ) throws {
         var values: [String: MLFeatureValue] = [:]
+        values.reserveCapacity(features.count + kvNames.count)
         for (name, array) in features {
             values[name] = MLFeatureValue(multiArray: array)
         }
@@ -386,9 +400,8 @@ extension MLMultiArray {
     /// Create an Int32 array of shape (1, length) from a Swift array.
     static func int32Row(_ values: [Int32]) -> MLMultiArray {
         let array = try! MLMultiArray(shape: [1, NSNumber(value: values.count)], dataType: .int32)
-        for (i, v) in values.enumerated() {
-            array[[0, NSNumber(value: i)] as [NSNumber]] = NSNumber(value: v)
-        }
+        let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: values.count)
+        for (i, v) in values.enumerated() { ptr[i] = v }
         return array
     }
 }

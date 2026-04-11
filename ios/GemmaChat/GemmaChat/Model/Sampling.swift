@@ -54,10 +54,14 @@ enum Sampling {
         var invSum = 1.0 / sum
         vDSP_vsmul(floats, 1, &invSum, &floats, 1, vDSP_Length(vocabSize))
 
-        // Top-p filtering: sort by probability descending
-        var indices = [vDSP_Length](0..<vDSP_Length(vocabSize))
-        // Sort indices by descending probability
-        indices.sort { floats[Int($0)] > floats[Int($1)] }
+        // Top-p filtering: vectorized argsort (descending)
+        var indices = Array(0..<vDSP_Length(vocabSize))
+        indices.withUnsafeMutableBufferPointer { idxBuf in
+            floats.withUnsafeBufferPointer { valBuf in
+                vDSP_vsorti(valBuf.baseAddress!, idxBuf.baseAddress!, nil,
+                            vDSP_Length(vocabSize), -1)
+            }
+        }
 
         // Find cutoff where cumulative probability exceeds topP
         var cumulative: Float = 0
