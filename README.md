@@ -43,6 +43,7 @@ uv run gemma-export-decode                    # int8 weights → gemma4-e2b.mlpa
 
 ```bash
 uv run gemma-chat                             # uses gemma4-e2b.mlpackage (default)
+uv run gemma-chat --compute-units cpu-only   # faster first-load compilation for iteration
 uv run gemma-chat --model path/to/other.mlpackage
 uv run gemma-chat --backend jax               # use JAX/Flax weights directly (for comparison)
 ```
@@ -51,7 +52,15 @@ In the TUI: `/quit` or `/exit` to leave, `/reset` to clear history, `/help` for 
 
 **Compute units:**
 
-By default, the CoreML model uses all available compute units (CPU, GPU, and ANE). This provides the best runtime performance but compilation is significantly slower (~10–30 min on first load). To speed up compilation, you can modify `load_coreml_model()` in [gemma_chat/generate.py](gemma_chat/generate.py#L138) to use `ct.ComputeUnit.CPU_ONLY`, which compiles in seconds but runtime will be slower in production.
+By default, `uv run gemma-chat` uses `--compute-units all`, which targets CPU, GPU, and ANE for the best runtime performance. First-load compilation is much slower in that mode (~10–30 min).
+
+For faster development iteration, use `--compute-units cpu-only`:
+
+```bash
+uv run gemma-chat --compute-units cpu-only
+```
+
+That usually compiles in seconds, but inference is slower than `all`.
 
 **Diagnostics:**
 

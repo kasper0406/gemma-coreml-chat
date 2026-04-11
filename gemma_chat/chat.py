@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import sys
 
+import coremltools as ct
+
 from gemma_chat.config import E2B_CONFIG, HF_MODEL_ID
 from gemma_chat.generate import load_coreml_model, load_tokenizer
 from gemma_chat.weight_mapper import load_params
@@ -54,6 +56,14 @@ Commands:
 """
 
 
+def parse_compute_units(value: str) -> ct.ComputeUnit:
+        mapping = {
+                "all": ct.ComputeUnit.ALL,
+                "cpu-only": ct.ComputeUnit.CPU_ONLY,
+        }
+        return mapping[value]
+
+
 def main() -> None:
     from gemma_chat.tui_app import ChatRuntimeConfig, run_chat_tui
 
@@ -71,6 +81,15 @@ def main() -> None:
         default="gemma4-e2b.mlpackage",
         help=(
             "Path to the multifunction .mlpackage (default: gemma4-e2b.mlpackage)"
+        ),
+    )
+    parser.add_argument(
+        "--compute-units",
+        choices=("all", "cpu-only"),
+        default="all",
+        help=(
+            "CoreML compute target: all for best runtime performance, "
+            "cpu-only for much faster first-load compilation"
         ),
     )
     parser.add_argument(
@@ -109,16 +128,33 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.backend == "coreml":
+        compute_units = parse_compute_units(args.compute_units)
         print("Loading tokenizer…", flush=True)
         tokenizer = load_tokenizer(args.model_id)
 
         # Pre-load decode model (always needed); prefill loaded only if not --decode-only.
-        print(f"Loading CoreML decode function from {args.model!r}…", flush=True)
-        decode_model = load_coreml_model(args.model, function_name="decode")
+        print(
+            f"Loading CoreML decode function from {args.model!r} "
+            f"(compute_units={args.compute_units})…",
+            flush=True,
+        )
+        decode_model = load_coreml_model(
+            args.model,
+            compute_units=compute_units,
+            function_name="decode",
+        )
         prefill_model = None
         if not args.decode_only:
-            print(f"Loading CoreML prefill function from {args.model!r}…", flush=True)
-            prefill_model = load_coreml_model(args.model, function_name="prefill")
+            print(
+                f"Loading CoreML prefill function from {args.model!r} "
+                f"(compute_units={args.compute_units})…",
+                flush=True,
+            )
+            prefill_model = load_coreml_model(
+                args.model,
+                compute_units=compute_units,
+                function_name="prefill",
+            )
 
         cfg = ChatRuntimeConfig(
             backend="coreml",
