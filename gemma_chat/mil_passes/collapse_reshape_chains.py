@@ -37,10 +37,6 @@ def _collapse_in_block(block):
         if parent_op.op_type not in ("reshape", "squeeze"):
             continue
 
-        # Only collapse if the intermediate result has no other consumers.
-        if len(x_var.child_ops) > 1:
-            continue
-
         # The original input (before the parent reshape/squeeze).
         original_input = parent_op.inputs["x"]
 
@@ -52,6 +48,8 @@ def _collapse_in_block(block):
         if shape_var.val is None:
             continue  # dynamic shape — skip
         target_shape = shape_var.val.tolist()
+
+        single_consumer = len(x_var.child_ops) == 1
 
         # Build replacement reshape from original input to final shape.
         new_var = mb.reshape(
@@ -67,7 +65,10 @@ def _collapse_in_block(block):
             new_var=new_var,
             no_check_var_types=True,
         )
-        block.remove_ops([op, parent_op])
+        if single_consumer:
+            block.remove_ops([op, parent_op])
+        else:
+            block.remove_ops([op])
         changed = True
 
     return changed

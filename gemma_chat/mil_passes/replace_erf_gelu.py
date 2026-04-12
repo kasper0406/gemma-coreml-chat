@@ -1,23 +1,22 @@
 """MIL pass: replace JAX erf polynomial approximation with native ``gelu`` op.
 
-JAX's ``jax.lax.erf`` lowers to a ~95-op rational polynomial approximation
+JAX's ``jax.lax.erf`` lowers to a ~62-op rational polynomial approximation
 of ``erfc``.  The full GELU pattern is::
 
-    0.5 * x * erfc(-x / sqrt(2))   ==   gelu(x, mode="EXACT")
+    gelu(x) = 0.5 * x * erfc(-x / sqrt(2))
 
 CoreML MIL has a native ``gelu`` op that computes this in a single
-instruction.  This pass matches the characteristic fingerprint:
+instruction.  This pass identifies the GELU structure by:
 
-1. ``fill/const(0.5)`` → ``mul(0.5, x)``   (the "half" multiply)
-2. ``mul(-1, x)`` → ``mul(neg_x, 0.7071)`` (erf input scaling, 1/√2)
-3. Long polynomial chain with ``select`` branch (small-arg vs large-arg)
-4. Final ``mul(0.5*x, erf_result)``         (GELU output)
+1. Finding ``abs`` ops that mark the entry to the erf polynomial.
+2. Verifying the structural signature:
+   - ``abs.input`` = ``mul(sub(0, gate), 1/sqrt(2))`` — the erf argument
+   - ``mul(abs.input, abs.input)`` → ``sub(0, _)`` → ``exp`` — Gaussian core
+3. Finding ``mul(0.5, gate)`` among gate's other consumers (the half multiply).
+4. Finding ``mul(0.5*gate, erfc_result)`` as the GELU output.
+5. Replacing with ``mb.gelu(x=gate, mode="EXACT")``.
 
-and replaces the entire ~95-op subgraph with ``mb.gelu(x, mode="EXACT")``.
 Dead polynomial ops are collected via backward DCE and removed.
-
-Counts from multi-chunk.mlpackage: 5 instances, ~475 ops + ~18.8 MB of
-polynomial coefficient constants eliminated.
 """
 
 import numpy as np
@@ -26,13 +25,9 @@ from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-_HALF = 0.5
-_NEG_ONE = -1.0
 _RSQRT2 = 0.7071067690849304  # float32 1/sqrt(2)
-
-_TOL_HALF = 1e-6
-_TOL_NEG = 1e-6
-_TOL_RSQRT2 = 1e-3
+_HALF = 0.5
+_TOL = 0.01
 
 
 def _get_scalar_value(var):
@@ -43,10 +38,9 @@ def _get_scalar_value(var):
         if arr.size == 0:
             return None
         first = float(arr.flat[0])
-        if arr.size == 1 or np.all(arr == first):
+        if arr.size == 1 or np.allclose(arr, first):
             return first
         return None
-    # fill ops have a symbolic output — read the value input directly.
     if var.op is not None and var.op.op_type == "fill":
         v = var.op.inputs.get("value")
         if v is not None and v.val is not None:
@@ -54,61 +48,96 @@ def _get_scalar_value(var):
     return None
 
 
-def _match_gelu(half_mul):
-    """If *half_mul* is the ``0.5 * x`` mul of a GELU pattern, return
-    ``(gelu_input_var, gelu_output_op)`` or ``None``."""
-    if half_mul.op_type != "mul":
+def _match_gelu(abs_op):
+    """If *abs_op* is the ``abs`` at the entry of a GELU erf polynomial,
+    return ``(gate_var, gelu_output_op)`` or ``None``.
+
+    Structural signature::
+
+        gate ──┬─ sub(0, gate) ─ mul(_, 1/√2) ─ abs ─ ... polynomial ...
+               │                                  └─ mul(x,x) ─ sub(0,_) ─ exp
+               └─ mul(0.5, gate) ──── mul(_, erfc_result) ← GELU output
+    """
+    if abs_op.op_type != "abs":
         return None
 
-    x_val = _get_scalar_value(half_mul.inputs["x"])
-    y_val = _get_scalar_value(half_mul.inputs["y"])
-    if x_val is not None and abs(x_val - _HALF) < _TOL_HALF:
-        gelu_input = half_mul.inputs["y"]
-    elif y_val is not None and abs(y_val - _HALF) < _TOL_HALF:
-        gelu_input = half_mul.inputs["x"]
-    else:
+    # abs.input = mul(sub(0, gate), 1/sqrt(2))
+    working_var = abs_op.inputs["x"]
+    working_op = working_var.op
+    if working_op is None or working_op.op_type != "mul":
         return None
 
-    # Verify: gelu_input also feeds mul(-1, gelu_input).
-    neg_found = False
-    for child in gelu_input.child_ops:
-        if child is half_mul or child.op_type != "mul":
+    # Find sub(0, gate) and scale ≈ 1/sqrt(2) among mul's two inputs.
+    gate = None
+    for side in ("x", "y"):
+        v = working_op.inputs[side]
+        other = "y" if side == "x" else "x"
+        if v.op is None or v.op.op_type != "sub":
             continue
-        for side in ("x", "y"):
-            sv = _get_scalar_value(child.inputs[side])
-            other = "y" if side == "x" else "x"
-            if (sv is not None and abs(sv - _NEG_ONE) < _TOL_NEG
-                    and child.inputs[other] is gelu_input):
-                neg_x_var = child.outputs[0]
-                neg_found = True
-                break
-        if neg_found:
+        sub_x_val = v.op.inputs["x"].val
+        if sub_x_val is None or not np.allclose(np.asarray(sub_x_val), 0):
+            continue
+        scale_val = _get_scalar_value(working_op.inputs[other])
+        if scale_val is not None and abs(scale_val - _RSQRT2) < _TOL:
+            gate = v.op.inputs["y"]
             break
-    if not neg_found:
+
+    if gate is None:
         return None
 
-    # Verify: neg_x feeds mul(neg_x, ~0.7071).
-    sqrt2_found = False
-    for child in neg_x_var.child_ops:
+    # Verify Gaussian core: mul(working, working) → sub(0, _) → exp.
+    gaussian_ok = False
+    for child in working_var.child_ops:
+        if child.op_type != "mul" or child is abs_op:
+            continue
+        if child.inputs.get("x") is not working_var:
+            continue
+        if child.inputs.get("y") is not working_var:
+            continue
+        for s_consumer in child.outputs[0].child_ops:
+            if s_consumer.op_type != "sub":
+                continue
+            sx = s_consumer.inputs.get("x")
+            if sx is None or sx.val is None:
+                continue
+            if not np.allclose(np.asarray(sx.val), 0):
+                continue
+            for e_consumer in s_consumer.outputs[0].child_ops:
+                if e_consumer.op_type == "exp":
+                    gaussian_ok = True
+                    break
+            if gaussian_ok:
+                break
+        if gaussian_ok:
+            break
+
+    if not gaussian_ok:
+        return None
+
+    # Find mul(0.5, gate) among gate's consumers.
+    half_gate_op = None
+    for child in gate.child_ops:
         if child.op_type != "mul":
             continue
-        for side in ("x", "y"):
-            sv = _get_scalar_value(child.inputs[side])
-            if sv is not None and abs(sv - _RSQRT2) < _TOL_RSQRT2:
-                sqrt2_found = True
+        for s in ("x", "y"):
+            sv = _get_scalar_value(child.inputs[s])
+            oth = "y" if s == "x" else "x"
+            if sv is not None and abs(sv - _HALF) < _TOL and child.inputs[oth] is gate:
+                half_gate_op = child
                 break
-        if sqrt2_found:
+        if half_gate_op is not None:
             break
-    if not sqrt2_found:
+
+    if half_gate_op is None:
         return None
 
-    # Find the GELU output: the sole mul consumer of 0.5*x.
-    half_x_var = half_mul.outputs[0]
-    consumers = [c for c in half_x_var.child_ops if c.op_type == "mul"]
-    if len(consumers) != 1:
+    # GELU output = the sole mul consumer of 0.5*gate.
+    half_gate_var = half_gate_op.outputs[0]
+    mul_consumers = [c for c in half_gate_var.child_ops if c.op_type == "mul"]
+    if len(mul_consumers) != 1:
         return None
 
-    return gelu_input, consumers[0]
+    return gate, mul_consumers[0]
 
 
 def _collect_dead_backward(start_op, keep_var):
@@ -145,18 +174,18 @@ def _replace_in_block(block):
         for b in op.blocks:
             changed |= _replace_in_block(b)
 
-        if op in removed:
+        if op in removed or op.op_type != "abs":
             continue
 
         result = _match_gelu(op)
         if result is None:
             continue
-        gelu_input, gelu_output = result
+        gate, gelu_output = result
 
         gelu_var = mb.gelu(
-            x=gelu_input,
+            x=gate,
             mode="EXACT",
-            before_op=op,
+            before_op=gelu_output,
             name=gelu_output.name + "_gelu",
         )
 
@@ -168,7 +197,7 @@ def _replace_in_block(block):
             force_replace=True,
         )
 
-        dead = _collect_dead_backward(gelu_output, gelu_input)
+        dead = _collect_dead_backward(gelu_output, gate)
         block.remove_ops(list(dead))
         removed.update(dead)
         changed = True
@@ -178,7 +207,7 @@ def _replace_in_block(block):
 
 @register_pass(namespace="common")
 class replace_erf_gelu(AbstractGraphPass):
-    """Replace JAX's ~95-op erf polynomial with native ``gelu`` op."""
+    """Replace JAX's ~62-op erf polynomial with native ``gelu`` op."""
 
     def apply(self, prog):
         for fname in prog.functions:

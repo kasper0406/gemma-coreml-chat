@@ -42,6 +42,13 @@ def install_stablehlo_streaming_patch() -> None:
         context.add_result(op.result, mb.const(val=constant))
 
     StableHloConverter.op_constant = _patched_op_constant
+
+    # The @register_stablehlo_op decorator caches a direct function reference
+    # in _stablehlo_ops_registry at class-definition time.  We must update
+    # that registry too, otherwise the dispatch table still calls the original.
+    from jaxlib.mlir.dialects._stablehlo_ops_gen import ConstantOp
+    StableHloConverter._stablehlo_ops_registry[ConstantOp] = _patched_op_constant
+
     _patch_installed = True
 
 

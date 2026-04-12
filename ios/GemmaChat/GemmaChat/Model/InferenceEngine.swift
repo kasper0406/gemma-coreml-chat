@@ -29,14 +29,18 @@ struct InferenceEngine: Sendable {
             // Run inference on a background queue to avoid blocking
             Task.detached { [self] in
                 do {
+                    let genStart = CFAbsoluteTimeGetCurrent()
                     let ids = truncatePromptIDs(
                         promptIDs,
                         maxSeqLen: GemmaConfig.maxSeqLen,
                         reserveForGeneration: maxNewTokens
                     )
                     let nReal = ids.count
+                    let nChunks = (nReal + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
+                    print("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks, prefillOffset=\(prefillOffset)")
 
                     // --- Chunked Prefill ---
+                    let prefillStart = CFAbsoluteTimeGetCurrent()
                     var kvState: KVCacheState
                     var logits: MLMultiArray
 
@@ -67,14 +71,13 @@ struct InferenceEngine: Sendable {
                         // Full prefill from scratch
                         (logits, kvState) = try self.fullPrefill(ids: ids)
                     }
+                    let prefillTime = CFAbsoluteTimeGetCurrent() - prefillStart
+                    print("[Perf] Prefill done: \(String(format: "%.2f", prefillTime))s")
 
                     // Extract the logits for the last real token.
-                    // Prefill logits are 2D (chunkSize, vocabSize) — pick the last real position.
-                    // Decode logits are already 1D (vocabSize) — use directly.
                     let vocabSize = GemmaConfig.vocabSize
                     let lastLogits: MLMultiArray
                     if logits.shape.count > 1 && logits.shape[0].intValue > 1 {
-                        let nChunks = (nReal + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
                         let lastChunkLen = nReal - (nChunks - 1) * GemmaConfig.chunkSize
                         let lastTokenPosInChunk = lastChunkLen - 1
                         lastLogits = try extractLogitsAt(
@@ -90,27 +93,51 @@ struct InferenceEngine: Sendable {
                     let maxSteps = min(maxNewTokens, GemmaConfig.maxSeqLen - nReal)
                     var currentLogits = lastLogits
                     var currentKV = kvState
+                    var totalSampleTime = 0.0
+                    var totalDecodeTime = 0.0
+                    var decodeSteps = 0
 
                     for step in 0..<maxSteps {
+                        let sampleStart = CFAbsoluteTimeGetCurrent()
                         let nextID = Sampling.sampleNextToken(
                             logits: currentLogits,
                             temperature: temperature,
                             topP: topP
                         )
+                        let sampleTime = CFAbsoluteTimeGetCurrent() - sampleStart
+                        totalSampleTime += sampleTime
+
                         continuation.yield(nextID)
 
                         if GemmaConfig.stopTokenIDs.contains(nextID) { break }
                         if Task.isCancelled { break }
 
+                        let decStart = CFAbsoluteTimeGetCurrent()
                         let position = Int32(nReal + step)
                         let (decLogits, decKV) = try model.decode(
                             token: nextID,
                             position: position,
                             kvState: currentKV
                         )
+                        let decTime = CFAbsoluteTimeGetCurrent() - decStart
+                        totalDecodeTime += decTime
+                        decodeSteps += 1
+
+                        if step < 3 {
+                            print("[Perf] Step \(step): sample=\(String(format: "%.3f", sampleTime))s, decode=\(String(format: "%.3f", decTime))s")
+                        } else if (step + 1) % 10 == 0 {
+                            let avgSample = totalSampleTime / Double(step + 1)
+                            let avgDecode = totalDecodeTime / Double(decodeSteps)
+                            print("[Perf] Step \(step): avg sample=\(String(format: "%.3f", avgSample))s, avg decode=\(String(format: "%.3f", avgDecode))s")
+                        }
+
                         currentLogits = decLogits
                         currentKV = decKV
                     }
+
+                    let totalTime = CFAbsoluteTimeGetCurrent() - genStart
+                    let tokPerSec = decodeSteps > 0 ? Double(decodeSteps) / totalDecodeTime : 0
+                    print("[Perf] Done: \(decodeSteps) tokens in \(String(format: "%.1f", totalTime))s (prefill=\(String(format: "%.1f", prefillTime))s, decode=\(String(format: "%.1f", totalDecodeTime))s, sample=\(String(format: "%.2f", totalSampleTime))s) \(String(format: "%.2f", tokPerSec)) tok/s")
                 } catch {
                     // Stream ends on error; the ChatViewModel handles the error
                     print("Inference error: \(error)")
@@ -151,8 +178,10 @@ struct InferenceEngine: Sendable {
         let startChunk = fromOffset / GemmaConfig.chunkSize
         var currentKV = kvState
         var lastLogits: MLMultiArray? = nil
+        let chunksToProcess = nChunks - startChunk
 
         for chunkIdx in startChunk..<nChunks {
+            let chunkStart = CFAbsoluteTimeGetCurrent()
             let start = chunkIdx * GemmaConfig.chunkSize
             let chunkTokens = Array(padded[start..<(start + GemmaConfig.chunkSize)])
 
@@ -164,6 +193,10 @@ struct InferenceEngine: Sendable {
             )
             currentKV = newKV.withProcessedTokens(start + GemmaConfig.chunkSize)
             lastLogits = logits
+
+            let chunkTime = CFAbsoluteTimeGetCurrent() - chunkStart
+            let chunkNum = chunkIdx - startChunk + 1
+            print("[Perf] Prefill chunk \(chunkNum)/\(chunksToProcess) (pos=\(start)): \(String(format: "%.2f", chunkTime))s")
         }
 
         return (lastLogits, currentKV)

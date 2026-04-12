@@ -355,6 +355,7 @@ private final class CoreMLInputProvider: MLFeatureProvider {
         kvState: KVCacheState
     ) throws {
         var values: [String: MLFeatureValue] = [:]
+        values.reserveCapacity(features.count + kvNames.count)
         for (name, array) in features {
             values[name] = MLFeatureValue(multiArray: array)
         }
@@ -386,9 +387,8 @@ extension MLMultiArray {
     /// Create an Int32 array of shape (1, length) from a Swift array.
     static func int32Row(_ values: [Int32]) -> MLMultiArray {
         let array = try! MLMultiArray(shape: [1, NSNumber(value: values.count)], dataType: .int32)
-        for (i, v) in values.enumerated() {
-            array[[0, NSNumber(value: i)] as [NSNumber]] = NSNumber(value: v)
-        }
+        let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: values.count)
+        for (i, v) in values.enumerated() { ptr[i] = v }
         return array
     }
 }

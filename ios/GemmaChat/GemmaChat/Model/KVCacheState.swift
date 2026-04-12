@@ -75,13 +75,13 @@ struct KVCacheState: @unchecked Sendable {
                      "KV output count (\(outputNames.count)) != input count (\(inputNames.count))")
 
         var dict: [String: MLMultiArray] = [:]
+        dict.reserveCapacity(inputNames.count)
 
-        // Try name-based matching first: output name == input name
-        let allInputsInOutput = inputNames.allSatisfy { name in
-            prediction.featureValue(for: name)?.multiArrayValue != nil
-        }
+        // Probe first name to decide matching strategy (avoid full allSatisfy scan)
+        let useNameMatching = !inputNames.isEmpty
+            && prediction.featureValue(for: inputNames[0])?.multiArrayValue != nil
 
-        if allInputsInOutput {
+        if useNameMatching {
             for name in inputNames {
                 dict[name] = prediction.featureValue(for: name)!.multiArrayValue!
             }
@@ -105,5 +105,27 @@ struct KVCacheState: @unchecked Sendable {
     /// Create a new KVCacheState with an updated processedTokens count.
     func withProcessedTokens(_ count: Int) -> KVCacheState {
         KVCacheState(arraysByName: arraysByName, inputNames: inputNames, processedTokens: count)
+    }
+
+    /// Deep-copy all MLMultiArray buffers so this snapshot is independent
+    /// of any future CoreML predictions (which may reuse output buffers).
+    func deepCopy() -> KVCacheState {
+        var copied: [String: MLMultiArray] = [:]
+        copied.reserveCapacity(arraysByName.count)
+        for (name, array) in arraysByName {
+            let new = try! MLMultiArray(shape: array.shape, dataType: array.dataType)
+            let bytesPerElement: Int
+            switch array.dataType {
+            case .float16: bytesPerElement = 2
+            case .float32: bytesPerElement = 4
+            case .int32:   bytesPerElement = 4
+            case .double:  bytesPerElement = 8
+            case .int8:    bytesPerElement = 1
+            @unknown default: bytesPerElement = 4
+            }
+            memcpy(new.dataPointer, array.dataPointer, array.count * bytesPerElement)
+            copied[name] = new
+        }
+        return KVCacheState(arraysByName: copied, inputNames: inputNames, processedTokens: processedTokens)
     }
 }

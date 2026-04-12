@@ -27,15 +27,15 @@ _BROADCAST_OPS = frozenset({
 })
 
 
-def _is_single_dim_tile(op) -> bool:
-    """True if ``tile`` only replicates along one dimension (rest are 1)."""
+def _is_broadcast_tile(op) -> bool:
+    """True if ``tile`` replicates along any dimension(s) (non-1 reps)."""
     if op.op_type != "tile":
         return False
     reps = op.inputs["reps"].val
     if reps is None:
         return False
     reps = np.asarray(reps).flatten().tolist()
-    return sum(1 for r in reps if r != 1) == 1
+    return any(r != 1 for r in reps)
 
 
 def _all_consumers_broadcast(op) -> bool:
@@ -55,7 +55,7 @@ def _remove_in_block(block):
         for b in op.blocks:
             changed |= _remove_in_block(b)
 
-        if not _is_single_dim_tile(op):
+        if not _is_broadcast_tile(op):
             continue
         if not _all_consumers_broadcast(op):
             continue

@@ -148,6 +148,11 @@ final class ChatViewModel {
         streamingText = ""
         generatedTokenCount = 0
 
+        // Cancel any pending eager-prefill debounce to prevent a stale
+        // textChanged from running concurrently with generation.
+        prefillDebounceTask?.cancel()
+        prefillDebounceTask = nil
+
         generateTask = Task { [weak self] in
             guard let self else { return }
 
@@ -177,8 +182,9 @@ final class ChatViewModel {
                     if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
                     genIDs.append(tokenID)
 
-                    let decoded = tokenizer.decode(genIDs.map { Int($0) })
-                    streamingText = decoded
+                    // O(1) per token: decode only the new token for streaming.
+                    // Full-sequence decode at finalization ensures accuracy.
+                    streamingText += tokenizer.decode([Int(tokenID)])
                     generatedTokenCount = genIDs.count
                 }
 

@@ -31,6 +31,10 @@ actor EagerPrefillManager {
     private var completedChunks: Int = 0
     /// Current KV cache state after the last completed chunk.
     private var kvState: KVCacheState
+    /// KV state checkpoint after each completed chunk.
+    /// checkpoints[i] = KV state after chunk i was prefilled.
+    /// Invariant: checkpoints.count == completedChunks.
+    private var checkpoints: [KVCacheState] = []
     /// Logits from the last prefilled chunk (needed for decode start).
     private var lastLogits: MLMultiArray?
     /// Whether a prefill operation is currently running.
@@ -114,7 +118,8 @@ actor EagerPrefillManager {
                 // Prefill invalidated — find last valid chunk
                 let lastValid = findLastValidChunk(newTokens: newTokens)
                 if lastValid < completedChunks {
-                    await resetTo(chunk: lastValid, tokens: newTokens)
+                    print("[Perf] Prefix changed at chunk \(lastValid)/\(completedChunks) — restoring checkpoint (saved \(lastValid) re-prefills)")
+                    resetTo(chunk: lastValid, tokens: newTokens)
                 }
             }
         }
@@ -142,6 +147,9 @@ actor EagerPrefillManager {
         systemPrompt: String? = nil
     ) async throws -> (promptIDs: [Int32], kvState: KVCacheState, prefillOffset: Int) {
         // Wait for any in-flight prefill to complete
+        if isPrefilling {
+            print("[Perf] finishPrefill: waiting for in-flight eager prefill...")
+        }
         while isPrefilling {
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -163,13 +171,34 @@ actor EagerPrefillManager {
 
         if isValid && completedChunks > 0 {
             // Prefill is still valid — engine only needs to process remaining chunks
+            print("[Perf] finishPrefill: reusing \(completedChunks) eager chunks (\(prefillBoundary)/\(finalTokens.count) tokens)")
             status = .ready(chunks: completedChunks)
             let result = (promptIDs, kvState, prefillBoundary)
             // Release internal state — the engine now owns the KV cache
             clearInternalState()
             return result
+        } else if !checkpoints.isEmpty {
+            // Full state invalid, but we may be able to salvage a prefix via checkpoints
+            let lastValid = findLastValidChunk(newTokens: finalTokens)
+            if lastValid > 0 {
+                let validBoundary = lastValid * GemmaConfig.chunkSize
+                print("[Perf] finishPrefill: partial reuse — \(lastValid)/\(completedChunks) chunks (\(validBoundary)/\(finalTokens.count) tokens)")
+                let result = (promptIDs, checkpoints[lastValid - 1], validBoundary)
+                clearInternalState()
+                return result
+            } else {
+                print("[Perf] finishPrefill: eager prefill invalid, full re-prefill (\(finalTokens.count) tokens)")
+                status = .idle
+                clearInternalState()
+                return (
+                    promptIDs,
+                    Self.makeEmptyKV(names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes),
+                    0
+                )
+            }
         } else {
             // Prefill invalidated — engine does full prefill
+            print("[Perf] finishPrefill: eager prefill invalid, full re-prefill (\(finalTokens.count) tokens)")
             status = .idle
             clearInternalState()
             return (
@@ -191,6 +220,7 @@ actor EagerPrefillManager {
         prefillTokens = []
         completedChunks = 0
         kvState = Self.makeEmptyKV(names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes)
+        checkpoints = []
         lastLogits = nil
         isPrefilling = false
     }
@@ -213,19 +243,18 @@ actor EagerPrefillManager {
     }
 
     /// Reset prefill state back to a given chunk boundary.
-    private func resetTo(chunk: Int, tokens: [Int]) async {
+    /// Uses saved checkpoints to restore KV state without re-prefilling.
+    private func resetTo(chunk: Int, tokens: [Int]) {
         if chunk == 0 {
             reset()
             return
         }
-        // We need to re-prefill from scratch up to `chunk`, since we can't
-        // "rewind" the KV cache to an intermediate state.
-        completedChunks = 0
-        kvState = Self.makeEmptyKV(names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes)
+        // Restore from checkpoint — O(1) instead of re-prefilling from scratch.
+        kvState = checkpoints[chunk - 1]
+        completedChunks = chunk
+        checkpoints = Array(checkpoints.prefix(chunk))
         lastLogits = nil
         prefillTokens = tokens
-        // Re-prefill up to the target chunk
-        await prefillNewChunks(tokens: tokens, upToChunk: chunk)
     }
 
     /// Prefill chunks from completedChunks to upToChunk.
@@ -233,9 +262,13 @@ actor EagerPrefillManager {
         guard upToChunk > completedChunks else { return }
         isPrefilling = true
         let startChunk = completedChunks
+        let totalToProcess = upToChunk - startChunk
+        print("[Perf] Eager prefill: \(totalToProcess) chunks (\(startChunk)..<\(upToChunk))")
+        let batchStart = CFAbsoluteTimeGetCurrent()
 
         do {
             for chunkIdx in startChunk..<upToChunk {
+                let chunkStart = CFAbsoluteTimeGetCurrent()
                 let start = chunkIdx * GemmaConfig.chunkSize
                 let chunkTokens = Array(tokens[start..<(start + GemmaConfig.chunkSize)])
                     .map { Int32($0) }
@@ -251,8 +284,15 @@ actor EagerPrefillManager {
                 kvState = newKV
                 lastLogits = logits
                 completedChunks = chunkIdx + 1
+                checkpoints.append(kvState.deepCopy())
                 prefillTokens = tokens
+
+                let chunkTime = CFAbsoluteTimeGetCurrent() - chunkStart
+                let chunkNum = chunkIdx - startChunk + 1
+                print("[Perf] Eager chunk \(chunkNum)/\(totalToProcess) (pos=\(start)): \(String(format: "%.2f", chunkTime))s")
             }
+            let totalTime = CFAbsoluteTimeGetCurrent() - batchStart
+            print("[Perf] Eager prefill done: \(totalToProcess) chunks in \(String(format: "%.1f", totalTime))s")
             status = .ready(chunks: completedChunks)
         } catch {
             status = .error(error.localizedDescription)
