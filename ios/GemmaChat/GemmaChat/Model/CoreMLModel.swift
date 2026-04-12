@@ -6,10 +6,21 @@
 import CoreML
 import Foundation
 
-/// Holds both prefill and decode MLModel instances plus their I/O metadata.
+/// Holds the decode MLModel permanently and the prefill MLModel on demand.
+///
+/// CoreML allocates separate weight buffers for each loaded function, roughly
+/// doubling memory when both are loaded. To avoid this, the prefill model is
+/// loaded only when needed (via ``loadPrefill()``) and released after the
+/// prefill phase (via ``releasePrefill()``).
 final class CoreMLModel: @unchecked Sendable {
-    let prefillModel: MLModel
     let decodeModel: MLModel
+
+    /// Prefill model — loaded on demand, released after use.
+    private(set) var prefillModel: MLModel?
+
+    /// Stored for on-demand prefill reloading.
+    private let modelURL: URL
+    private let computeUnits: MLComputeUnits
 
     /// Logits output name for each function.
     let decodeLogitsName: String
@@ -29,14 +40,22 @@ final class CoreMLModel: @unchecked Sendable {
     let prefillKVInputNames: [String]
     let prefillKVOutputNames: [String]
 
+    /// Prefill input descriptions for KV cache initialization.
+    /// Extracted once so the prefill model can be released between uses.
+    let prefillInputDescriptions: [String: MLFeatureDescription]
+
     private init(
-        prefillModel: MLModel,
         decodeModel: MLModel,
+        modelURL: URL,
+        computeUnits: MLComputeUnits,
         prefillIO: ClassifiedIO,
+        prefillInputDescriptions: [String: MLFeatureDescription],
         decodeIO: ClassifiedIO
     ) {
-        self.prefillModel = prefillModel
         self.decodeModel = decodeModel
+        self.prefillModel = nil
+        self.modelURL = modelURL
+        self.computeUnits = computeUnits
         self.prefillLogitsName = prefillIO.logitsOutputName
         self.decodeLogitsName = decodeIO.logitsOutputName
         self.prefillTokenInputName = prefillIO.tokenInputName
@@ -47,6 +66,7 @@ final class CoreMLModel: @unchecked Sendable {
         self.prefillKVOutputNames = prefillIO.kvOutputNames
         self.decodeKVInputNames = decodeIO.kvInputNames
         self.decodeKVOutputNames = decodeIO.kvOutputNames
+        self.prefillInputDescriptions = prefillInputDescriptions
     }
 
     /// Load the multifunction model from the app bundle.
@@ -92,40 +112,68 @@ final class CoreMLModel: @unchecked Sendable {
     }
 
     /// Load a pre-compiled multifunction .mlmodelc.
+    ///
+    /// Only the decode model is loaded with full compute units.  The prefill
+    /// model is loaded temporarily with `.cpuOnly` to extract I/O metadata,
+    /// then released immediately.  Call ``loadPrefill()`` before ``prefill()``.
     static func load(
         from url: URL,
         computeUnits: MLComputeUnits = .cpuAndGPU
     ) async throws -> CoreMLModel {
         print("[CoreML] Loading decode function from \(url.lastPathComponent)...")
 
-        // Load decode function
+        // Load decode function with target compute units
         let decodeConfig = MLModelConfiguration()
         decodeConfig.computeUnits = computeUnits
         decodeConfig.functionName = "decode"
         let decodeModel = try await MLModel.load(contentsOf: url, configuration: decodeConfig)
         print("[CoreML] Decode loaded. Inputs: \(Array(decodeModel.modelDescription.inputDescriptionsByName.keys).sorted())")
 
-        print("[CoreML] Loading prefill function...")
-        // Load prefill function
+        // Load prefill with cpuOnly just to extract I/O metadata.
+        // This avoids the memory cost of GPU/ANE compilation for a model
+        // we won't run predictions on until loadPrefill() is called.
+        print("[CoreML] Extracting prefill I/O metadata (cpuOnly)...")
         let prefillConfig = MLModelConfiguration()
-        prefillConfig.computeUnits = computeUnits
+        prefillConfig.computeUnits = .cpuOnly
         prefillConfig.functionName = "prefill"
-        let prefillModel = try await MLModel.load(contentsOf: url, configuration: prefillConfig)
-        print("[CoreML] Prefill loaded. Inputs: \(Array(prefillModel.modelDescription.inputDescriptionsByName.keys).sorted())")
+        let tempPrefill = try await MLModel.load(contentsOf: url, configuration: prefillConfig)
 
-        // Classify I/O
         let decodeIO = Self.classifyIO(model: decodeModel)
-        let prefillIO = Self.classifyIO(model: prefillModel)
+        let prefillIO = Self.classifyIO(model: tempPrefill)
+        let prefillInputDescs = tempPrefill.modelDescription.inputDescriptionsByName
 
         print("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count)")
         print("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName), token=\(prefillIO.tokenInputName), pos=\(prefillIO.positionInputName), kvIn=\(prefillIO.kvInputNames.count), kvOut=\(prefillIO.kvOutputNames.count)")
 
+        // tempPrefill released here — only metadata is kept
         return CoreMLModel(
-            prefillModel: prefillModel,
             decodeModel: decodeModel,
+            modelURL: url,
+            computeUnits: computeUnits,
             prefillIO: prefillIO,
+            prefillInputDescriptions: prefillInputDescs,
             decodeIO: decodeIO
         )
+    }
+
+    /// Load the prefill model with target compute units.
+    /// Call before using ``prefill()``.  No-op if already loaded.
+    func loadPrefill() async throws {
+        guard prefillModel == nil else { return }
+        print("[CoreML] Loading prefill model on demand...")
+        let config = MLModelConfiguration()
+        config.computeUnits = computeUnits
+        config.functionName = "prefill"
+        prefillModel = try await MLModel.load(contentsOf: modelURL, configuration: config)
+        print("[CoreML] Prefill model loaded.")
+    }
+
+    /// Release the prefill model to free memory (~4-5 GB).
+    /// Call after the prefill phase when only decode is needed.
+    func releasePrefill() {
+        guard prefillModel != nil else { return }
+        prefillModel = nil
+        print("[CoreML] Prefill model released.")
     }
 
     // MARK: - Prediction
@@ -141,6 +189,9 @@ final class CoreMLModel: @unchecked Sendable {
         seqLen: Int32,
         kvState: KVCacheState
     ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+        guard let prefillModel else {
+            throw CoreMLModelError.prefillNotLoaded
+        }
         var features: [String: MLMultiArray] = [:]
         features[prefillTokenInputName] = tokens
         features[prefillPositionInputName] = MLMultiArray.int32Scalar(seqLen)
@@ -397,11 +448,14 @@ extension MLMultiArray {
 
 enum CoreMLModelError: Error, LocalizedError {
     case modelNotFound
+    case prefillNotLoaded
 
     var errorDescription: String? {
         switch self {
         case .modelNotFound:
             "gemma4-e2b.mlpackage not found in app bundle"
+        case .prefillNotLoaded:
+            "Prefill model not loaded. Call loadPrefill() first."
         }
     }
 }
