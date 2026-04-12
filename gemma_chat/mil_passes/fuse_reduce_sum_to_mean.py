@@ -1,11 +1,13 @@
-"""MIL pass: replace ``reduce_sum → reshape → mul(1/N)`` with ``reduce_mean → reshape``.
+"""MIL pass: replace ``reduce_sum`` ÷ N patterns with ``reduce_mean``.
 
-RMSNorm computes ``mean(x²)`` which JAX lowers as
-``reduce_sum(x²) → reshape → mul(1/N)``.  CoreML has a native
-``reduce_mean`` op that folds the division into the reduction.
+RMSNorm computes ``mean(x²)`` which JAX/XLA lowers in two variants:
 
-Counts from gemma4-e2b.mlpackage (decode): 171 chains replaced,
-eliminating ~171 mul ops and their scalar constants.
+1. ``reduce_sum → reshape → mul(1/N)``  →  ``reduce_mean → reshape``
+2. ``reduce_sum → add(C) → mul(1/N)``   →  ``reduce_mean → add(C/N)``
+
+Variant 2 arises when XLA restructures ``mean(x²) + ε`` into
+``(sum(x²) + ε·N) / N`` to combine the epsilon addition with the
+reduction.  Both variants are handled by this pass.
 """
 
 import numpy as np
@@ -61,78 +63,114 @@ def _fuse_in_block(block):
         if N is None or N <= 0:
             continue
 
-        # Find the reshape consumer.
-        reshape_ops = [c for c in rs_out.child_ops if c.op_type == "reshape"]
-        if len(reshape_ops) != 1:
-            continue
-        reshape_op = reshape_ops[0]
-        if len(rs_out.child_ops) > 1:
-            continue  # reduce_sum result used elsewhere too
+        if len(rs_out.child_ops) != 1:
+            continue  # reduce_sum result used by multiple ops
 
-        reshape_out = reshape_op.outputs[0]
-
-        # Find the mul(_, 1/N) consumer of reshape.
-        mul_ops = [c for c in reshape_out.child_ops if c.op_type == "mul"]
-        if len(mul_ops) != 1:
-            continue
-        mul_op = mul_ops[0]
-        if len(reshape_out.child_ops) > 1:
-            continue  # reshape result used elsewhere too
-
-        # Check that one mul input is the reshape output and the other
-        # is a uniform constant ≈ 1/N.
-        scalar_val = None
-        for side in ("x", "y"):
-            v = mul_op.inputs[side]
-            if v is not reshape_out:
-                scalar_val = _get_uniform_scalar(v)
-        if scalar_val is None:
-            continue
-        expected = 1.0 / N
-        if abs(scalar_val - expected) / max(abs(expected), 1e-12) > 1e-3:
-            continue
-
-        # Build reduce_mean → reshape (reuse the original reshape target).
         keep_dims_var = op.inputs.get("keep_dims")
         keep_dims = bool(keep_dims_var.val) if keep_dims_var and keep_dims_var.val is not None else False
 
-        mean_var = mb.reduce_mean(
-            x=rs_input,
-            axes=axes,
-            keep_dims=keep_dims,
-            before_op=op,
-            name=op.name + "_mean",
-        )
+        consumer = list(rs_out.child_ops)[0]
 
-        shape_var = reshape_op.inputs["shape"]
-        if shape_var.val is None:
-            continue
-        target_shape = shape_var.val.tolist()
+        # ── Variant 1: reduce_sum → reshape → mul(1/N) ──────────────
+        if consumer.op_type == "reshape":
+            reshape_op = consumer
+            reshape_out = reshape_op.outputs[0]
 
-        new_reshape = mb.reshape(
-            x=mean_var,
-            shape=target_shape,
-            before_op=op,
-            name=reshape_op.name,
-        )
+            mul_ops = [c for c in reshape_out.child_ops if c.op_type == "mul"]
+            if len(mul_ops) != 1 or len(reshape_out.child_ops) > 1:
+                continue
+            mul_op = mul_ops[0]
 
-        block.replace_uses_of_var_after_op(
-            anchor_op=mul_op,
-            old_var=mul_op.outputs[0],
-            new_var=new_reshape,
-            no_check_var_types=True,
-        )
+            scalar_val = None
+            for side in ("x", "y"):
+                v = mul_op.inputs[side]
+                if v is not reshape_out:
+                    scalar_val = _get_uniform_scalar(v)
+            if scalar_val is None:
+                continue
+            expected = 1.0 / N
+            if abs(scalar_val - expected) / max(abs(expected), 1e-12) > 1e-3:
+                continue
 
-        block.remove_ops([mul_op, reshape_op, op])
-        removed.update([mul_op, reshape_op, op])
-        changed = True
+            shape_var = reshape_op.inputs["shape"]
+            if shape_var.val is None:
+                continue
+
+            mean_var = mb.reduce_mean(
+                x=rs_input, axes=axes, keep_dims=keep_dims,
+                before_op=op, name=op.name + "_mean",
+            )
+            new_reshape = mb.reshape(
+                x=mean_var, shape=shape_var.val.tolist(),
+                before_op=op, name=reshape_op.name,
+            )
+
+            block.replace_uses_of_var_after_op(
+                anchor_op=mul_op, old_var=mul_op.outputs[0],
+                new_var=new_reshape, no_check_var_types=True,
+            )
+            block.remove_ops([mul_op, reshape_op, op])
+            removed.update([mul_op, reshape_op, op])
+            changed = True
+
+        # ── Variant 2: reduce_sum → add(C) → mul(1/N) ──────────────
+        # XLA restructures mean(x²)+ε into (sum(x²)+ε·N)/N.
+        elif consumer.op_type == "add":
+            add_op = consumer
+            add_out = add_op.outputs[0]
+
+            mul_ops = [c for c in add_out.child_ops if c.op_type == "mul"]
+            if len(mul_ops) != 1 or len(add_out.child_ops) > 1:
+                continue
+            mul_op = mul_ops[0]
+
+            # Verify the mul constant ≈ 1/N.
+            scalar_val = None
+            for side in ("x", "y"):
+                v = mul_op.inputs[side]
+                if v is not add_out:
+                    scalar_val = _get_uniform_scalar(v)
+            if scalar_val is None:
+                continue
+            expected = 1.0 / N
+            if abs(scalar_val - expected) / max(abs(expected), 1e-12) > 1e-3:
+                continue
+
+            # Get the add constant (the other operand, not the reduce_sum output).
+            add_const_var = None
+            for side in ("x", "y"):
+                v = add_op.inputs[side]
+                if v is not rs_out:
+                    add_const_var = v
+            if add_const_var is None or add_const_var.val is None:
+                continue
+
+            # Adjusted constant: C * (1/N) — restores original epsilon.
+            adjusted_val = np.asarray(add_const_var.val, dtype=np.float32) * scalar_val
+
+            mean_var = mb.reduce_mean(
+                x=rs_input, axes=axes, keep_dims=keep_dims,
+                before_op=op, name=op.name + "_mean",
+            )
+            new_add = mb.add(
+                x=mean_var, y=adjusted_val,
+                before_op=op, name=add_op.name,
+            )
+
+            block.replace_uses_of_var_after_op(
+                anchor_op=mul_op, old_var=mul_op.outputs[0],
+                new_var=new_add, no_check_var_types=True,
+            )
+            block.remove_ops([mul_op, add_op, op])
+            removed.update([mul_op, add_op, op])
+            changed = True
 
     return changed
 
 
 @register_pass(namespace="common")
 class fuse_reduce_sum_to_mean(AbstractGraphPass):
-    """Replace ``reduce_sum → reshape → mul(1/N)`` with ``reduce_mean → reshape``."""
+    """Replace ``reduce_sum`` ÷ N patterns with ``reduce_mean``."""
 
     def apply(self, prog):
         for fname in prog.functions:
