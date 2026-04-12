@@ -57,17 +57,18 @@ import jax
 import jax.numpy as jnp
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
+from jax import export as jax_export
 
 import coremltools as ct
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN
-from gemma_chat.model import Gemma4Transformer, Gemma4Config
+from gemma_chat.model import Gemma4Transformer, Gemma4Config, AttentionType
 from gemma_chat.weight_mapper import load_params
 from gemma_chat.decode_coreml import (
-    chunk_prefill_step, decode_step, empty_pos_ring, kv_cache_shapes,
-    kv_non_shared_layers,
+    chunk_prefill_step, decode_step, empty_pos_ring,
 )
+from gemma_chat.cache_spec import build_cache_specs
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────
@@ -80,6 +81,42 @@ def _build_kv_names(n_layers: int) -> list[str]:
         names.append(f"k_{i}")
         names.append(f"v_{i}")
     return names
+
+
+def _build_ct_inputs(
+    config: Gemma4Config,
+    cache_specs,
+    max_seq_len: int,
+    prefix_inputs: list,
+) -> list:
+    """Build ct.TensorType list for ct.convert with RangeDim on global KV caches.
+
+    MIL inputs from stablehlo-coreml are named _arg0, _arg1, ... (sanitized from %argN).
+    Global KV caches get RangeDim [1, max_seq_len] on dim 1.
+    """
+    ct_inputs = list(prefix_inputs)
+    arg_idx = len(prefix_inputs)
+    for spec in cache_specs:
+        shape = (1, spec.cache_len, spec.num_kv_heads, spec.head_dim)
+        if spec.attn_type == AttentionType.GLOBAL:
+            flex_shape = ct.Shape(shape=(
+                1,
+                ct.RangeDim(lower_bound=1, upper_bound=max_seq_len, default=max_seq_len),
+                spec.num_kv_heads,
+                spec.head_dim,
+            ))
+            ct_inputs.append(ct.TensorType(name=f"%arg{arg_idx}", shape=flex_shape))
+            ct_inputs.append(ct.TensorType(name=f"%arg{arg_idx + 1}", shape=flex_shape))
+        else:
+            ct_inputs.append(ct.TensorType(name=f"%arg{arg_idx}", shape=shape))
+            ct_inputs.append(ct.TensorType(name=f"%arg{arg_idx + 1}", shape=shape))
+        arg_idx += 2
+    # sliding_pos_ring
+    ct_inputs.append(ct.TensorType(
+        name=f"%arg{arg_idx}",
+        shape=(1, config.sliding_window_size),
+    ))
+    return ct_inputs
 
 
 def _rename_model_io(
@@ -121,6 +158,7 @@ def _hlo_to_mlpackage(
     output_path: Path,
     input_names: list[str] | None = None,
     output_names: list[str] | None = None,
+    ct_inputs: list | None = None,
 ) -> None:
     """Run hlo_to_mil → ct.convert → save in the current process.
 
@@ -131,6 +169,10 @@ def _hlo_to_mlpackage(
     data, fp16 scale) are visible to ``save_multifunction``'s cross-function
     ``const_deduplication`` pass — so weight sharing still works when
     merging quantized functions.
+
+    ct_inputs: optional list of ``ct.TensorType`` for ``ct.convert(inputs=...)``.
+        Used to specify RangeDim flexible shape bounds when the MIL program
+        has symbolic dimensions.
     """
     import ctypes as _ctypes, ctypes.util as _ctypes_util
     import threading
@@ -231,14 +273,16 @@ def _hlo_to_mlpackage(
     threading.Thread(target=_monitor, daemon=True).start()
     try:
         try:
-            cml_model = ct.convert(
-                mil_program,
+            convert_kwargs = dict(
                 source="milinternal",
                 minimum_deployment_target=ct.target.iOS18,
                 compute_precision=ct.precision.FLOAT16,
                 pass_pipeline=pipeline,
                 skip_model_load=True,
             )
+            if ct_inputs is not None:
+                convert_kwargs["inputs"] = ct_inputs
+            cml_model = ct.convert(mil_program, **convert_kwargs)
         except BaseException as _e:
             print(f"\n!!! [convert] ct.convert raised {type(_e).__name__}: {_e}", flush=True)
             _tb.print_exc()
@@ -273,6 +317,9 @@ def export_chunk_prefill(
     chunk_size: int = CHUNK_SIZE,
 ) -> None:
     """Export the chunked-prefill model (process CHUNK_SIZE tokens per call).
+
+    Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
+    so a single model works at any cache length up to ``max_seq_len``.
 
     Inputs:  tokens (1, chunk_size) int32
              start_position (1,) int32  — absolute position of first token in chunk
@@ -313,7 +360,8 @@ def export_chunk_prefill(
 
     gc.disable()
     try:
-        kv_shapes = kv_cache_shapes(config, max_seq_len)
+        cache_specs = build_cache_specs(config, max_seq_len)
+        kv_shapes = [(1, s.cache_len, s.num_kv_heads, s.head_dim) for s in cache_specs]
         pos_ring_shape = (1, config.sliding_window_size)
 
         def chunk_prefill_fn(tokens, start_pos_1d, *kv_and_ring):
@@ -327,27 +375,42 @@ def export_chunk_prefill(
             start_pos = start_pos_1d[0]
             logits, kv_new, ring_new = chunk_prefill_step(
                 params, tokens, start_pos, kv_flat, sliding_pos_ring,
-                cfg=config, chunk_size=chunk_size, max_seq_len=max_seq_len,
+                cfg=config, chunk_size=chunk_size,
             )
             return (logits,) + tuple(kv_new) + (ring_new,)
 
-        kv_flat_shapes = []
-        for shape in kv_shapes:
-            kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # k
-            kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # v
-        ring_shape = jax.ShapeDtypeStruct(pos_ring_shape, jnp.int32)
+        # Build example arrays and symbolic shape specs
+        example_args = [
+            np.zeros((1, chunk_size), dtype=np.int32),   # tokens
+            np.zeros((1,), dtype=np.int32),              # start_position
+        ]
+        shape_specs = [None, None]  # concrete shapes for tokens, start_pos
 
-        print("  Lowering chunk_prefill_step to StableHLO …", flush=True)
-        lowered = jax.jit(chunk_prefill_fn).lower(
-            jax.ShapeDtypeStruct((1, chunk_size), jnp.int32),  # tokens
-            jax.ShapeDtypeStruct((1,), jnp.int32),            # start_position
-            *kv_flat_shapes,
-            ring_shape,                                        # sliding_pos_ring
+        for spec in cache_specs:
+            shape = (1, spec.cache_len, spec.num_kv_heads, spec.head_dim)
+            example = np.zeros(shape, dtype=np.float16)
+            if spec.attn_type == AttentionType.GLOBAL:
+                sym_shape = f"1, N, {spec.num_kv_heads}, {spec.head_dim}"
+                example_args.extend([example, example])  # k, v
+                shape_specs.extend([sym_shape, sym_shape])
+            else:
+                example_args.extend([example, example])  # k, v
+                shape_specs.extend([None, None])  # concrete
+
+        example_args.append(np.full(pos_ring_shape, -1, dtype=np.int32))
+        shape_specs.append(None)
+
+        args_specs = jax_export.symbolic_args_specs(
+            tuple(example_args), shape_specs, constraints=["N >= 1"],
         )
-        hlo_module = lowered.compiler_ir('stablehlo')
-        print("  Lowering OK.", flush=True)
 
-        del lowered, params
+        print("  Symbolic export of chunk_prefill_step to StableHLO …", flush=True)
+        exported = jax_export.export(jax.jit(chunk_prefill_fn))(*args_specs)
+        mlir_module = exported.mlir_module()
+        hlo_module = ir.Module.parse(str(mlir_module), context=context)
+        print("  Symbolic export OK.", flush=True)
+
+        del exported, mlir_module, params
 
         mlir_cache = output_path.with_suffix('.mlirbc')
         print(f"  Saving MLIR cache → {mlir_cache} …", flush=True)
@@ -362,15 +425,22 @@ def export_chunk_prefill(
         print("=" * 60)
         print("Chunk-prefill export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        n_kv = len(kv_shapes)
+        n_kv = len(cache_specs)
         kv_names = _build_kv_names(n_kv)
-        # Output names use _out suffix to avoid SSA variable shadowing in MLProgram
-        # (input and output cannot share a name in the same scope).
         kv_out_names = [n + "_out" for n in kv_names]
+
+        ct_inputs = _build_ct_inputs(
+            config, cache_specs, max_seq_len,
+            prefix_inputs=[
+                ct.TensorType(name="%arg0", shape=(1, chunk_size)),
+                ct.TensorType(name="%arg1", shape=(1,)),
+            ],
+        )
         _hlo_to_mlpackage(
             hlo_module, output_path,
             input_names=["tokens", "start_position"] + kv_names + ["sliding_pos_ring"],
             output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
+            ct_inputs=ct_inputs,
         )
     finally:
         gc.enable()
@@ -386,6 +456,9 @@ def export_decode_step(
     skip_warmup: bool = False,
 ) -> None:
     """Export the single-token decode-step model.
+
+    Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
+    so a single model works at any cache length up to ``max_seq_len``.
 
     Inputs:  token_id (1,) int32
              position (1,) int32  — absolute position of this token
@@ -429,8 +502,8 @@ def export_decode_step(
 
     gc.disable()
     try:
-        # Build KV cache shapes: one per non-shared layer; k and v share shape.
-        kv_shapes = kv_cache_shapes(config, max_seq_len)  # list of 15 shapes
+        cache_specs = build_cache_specs(config, max_seq_len)
+        kv_shapes = [(1, s.cache_len, s.num_kv_heads, s.head_dim) for s in cache_specs]
         pos_ring_shape = (1, config.sliding_window_size)
 
         def decode_fn(token_id_1d, position_1d, *kv_and_ring):
@@ -445,28 +518,42 @@ def export_decode_step(
             position = position_1d[0]
             logits, kv_new, ring_new = decode_step(
                 params, token_id, position, kv_flat, sliding_pos_ring,
-                cfg=config, max_seq_len=max_seq_len,
+                cfg=config,
             )
             return (logits,) + tuple(kv_new) + (ring_new,)
 
-        # Build shape specs for all inputs.
-        kv_flat_shapes = []
-        for shape in kv_shapes:
-            kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # k
-            kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # v
-        ring_shape = jax.ShapeDtypeStruct(pos_ring_shape, jnp.int32)
+        # Build example arrays and symbolic shape specs
+        example_args = [
+            np.zeros((1,), dtype=np.int32),   # token_id
+            np.zeros((1,), dtype=np.int32),   # position
+        ]
+        shape_specs = [None, None]  # concrete shapes
 
-        print("  Lowering decode_step to StableHLO …", flush=True)
-        lowered = jax.jit(decode_fn).lower(
-            jax.ShapeDtypeStruct((1,), jnp.int32),   # token_id
-            jax.ShapeDtypeStruct((1,), jnp.int32),   # position
-            *kv_flat_shapes,
-            ring_shape,                               # sliding_pos_ring
+        for spec in cache_specs:
+            shape = (1, spec.cache_len, spec.num_kv_heads, spec.head_dim)
+            example = np.zeros(shape, dtype=np.float16)
+            if spec.attn_type == AttentionType.GLOBAL:
+                sym_shape = f"1, N, {spec.num_kv_heads}, {spec.head_dim}"
+                example_args.extend([example, example])  # k, v
+                shape_specs.extend([sym_shape, sym_shape])
+            else:
+                example_args.extend([example, example])  # k, v
+                shape_specs.extend([None, None])  # concrete
+
+        example_args.append(np.full(pos_ring_shape, -1, dtype=np.int32))
+        shape_specs.append(None)
+
+        args_specs = jax_export.symbolic_args_specs(
+            tuple(example_args), shape_specs, constraints=["N >= 1"],
         )
-        hlo_module = lowered.compiler_ir('stablehlo')
-        print("  Lowering OK.", flush=True)
 
-        del lowered, params
+        print("  Symbolic export of decode_step to StableHLO …", flush=True)
+        exported = jax_export.export(jax.jit(decode_fn))(*args_specs)
+        mlir_module = exported.mlir_module()
+        hlo_module = ir.Module.parse(str(mlir_module), context=context)
+        print("  Symbolic export OK.", flush=True)
+
+        del exported, mlir_module, params
 
         mlir_cache = output_path.with_suffix('.mlirbc')
         print(f"  Saving MLIR cache → {mlir_cache} …", flush=True)
@@ -481,13 +568,22 @@ def export_decode_step(
         print("=" * 60)
         print("Decode export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        n_kv = len(kv_shapes)
+        n_kv = len(cache_specs)
         kv_names = _build_kv_names(n_kv)
         kv_out_names = [n + "_out" for n in kv_names]
+
+        ct_inputs = _build_ct_inputs(
+            config, cache_specs, max_seq_len,
+            prefix_inputs=[
+                ct.TensorType(name="%arg0", shape=(1,)),
+                ct.TensorType(name="%arg1", shape=(1,)),
+            ],
+        )
         _hlo_to_mlpackage(
             hlo_module, output_path,
             input_names=["token_id", "position"] + kv_names + ["sliding_pos_ring"],
             output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
+            ct_inputs=ct_inputs,
         )
     finally:
         gc.enable()

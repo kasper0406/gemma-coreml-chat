@@ -62,7 +62,6 @@ def _jax_slow_prefill_logits(
             kv_flat,
             pos_ring,
             cfg=cfg,
-            max_seq_len=max_seq_len,
         )
     return np.asarray(logits, dtype=np.float32), params, cfg
 
@@ -139,7 +138,6 @@ def _jax_greedy_tokens_after_prefill(
             kv_flat,
             pos_ring,
             cfg=cfg,
-            max_seq_len=max_seq_len,
         )
     t = len(prompt_ids)
     out: list[int] = []
@@ -154,7 +152,6 @@ def _jax_greedy_tokens_after_prefill(
             kv_flat,
             pos_ring,
             cfg=cfg,
-            max_seq_len=max_seq_len,
         )
         logits_np = np.asarray(logits, dtype=np.float32)
     return out
