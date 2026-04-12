@@ -185,9 +185,10 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
 
         # Write slot: ring-buffer modular index for sliding, absolute for global.
         write_idx = (position % cfg.sliding_window_size) if is_sliding else position
-        slot = (jnp.arange(max_len, dtype=jnp.int32) == write_idx)[None, :, None, None]
-        k_updated = jnp.where(slot, k_new, k_cache).astype(jnp.float16)
-        v_updated = jnp.where(slot, v_new, v_cache).astype(jnp.float16)
+        k_new_f16 = k_new.astype(jnp.float16)
+        v_new_f16 = v_new.astype(jnp.float16)
+        k_updated = jax.lax.dynamic_update_slice(k_cache, k_new_f16, (0, write_idx, 0, 0))
+        v_updated = jax.lax.dynamic_update_slice(v_cache, v_new_f16, (0, write_idx, 0, 0))
         k_full, v_full = k_updated, v_updated
 
     # Attention validity mask
