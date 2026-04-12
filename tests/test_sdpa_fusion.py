@@ -329,6 +329,136 @@ def test_graph_dump():
     _dump_ops(prog)
 
 
+# ── Numerical correctness tests ───────────────────────────────────────────
+
+def _jax_to_coreml_model(fn, *example_args):
+    """Build a CoreML model from a JAX function, with full pass pipeline."""
+    prog = _jax_to_mil(fn, *example_args)
+    _full_pipeline(prog)
+    return ct.convert(
+        prog,
+        compute_precision=ct.precision.FLOAT32,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+
+def _run_coreml(model, *np_inputs):
+    """Run CoreML prediction and return first output as numpy array."""
+    inputs = {f"_arg{i}": v for i, v in enumerate(np_inputs)}
+    result = model.predict(inputs)
+    key = list(result.keys())[0]
+    return np.array(result[key])
+
+
+def test_numerical_simple_attention():
+    """Numerical: simple attention L=8 produces same output as JAX."""
+    rng = np.random.RandomState(42)
+    B, H, L, S, E = 1, 8, 8, 32, 256
+    q_np = rng.randn(B, H, L, E).astype(np.float32) * 0.1
+    k_np = rng.randn(B, H, S, E).astype(np.float32) * 0.1
+    v_np = rng.randn(B, H, S, E).astype(np.float32) * 0.1
+    mask_bool = np.ones((1, 1, L, S), dtype=np.bool_)
+
+    # JAX reference
+    q, k, v = jnp.array(q_np), jnp.array(k_np), jnp.array(v_np)
+    mask = jnp.array(mask_bool)
+    jax_out = np.array(attention_masked(q, k, v, mask))
+
+    # CoreML with SDPA fusion
+    model = _jax_to_coreml_model(
+        attention_masked,
+        jnp.ones_like(q), jnp.ones_like(k), jnp.ones_like(v), jnp.ones_like(mask),
+    )
+    # CoreML converts bool→fp32 at I/O boundary
+    mask_fp32 = mask_bool.astype(np.float32)
+    coreml_out = _run_coreml(model, q_np, k_np, v_np, mask_fp32)
+
+    max_diff = np.max(np.abs(jax_out - coreml_out))
+    print(f"  simple L=8: max_diff={max_diff:.6f}")
+    assert max_diff < 0.001, f"Numerical mismatch: max_diff={max_diff}"
+    print("  ✓ test_numerical_simple_attention passed")
+
+
+def test_numerical_gqa_l1():
+    """Numerical: GQA with L=1 (decode) produces same output as JAX."""
+    def gqa_attention(q, k, v, mask):
+        k = jnp.repeat(k, 8, axis=2)
+        v = jnp.repeat(v, 8, axis=2)
+        qt = jnp.transpose(q, (0, 2, 1, 3))
+        kt = jnp.transpose(k, (0, 2, 1, 3))
+        vt = jnp.transpose(v, (0, 2, 1, 3))
+        scores = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))
+        scores = jnp.where(mask[jnp.newaxis, jnp.newaxis], scores, jnp.float32(-10000.0))
+        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
+        out = jnp.matmul(weights, vt)
+        return jnp.transpose(out, (0, 2, 1, 3))
+
+    rng = np.random.RandomState(42)
+    B, L, S, H, hd = 1, 1, 32, 8, 256
+    q_np = rng.randn(B, L, H, hd).astype(np.float32) * 0.1
+    k_np = rng.randn(B, S, 1, hd).astype(np.float32) * 0.1
+    v_np = rng.randn(B, S, 1, hd).astype(np.float32) * 0.1
+    mask_bool = np.ones((L, S), dtype=np.bool_)
+
+    q, k, v = jnp.array(q_np), jnp.array(k_np), jnp.array(v_np)
+    mask = jnp.array(mask_bool)
+    jax_out = np.array(gqa_attention(q, k, v, mask))
+
+    model = _jax_to_coreml_model(
+        gqa_attention,
+        jnp.ones_like(q), jnp.ones_like(k), jnp.ones_like(v), jnp.ones_like(mask),
+    )
+    mask_fp32 = mask_bool.astype(np.float32)
+    coreml_out = _run_coreml(model, q_np, k_np, v_np, mask_fp32)
+
+    max_diff = np.max(np.abs(jax_out - coreml_out))
+    print(f"  GQA L=1: max_diff={max_diff:.6f}")
+    assert max_diff < 0.001, f"Numerical mismatch: max_diff={max_diff}"
+    print("  ✓ test_numerical_gqa_l1 passed")
+
+
+def test_numerical_gqa_l8():
+    """Numerical: GQA with L=8 (prefill) — the critical case.
+
+    Before the fix, SDPA output was in [B,H,L,EV] but the graph expected
+    [B,L,H,EV].  With L=H=8 the shape is identical but data order differs.
+    """
+    def gqa_attention(q, k, v, mask):
+        k = jnp.repeat(k, 8, axis=2)
+        v = jnp.repeat(v, 8, axis=2)
+        qt = jnp.transpose(q, (0, 2, 1, 3))
+        kt = jnp.transpose(k, (0, 2, 1, 3))
+        vt = jnp.transpose(v, (0, 2, 1, 3))
+        scores = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))
+        scores = jnp.where(mask[jnp.newaxis, jnp.newaxis], scores, jnp.float32(-10000.0))
+        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
+        out = jnp.matmul(weights, vt)
+        return jnp.transpose(out, (0, 2, 1, 3))
+
+    rng = np.random.RandomState(42)
+    B, L, S, H, hd = 1, 8, 32, 8, 256
+    q_np = rng.randn(B, L, H, hd).astype(np.float32) * 0.1
+    k_np = rng.randn(B, S, 1, hd).astype(np.float32) * 0.1
+    v_np = rng.randn(B, S, 1, hd).astype(np.float32) * 0.1
+    mask_bool = np.ones((L, S), dtype=np.bool_)
+
+    q, k, v = jnp.array(q_np), jnp.array(k_np), jnp.array(v_np)
+    mask = jnp.array(mask_bool)
+    jax_out = np.array(gqa_attention(q, k, v, mask))
+
+    model = _jax_to_coreml_model(
+        gqa_attention,
+        jnp.ones_like(q), jnp.ones_like(k), jnp.ones_like(v), jnp.ones_like(mask),
+    )
+    mask_fp32 = mask_bool.astype(np.float32)
+    coreml_out = _run_coreml(model, q_np, k_np, v_np, mask_fp32)
+
+    max_diff = np.max(np.abs(jax_out - coreml_out))
+    print(f"  GQA L=8: max_diff={max_diff:.6f}")
+    assert max_diff < 0.001, f"Numerical mismatch: max_diff={max_diff}"
+    print("  ✓ test_numerical_gqa_l8 passed")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -340,6 +470,7 @@ if __name__ == "__main__":
         test_graph_dump()
         sys.exit(0)
 
+    # Structural tests
     test_sdpa_fusion_masked()
     test_sdpa_fusion_no_mask()
     test_sdpa_different_head_dim()
@@ -347,4 +478,10 @@ if __name__ == "__main__":
     test_gqa_attention()
     test_gqa_global_attention()
     test_standard_scaled_attention()
+
+    # Numerical correctness tests
+    test_numerical_simple_attention()
+    test_numerical_gqa_l1()
+    test_numerical_gqa_l8()
+
     print("\nAll tests passed ✓")

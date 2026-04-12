@@ -23,13 +23,18 @@ import numpy as np
 
 
 def _get_scalar(var):
-    """Extract a Python float from a MIL variable if it's a compile-time scalar."""
+    """Extract a Python float from a MIL variable if it's a compile-time scalar
+    or a uniform-valued constant (all elements identical — DEFAULT passes
+    broadcast scalars into full-size tensors)."""
     if var.val is None:
         return None
-    val = np.asarray(var.val).flatten()
-    if val.size != 1:
+    arr = np.asarray(var.val).flatten()
+    if arr.size == 0:
         return None
-    return float(val[0])
+    first = float(arr[0])
+    if arr.size > 1 and not np.all(arr == arr[0]):
+        return None
+    return first
 
 
 def _sole_consumer(var):

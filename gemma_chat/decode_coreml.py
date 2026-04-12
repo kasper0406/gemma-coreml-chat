@@ -518,7 +518,10 @@ def chunk_prefill_step(
     write_mask = (jnp.arange(W, dtype=jnp.int32)[:, None]
                   == ring_slots[None, :])  # (W, C)
     any_written = write_mask.any(axis=1)  # (W,)
-    new_ring_vals = jnp.dot(write_mask.astype(jnp.int32), abs_pos)  # (W,)
+    # Use float16 dot — MPS does not support int32 matmul.
+    new_ring_vals = jnp.dot(
+        write_mask.astype(jnp.float16), abs_pos.astype(jnp.float16)
+    ).astype(jnp.int32)  # (W,)
     sliding_pos_ring = jnp.where(any_written[None, :], new_ring_vals[None, :],
                                  sliding_pos_ring)
 

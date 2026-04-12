@@ -215,6 +215,40 @@ def _match_sdpa(softmax_op):
     if K_E is not None and isinstance(K_E, int) and K_E != E:
         return None
 
+    # ── compute compensating output layout perm ──────────────────────
+    # The 3D matmul output is [merged_batch, L, EV].  Reshape inserts B
+    # (size B_ref) at some position, giving 4D [d0, d1, d2, EV].  The
+    # transpose then reorders to the expected output layout.
+    #
+    # SDPA always outputs [B, H, L, EV].  If the original output layout
+    # differs (e.g. [B, L, H, EV] when the JAX code transposes H↔L after
+    # attention), we need a compensating transpose after SDPA.
+    B_ref_val = out_4d.shape[0] if out_4d.shape is not None else 1
+    reshape_4d = list(out_reshaped.shape)[:3]
+    out_perm = [int(x) for x in np.asarray(out_transpose_op.inputs["perm"].val)]
+
+    # Find B's position in the 4D reshaped tensor (prefer rightmost).
+    b_pos = None
+    for i in range(2, -1, -1):
+        if reshape_4d[i] == B_ref_val:
+            b_pos = i
+            break
+    if b_pos is None:
+        return None
+
+    # Build P: perm mapping SDPA [B,H,L,EV] positions → reshaped positions.
+    # In the reshaped tensor, H (merged) is at the first non-B slot, L at
+    # the second, because reshape preserves data order from [merged, L, EV].
+    non_b = [i for i in range(3) if i != b_pos]
+    P = [0, 0, 0, 3]
+    P[b_pos] = 0       # B (SDPA pos 0) → b_pos in reshaped
+    P[non_b[0]] = 1    # H (SDPA pos 1) → first non-B slot
+    P[non_b[1]] = 2    # L (SDPA pos 2) → second non-B slot
+
+    # Compensating perm: compose P with the output transpose.
+    # out_layout_perm[i] = P[out_perm[i]]
+    out_layout_perm = [P[out_perm[i]] for i in range(4)]
+
     # ── collect dead ops ─────────────────────────────────────────────
     dead = {matmul_0, matmul_1, softmax_op, out_reshape_op, out_transpose_op}
     for op in scores_unwrap:
@@ -249,7 +283,8 @@ def _match_sdpa(softmax_op):
                 if consumer not in dead:
                     return None
 
-    return Q_raw, K_raw, V_raw, mask_var, E, out_4d, out_transpose_op, dead, has_explicit_scaling
+    return (Q_raw, K_raw, V_raw, mask_var, E, out_4d, out_transpose_op,
+            dead, has_explicit_scaling, out_layout_perm)
 
 
 @block_context_manager
@@ -267,7 +302,8 @@ def _replace_in_block(block):
         result = _match_sdpa(op)
         if result is None:
             continue
-        Q_raw, K_raw, V_raw, mask_var, E, out_4d, anchor_op, dead_ops, has_explicit_scaling = result
+        (Q_raw, K_raw, V_raw, mask_var, E, out_4d, anchor_op,
+         dead_ops, has_explicit_scaling, out_layout_perm) = result
 
         # ── Fix Q/K/V layouts for SDPA [B, H, ?, ?] ─────────────
         # out_4d is always [B, H, L, EV] — use shape[0] as B reference.
@@ -330,6 +366,17 @@ def _replace_in_block(block):
             before_op=anchor_op,
             name=anchor_op.name + "_sdpa",
         )
+
+        # Compensate for output layout mismatch.
+        # SDPA outputs [B, H, L, EV] but the original graph may expect a
+        # different layout (e.g. [B, L, H, EV] for GQA).  Apply the
+        # compensating transpose if it's not the identity perm.
+        if out_layout_perm != [0, 1, 2, 3]:
+            sdpa_out = mb.transpose(
+                x=sdpa_out, perm=out_layout_perm,
+                before_op=anchor_op,
+                name=anchor_op.name + "_sdpa_layout",
+            )
 
         block.replace_uses_of_var_after_op(
             anchor_op=anchor_op,
