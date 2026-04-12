@@ -38,6 +38,7 @@ def build_ct_convert_pass_pipeline():
     import gemma_chat.mil_passes.replace_erf_gelu  # noqa: F401
     import gemma_chat.mil_passes.collapse_reshape_chains  # noqa: F401
     import gemma_chat.mil_passes.collapse_transpose_chains  # noqa: F401
+    import gemma_chat.mil_passes.collapse_cast_chains  # noqa: F401
     import gemma_chat.mil_passes.fuse_reduce_sum_to_mean  # noqa: F401
     import gemma_chat.mil_passes.remove_redundant_maximum  # noqa: F401
     import gemma_chat.mil_passes.remove_broadcast_tiles  # noqa: F401
@@ -54,6 +55,7 @@ def build_ct_convert_pass_pipeline():
     pipeline.append_pass("common::replace_erf_gelu")
     pipeline.append_pass("common::collapse_reshape_chains")
     pipeline.append_pass("common::collapse_transpose_chains")
+    pipeline.append_pass("common::collapse_cast_chains")
     pipeline.append_pass("common::fuse_reduce_sum_to_mean")
     pipeline.append_pass("common::remove_redundant_maximum")
     pipeline.append_pass("common::remove_broadcast_tiles")

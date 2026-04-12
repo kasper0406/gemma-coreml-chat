@@ -168,7 +168,9 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
     pos_arr = position[jnp.newaxis, jnp.newaxis]  # (1, 1) for RoPE
 
     q = jnp.dot(x[0, 0], sa['q_proj']['kernel']).reshape(1, 1, num_heads, hd)
-    q = _rmsnorm(q, sa['q_norm']['scale'])
+    # Pre-scale Q norm by √hd so SDPA's built-in 1/√E cancels it (no runtime pre-scale mul).
+    q_scale = sa['q_norm']['scale'] * jnp.sqrt(float(hd))
+    q = _rmsnorm(q, q_scale)
     q = _apply_rope(q, pos_arr, base_freq, rope_frac)
 
     if shared_kv is not None:
@@ -210,6 +212,7 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
     vt = jnp.transpose(v_full, (0, 2, 1, 3))
 
     w = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))           # (1, H, 1, max_len)
+    w = w * (float(hd) ** -0.5)
     w = jnp.where(valid[jnp.newaxis, jnp.newaxis, jnp.newaxis], w, -10000.0)
     w = jax.nn.softmax(w.astype(jnp.float32), axis=-1)
 
@@ -362,7 +365,8 @@ def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
     k_new = jnp.dot(x, sa['k_proj']['kernel']).reshape(1, C, num_kv_heads, hd)
     v_new = jnp.dot(x, sa['v_proj']['kernel']).reshape(1, C, num_kv_heads, hd)
 
-    q = _rmsnorm(q, sa['q_norm']['scale'])
+    q_scale = sa['q_norm']['scale'] * jnp.sqrt(float(hd))
+    q = _rmsnorm(q, q_scale)
     k_new = _rmsnorm(k_new, sa['k_norm']['scale'])
     v_new = _rmsnorm_noscale(v_new)
 
@@ -402,6 +406,7 @@ def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
     vt = jnp.transpose(v_full, (0, 2, 1, 3))
 
     w = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))  # (1, H, C, cache_len)
+    w = w * (float(hd) ** -0.5)
 
     pos_q = positions[0]  # (C,)
     if is_sliding:
@@ -440,7 +445,8 @@ def _attn_chunk_shared(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type
     sa = lp['self_attn']
 
     q = jnp.dot(x, sa['q_proj']['kernel']).reshape(1, C, num_heads, hd)
-    q = _rmsnorm(q, sa['q_norm']['scale'])
+    q_scale = sa['q_norm']['scale'] * jnp.sqrt(float(hd))
+    q = _rmsnorm(q, q_scale)
     q = _apply_rope(q, positions, base_freq, rope_frac)
 
     k_src, v_src = shared_kv
@@ -455,6 +461,7 @@ def _attn_chunk_shared(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type
     vt = jnp.transpose(v_full, (0, 2, 1, 3))
 
     w = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))
+    w = w * (float(hd) ** -0.5)
 
     pos_q = positions[0]
     if is_sliding:
