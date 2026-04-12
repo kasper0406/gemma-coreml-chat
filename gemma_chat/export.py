@@ -171,16 +171,12 @@ def _hlo_to_mlpackage(
         orig_dtype = arr.dtype
         if arr.dtype == np.float32:
             arr = arr.astype(np.float16)
-        is_embed = any(s == _VOCAB_SIZE for s in arr.shape)
-        nbits = 8 if is_embed else 4
+        nbits = 4
         q_data, scale = _quantize_symmetric_blockwise(
             arr, axis=0, group_size=_GROUP_SIZE, nbits=nbits,
         )
         del arr
-        if is_embed:
-            _stream_counter[1] += 1
-        else:
-            _stream_counter[0] += 1
+        _stream_counter[0] += 1
         _stream_counter[2] += q_data.nbytes * 2
         total = _stream_counter[0] + _stream_counter[1]
         if total % 20 == 0:
@@ -190,7 +186,7 @@ def _hlo_to_mlpackage(
                 f"({_stream_counter[2] / 1e9:.2f} GB)  RSS={_rss_mb():.0f} MB",
                 flush=True,
             )
-        suffix = "_int8" if is_embed else "_int4"
+        suffix = "_int4"
         result = mb.constexpr_blockwise_shift_scale(
             data=q_data, scale=scale, name=name + suffix,
         )

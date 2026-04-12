@@ -77,8 +77,6 @@ def _classify_quantize(op):
     for child_op in op.outputs[0].child_ops:
         if child_op.op_type.startswith("constexpr_"):
             return "skip_constexpr"
-    if _is_embedding(val):
-        return "int8"
     return "int4"
 
 
