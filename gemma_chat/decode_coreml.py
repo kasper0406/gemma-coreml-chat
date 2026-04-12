@@ -119,16 +119,17 @@ def _ffn(lp, x, hidden_dim: int):
     """GeLU-gated FFN. x: (..., D) → (..., D)."""
     gate = jnp.dot(x, lp['mlp']['gate_proj']['kernel'])
     up   = jnp.dot(x, lp['mlp']['up_proj']['kernel'])
-    return jnp.dot(jax.nn.gelu(gate, approximate=False) * up,
-                   lp['mlp']['down_proj']['kernel'])
+    # GELU in float32 so the erf polynomial stays scalar (avoids constexpr quantization)
+    gate = jax.nn.gelu(gate.astype(jnp.float32), approximate=False).astype(jnp.float16)
+    return jnp.dot(gate * up, lp['mlp']['down_proj']['kernel'])
 
 
 def _ple_gate(lp, x, ple_slice):
     """Per-layer input gate block. x: (..., D), ple_slice: (..., d) → (..., D)."""
+    gate_proj = jnp.dot(x, lp['per_layer_input_gate']['kernel'])
     gate = jax.nn.gelu(
-        jnp.dot(x, lp['per_layer_input_gate']['kernel']),
-        approximate=False,
-    ) * ple_slice
+        gate_proj.astype(jnp.float32), approximate=False,
+    ).astype(jnp.float16) * ple_slice
     proj = jnp.dot(gate, lp['per_layer_projection']['kernel'])
     proj = _rmsnorm(proj, lp['post_per_layer_input_norm']['scale'])
     return x + proj
@@ -168,9 +169,7 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
     pos_arr = position[jnp.newaxis, jnp.newaxis]  # (1, 1) for RoPE
 
     q = jnp.dot(x[0, 0], sa['q_proj']['kernel']).reshape(1, 1, num_heads, hd)
-    # Pre-scale Q norm by √hd so SDPA's built-in 1/√E cancels it (no runtime pre-scale mul).
-    q_scale = sa['q_norm']['scale'] * jnp.sqrt(float(hd))
-    q = _rmsnorm(q, q_scale)
+    q = _rmsnorm(q, sa['q_norm']['scale'])
     q = _apply_rope(q, pos_arr, base_freq, rope_frac)
 
     if shared_kv is not None:
@@ -212,9 +211,8 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
     vt = jnp.transpose(v_full, (0, 2, 1, 3))
 
     w = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))           # (1, H, 1, max_len)
-    w = w * (float(hd) ** -0.5)
     w = jnp.where(valid[jnp.newaxis, jnp.newaxis, jnp.newaxis], w, -10000.0)
-    w = jax.nn.softmax(w.astype(jnp.float32), axis=-1).astype(jnp.float16)
+    w = jax.nn.softmax(w, axis=-1)
 
     out = jnp.matmul(w, vt)                                 # (1, H, 1, hd)
     out = jnp.transpose(out, (0, 2, 1, 3)).reshape(1, 1, num_heads * hd)
@@ -365,8 +363,7 @@ def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
     k_new = jnp.dot(x, sa['k_proj']['kernel']).reshape(1, C, num_kv_heads, hd)
     v_new = jnp.dot(x, sa['v_proj']['kernel']).reshape(1, C, num_kv_heads, hd)
 
-    q_scale = sa['q_norm']['scale'] * jnp.sqrt(float(hd))
-    q = _rmsnorm(q, q_scale)
+    q = _rmsnorm(q, sa['q_norm']['scale'])
     k_new = _rmsnorm(k_new, sa['k_norm']['scale'])
     v_new = _rmsnorm_noscale(v_new)
 
@@ -406,7 +403,6 @@ def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
     vt = jnp.transpose(v_full, (0, 2, 1, 3))
 
     w = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))  # (1, H, C, cache_len)
-    w = w * (float(hd) ** -0.5)
 
     pos_q = positions[0]  # (C,)
     if is_sliding:
@@ -419,7 +415,7 @@ def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
         mask = pos_k[jnp.newaxis, :] <= pos_q[:, jnp.newaxis]  # (C, max_len)
 
     w = jnp.where(mask[jnp.newaxis, jnp.newaxis], w, -10000.0)
-    w = jax.nn.softmax(w.astype(jnp.float32), axis=-1).astype(jnp.float16)
+    w = jax.nn.softmax(w, axis=-1)
 
     out = jnp.matmul(w, vt)                                    # (1, H, C, hd)
     out = jnp.transpose(out, (0, 2, 1, 3)).reshape(1, C, num_heads * hd)
@@ -445,8 +441,7 @@ def _attn_chunk_shared(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type
     sa = lp['self_attn']
 
     q = jnp.dot(x, sa['q_proj']['kernel']).reshape(1, C, num_heads, hd)
-    q_scale = sa['q_norm']['scale'] * jnp.sqrt(float(hd))
-    q = _rmsnorm(q, q_scale)
+    q = _rmsnorm(q, sa['q_norm']['scale'])
     q = _apply_rope(q, positions, base_freq, rope_frac)
 
     k_src, v_src = shared_kv
@@ -461,7 +456,6 @@ def _attn_chunk_shared(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type
     vt = jnp.transpose(v_full, (0, 2, 1, 3))
 
     w = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))
-    w = w * (float(hd) ** -0.5)
 
     pos_q = positions[0]
     if is_sliding:
@@ -472,7 +466,7 @@ def _attn_chunk_shared(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type
         mask = pos_k[jnp.newaxis, :] <= pos_q[:, jnp.newaxis]
 
     w = jnp.where(mask[jnp.newaxis, jnp.newaxis], w, -10000.0)
-    w = jax.nn.softmax(w.astype(jnp.float32), axis=-1).astype(jnp.float16)
+    w = jax.nn.softmax(w, axis=-1)
 
     out = jnp.transpose(jnp.matmul(w, vt), (0, 2, 1, 3)).reshape(1, C, num_heads * hd)
     return jnp.dot(out, sa['o_proj']['kernel'])
