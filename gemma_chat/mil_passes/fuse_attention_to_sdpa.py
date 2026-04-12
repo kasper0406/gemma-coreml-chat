@@ -8,6 +8,7 @@ attention layer appears as a 3D batch-folded matmul pattern::
     K_raw [H,B,S,E]   → reshape → K_3d [HB,S,E]
     matmul(Q_3d, K_3d, transpose_y=True) → scores_3d [BH,L,S]
       → reshape → transpose → scores_4d [B,H,L,S]
+    [optional: real_div(scores_4d, sqrt(E)) — standard attention scaling]
     select(mask, scores_4d, -10000)
     [cast(fp32)]
     softmax(axis=-1) → weights_4d [B,H,L,S]
@@ -16,22 +17,14 @@ attention layer appears as a 3D batch-folded matmul pattern::
     matmul(weights_3d, V_3d, transpose_y=True) → out_3d [BH,L,EV]
       → reshape → transpose → out_4d [B,H,L,EV]
 
-The batch-fold transposes before K and V reshapes have varying permutations
-depending on whether GQA repeat (``jnp.repeat``) precedes the layout
-transpose.  This pass peels back only through the reshape to get the raw
-4D tensors, then inserts explicit transposes to reach SDPA's required
-``[B, H, ?, ?]`` layout.
+This pass handles two attention scaling styles:
 
-This pass replaces the entire chain with a single SDPA op at rank 4::
+1. **Standard** (Llama, Mistral): explicit ``real_div(scores, sqrt(E))`` or
+   ``mul(scores, 1/sqrt(E))`` between the scores matmul and softmax.  The
+   pass absorbs this scaling — SDPA divides by ``sqrt(E)`` natively.
 
-    Q_4d  = transpose(Q_raw) if needed     # [B,H,L,E]
-    K_4d  = transpose(K_raw, [1,0,2,3])    # [B,H,S,E]
-    V_4d  = transpose(V_raw, [1,0,3,2])    # [B,H,S,EV]
-    Q_prescaled = Q_4d * sqrt(E)
-    out_4d = sdpa(Q_prescaled, K_4d, V_4d, attn_mask=mask)
-
-The ``sqrt(E)`` pre-scaling cancels SDPA's built-in ``1/sqrt(E)`` divisor,
-since Gemma4 uses ``scale=1.0`` (QK-norm absorbs the scaling).
+2. **Gemma-style** (scale=1.0, QK-norm): no explicit scaling in the graph.
+   Q is pre-multiplied by ``sqrt(E)`` to cancel SDPA's built-in divisor.
 """
 
 from __future__ import annotations
@@ -43,6 +36,20 @@ from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 _MASK_FILL_THRESHOLD = -1000.0
+
+
+def _get_scalar_val(var):
+    """Extract a Python float from a MIL variable if it's a compile-time scalar
+    or a uniform-valued constant (all elements identical)."""
+    if var.val is None:
+        return None
+    arr = np.asarray(var.val).flatten()
+    if arr.size == 0:
+        return None
+    first = float(arr[0])
+    if arr.size == 1 or np.all(arr == first):
+        return first
+    return None
 
 
 def _is_large_negative(var) -> bool:
@@ -90,8 +97,14 @@ def _peel_fwd_single(var, op_type):
 def _match_sdpa(softmax_op):
     """Match attention pattern anchored at a softmax op.
 
-    Returns ``(Q_4d, K_4d, V_4d, mask_var, E, out_4d, anchor_op, dead_ops)``
-    or ``None``.
+    Returns ``(Q_4d, K_4d, V_4d, mask_var, E, out_4d, anchor_op, dead_ops,
+    has_explicit_scaling)`` or ``None``.
+
+    ``has_explicit_scaling`` is True if the graph contains an explicit
+    ``real_div(scores, sqrt(E))`` or ``mul(scores, 1/sqrt(E))`` between the
+    scores matmul and softmax.  When True, SDPA handles scaling natively and
+    Q should NOT be pre-scaled.  When False (Gemma-style scale=1.0), Q must
+    be pre-scaled by ``sqrt(E)`` to cancel SDPA's built-in divisor.
     """
     if softmax_op.op_type != "softmax":
         return None
@@ -112,6 +125,29 @@ def _match_sdpa(softmax_op):
             mask_var = sel.inputs["cond"]
             scores_4d = sel.inputs["a"]
             select_op = sel
+
+    # ── check for explicit attention scaling ──────────────────────────
+    # Standard transformers: real_div(scores, sqrt(E)) or mul(scores, 1/sqrt(E))
+    # between scores_4d and the rest of the backward chain.
+    has_explicit_scaling = False
+    scale_op = None
+    if scores_4d.op is not None and scores_4d.op.op_type == "real_div":
+        scale_op = scores_4d.op
+        scores_4d = scale_op.inputs["x"]
+        has_explicit_scaling = True
+    elif scores_4d.op is not None and scores_4d.op.op_type == "mul":
+        # mul(scores, 1/sqrt(E)) — one operand is a small scalar constant
+        candidate = scores_4d.op
+        sx = _get_scalar_val(candidate.inputs["x"])
+        sy = _get_scalar_val(candidate.inputs["y"])
+        if sx is not None and 0 < abs(sx) < 1:
+            scale_op = candidate
+            scores_4d = candidate.inputs["y"]
+            has_explicit_scaling = True
+        elif sy is not None and 0 < abs(sy) < 1:
+            scale_op = candidate
+            scores_4d = candidate.inputs["x"]
+            has_explicit_scaling = True
 
     # ── scores_4d ← transpose ← reshape ← matmul_0 ─────────────────
     scores_src, scores_unwrap = _peel_back(scores_4d, "transpose", "reshape")
@@ -189,6 +225,8 @@ def _match_sdpa(softmax_op):
         dead.add(cast_op)
     if weights_reshape:
         dead.add(weights_reshape)
+    if scale_op:
+        dead.add(scale_op)
 
     # Prep ops only if all their consumers are dead
     for prep_op in list(q_prep) + list(k_prep) + list(v_prep):
@@ -211,7 +249,7 @@ def _match_sdpa(softmax_op):
                 if consumer not in dead:
                     return None
 
-    return Q_raw, K_raw, V_raw, mask_var, E, out_4d, out_transpose_op, dead
+    return Q_raw, K_raw, V_raw, mask_var, E, out_4d, out_transpose_op, dead, has_explicit_scaling
 
 
 @block_context_manager
@@ -229,7 +267,7 @@ def _replace_in_block(block):
         result = _match_sdpa(op)
         if result is None:
             continue
-        Q_raw, K_raw, V_raw, mask_var, E, out_4d, anchor_op, dead_ops = result
+        Q_raw, K_raw, V_raw, mask_var, E, out_4d, anchor_op, dead_ops, has_explicit_scaling = result
 
         # ── Fix Q/K/V layouts for SDPA [B, H, ?, ?] ─────────────
         # out_4d is always [B, H, L, EV] — use shape[0] as B reference.
@@ -269,19 +307,25 @@ def _replace_in_block(block):
                 name=anchor_op.name + "_v_layout",
             )
 
-        from coremltools.converters.mil.mil import types as mil_types
-        q_dtype = Q_4d.dtype
-        scale_val = np.sqrt(float(E))
-        scale_np = np.float16(scale_val) if q_dtype == mil_types.fp16 else np.float32(scale_val)
-
-        q_scaled = mb.mul(
-            x=Q_4d, y=scale_np,
-            before_op=anchor_op,
-            name=anchor_op.name + "_q_prescale",
-        )
+        if has_explicit_scaling:
+            # Standard attention: graph already has real_div/mul by sqrt(E),
+            # which is absorbed into the fusion. SDPA divides by sqrt(E) natively.
+            q_input = Q_4d
+        else:
+            # Gemma-style: scale=1.0 (QK-norm absorbs scaling). Pre-multiply
+            # Q by sqrt(E) to cancel SDPA's built-in 1/sqrt(E) divisor.
+            from coremltools.converters.mil.mil import types as mil_types
+            q_dtype = Q_4d.dtype
+            scale_val = np.sqrt(float(E))
+            scale_np = np.float16(scale_val) if q_dtype == mil_types.fp16 else np.float32(scale_val)
+            q_input = mb.mul(
+                x=Q_4d, y=scale_np,
+                before_op=anchor_op,
+                name=anchor_op.name + "_q_prescale",
+            )
 
         sdpa_out = mb.scaled_dot_product_attention(
-            query=q_scaled, key=K_4d, value=V_4d,
+            query=q_input, key=K_4d, value=V_4d,
             attn_mask=mask_var,
             before_op=anchor_op,
             name=anchor_op.name + "_sdpa",

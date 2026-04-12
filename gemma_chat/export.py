@@ -158,9 +158,10 @@ def _hlo_to_mlpackage(
     except Exception as _e:
         print(f"  [convert] malloc_zone_pressure_relief skipped: {_e}", flush=True)
 
-    # ── Streaming int4 quantization during HLO→MIL ──
+    # ── Streaming mixed-precision quantization during HLO→MIL ──
     _WEIGHT_THRESHOLD = 2048
-    _stream_counter = [0, 0]  # [count, total_bytes]
+    _VOCAB_SIZE = 262144
+    _stream_counter = [0, 0, 0]  # [count_int4, count_int8, total_bytes]
 
     def _stream_quantize(arr: np.ndarray, name: str):
         if arr.ndim < 2 or arr.size <= _WEIGHT_THRESHOLD:
@@ -170,20 +171,28 @@ def _hlo_to_mlpackage(
         orig_dtype = arr.dtype
         if arr.dtype == np.float32:
             arr = arr.astype(np.float16)
+        is_embed = any(s == _VOCAB_SIZE for s in arr.shape)
+        nbits = 8 if is_embed else 4
         q_data, scale = _quantize_symmetric_blockwise(
-            arr, axis=0, group_size=_GROUP_SIZE,
+            arr, axis=0, group_size=_GROUP_SIZE, nbits=nbits,
         )
         del arr
-        _stream_counter[0] += 1
-        _stream_counter[1] += q_data.nbytes * 2
-        if _stream_counter[0] % 20 == 0:
+        if is_embed:
+            _stream_counter[1] += 1
+        else:
+            _stream_counter[0] += 1
+        _stream_counter[2] += q_data.nbytes * 2
+        total = _stream_counter[0] + _stream_counter[1]
+        if total % 20 == 0:
             print(
-                f"    streaming-quantized {_stream_counter[0]} tensors  "
-                f"({_stream_counter[1] / 1e9:.2f} GB)  RSS={_rss_mb():.0f} MB",
+                f"    streaming-quantized {_stream_counter[0]} int4 + "
+                f"{_stream_counter[1]} int8  "
+                f"({_stream_counter[2] / 1e9:.2f} GB)  RSS={_rss_mb():.0f} MB",
                 flush=True,
             )
+        suffix = "_int8" if is_embed else "_int4"
         result = mb.constexpr_blockwise_shift_scale(
-            data=q_data, scale=scale, name=name + "_int4",
+            data=q_data, scale=scale, name=name + suffix,
         )
         if orig_dtype == np.float32:
             result = mb.cast(x=result, dtype="fp32", name=name + "_fp32")
@@ -191,7 +200,7 @@ def _hlo_to_mlpackage(
 
     install_stablehlo_streaming_patch()
     set_streaming_quantizer(_stream_quantize)
-    print("  [convert] streaming int4 quantization enabled", flush=True)
+    print("  [convert] streaming mixed-precision quantization enabled", flush=True)
 
     print(f"  [convert {_os.getpid()}] hlo_to_mil …", flush=True)
     try:

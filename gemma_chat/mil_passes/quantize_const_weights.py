@@ -2,9 +2,13 @@
 # Copyright (c) 2024 Kasper Nielsen
 # Vendored from stablehlo-coreml (https://github.com/kasper0406/stablehlo-coreml).
 """
-MIL pass: quantize large float weight constants to int4 using symmetric
-block-wise quantization, replacing them with constexpr_blockwise_shift_scale
-(iOS18) ops that are immune to constant folding.
+MIL pass: quantize large float weight constants using symmetric block-wise
+quantization, replacing them with constexpr_blockwise_shift_scale (iOS18) ops
+that are immune to constant folding.
+
+Mixed precision: embedding tables (detected by having a dimension matching
+VOCAB_SIZE) are quantized to int8 for accuracy (they double as the logit
+projection), while all other large weights use int4.
 
 This pass runs early in the pipeline so that coremltools' ~95 optimization
 passes work on a compressed model instead of a full ~17GB fp32 model,
@@ -29,60 +33,76 @@ _INT4_NP_DTYPE = np.dtype(np.int8, metadata={_SUB_BYTE_KEY: _mil_types.int4})
 # Bias vectors (1D) and small positional buffers are left uncompressed.
 _WEIGHT_THRESHOLD = 2048
 
+# Vocab size used to detect embedding tables. Tensors with any dimension
+# matching this value are quantized at int8 instead of int4, because the
+# embedding table doubles as the logit projection and int4 is too lossy.
+_VOCAB_SIZE = 262144
+
 # Group size for block-wise quantization along the reduction axis.
 # Smaller groups = more scales = better accuracy but slightly larger model.
 # 32 is the standard for int4 group quantization (matches GPTQ/AWQ conventions).
 _GROUP_SIZE = 32
 
-# Module-level counter shared between _quantize_consts_in_block and apply().
-# [count, total_bytes].  Reset by apply() before each run.
-_counter: list = [0, 0]
+# Module-level counters shared between _quantize_consts_in_block and apply().
+# Reset by apply() before each run.
+_counter_int4: list = [0, 0]   # [count, total_bytes_original]
+_counter_int8: list = [0, 0]
+_counter_skip: list = [0]      # [count] — skipped (already constexpr)
 
 
-def _should_quantize(op):
-    """Return True if this const op should be compressed to int4."""
+def _is_embedding(val: np.ndarray) -> bool:
+    """True if this tensor looks like an embedding table (has VOCAB_SIZE dim)."""
+    return any(s == _VOCAB_SIZE for s in val.shape)
+
+
+def _classify_quantize(op):
+    """Classify a const op for quantization.
+
+    Returns:
+        'int4' — standard weight, quantize to int4
+        'int8' — embedding table, quantize to int8
+        'skip_constexpr' — already feeds a constexpr op
+        None — not a quantizable const (wrong type, too small, etc.)
+    """
     if op.op_type != "const":
-        return False
+        return None
     val = op.outputs[0].val
     if not isinstance(val, np.ndarray):
-        return False
-    # Only compress multi-dimensional float tensors large enough to matter
+        return None
     if val.dtype not in (np.float16, np.float32):
-        return False
+        return None
     if val.ndim < 2 or val.size < _WEIGHT_THRESHOLD:
-        return False
+        return None
     # Don't re-compress what is already feeding a constexpr_* op
     for child_op in op.outputs[0].child_ops:
         if child_op.op_type.startswith("constexpr_"):
-            return False
-    return True
+            return "skip_constexpr"
+    if _is_embedding(val):
+        return "int8"
+    return "int4"
 
 
 def _quantize_symmetric_blockwise(val: np.ndarray, axis: int = 0,
-                                  group_size: int = _GROUP_SIZE):
+                                  group_size: int = _GROUP_SIZE,
+                                  nbits: int = 4):
     """
-    Symmetric block-wise int4 quantization (round-to-nearest).
+    Symmetric block-wise quantization (round-to-nearest).
 
-    Quantizes to signed int4 (range [-7, 7]) with one scale per group of
-    `group_size` elements along each non-`axis` dimension. Along `axis`,
-    each channel gets its own scale (block_size=1).
+    nbits=4: signed int4 range [-7, 7], tagged with int4 metadata
+    nbits=8: signed int8 range [-127, 127], plain int8
+
+    Quantizes with one scale per group of `group_size` elements along each
+    non-`axis` dimension. Along `axis`, each channel gets its own scale
+    (block_size=1).
 
     Returns:
-        quantized_data: int8 array with same shape as val (holding int4 values)
-        scale: float array, same rank as val, with shape:
-            - axis dim: same as val (per-channel)
-            - other dims: ceil(val.shape[d] / group_size)
-
-    The implied block_size for constexpr_blockwise_shift_scale is:
-        block_size[axis] = 1  (per-channel)
-        block_size[d] = group_size  (for other dims, if evenly divisible)
-
-    If a dimension is not evenly divisible by group_size, the last group
-    is smaller but the scale still covers it (constexpr_blockwise_shift_scale
-    broadcasts the scale to cover remaining elements).
+        quantized_data: int8 array with same shape as val
+        scale: float array, same rank as val
 
     Note: processes in chunks along axis=0 to avoid OOM on large tensors.
     """
+    max_val = (1 << (nbits - 1)) - 1  # 7 for int4, 127 for int8
+
     # Determine scale shape: per-channel on axis, grouped on other dims
     scale_shape = []
     for d in range(val.ndim):
@@ -130,7 +150,7 @@ def _quantize_symmetric_blockwise(val: np.ndarray, axis: int = 0,
         np.abs(val_grouped), axis=tuple(reduce_axes_grouped), keepdims=True
     ).astype(np.float32)
     group_max_f32 = np.where(group_max_f32 == 0.0, 1.0, group_max_f32)
-    scale_grouped_f32 = group_max_f32 / 7.0
+    scale_grouped_f32 = group_max_f32 / float(max_val)
 
     # Quantize in the grouped view
     n_channels = padded_shape[axis]
@@ -150,7 +170,7 @@ def _quantize_symmetric_blockwise(val: np.ndarray, axis: int = 0,
         chunk_f32 = val_grouped[slc].astype(np.float32)
         chunk_scale = scale_grouped_f32[slc]
         quantized_grouped[slc] = np.clip(
-            np.round(chunk_f32 / chunk_scale), -7, 7
+            np.round(chunk_f32 / chunk_scale), -max_val, max_val
         ).astype(np.int8)
         del chunk_f32, chunk_scale
 
@@ -159,14 +179,15 @@ def _quantize_symmetric_blockwise(val: np.ndarray, axis: int = 0,
     quantized = quantized_padded[tuple(slice(0, s) for s in val.shape)]
 
     # Scale: squeeze out the group_size dims to get [out, n_groups] shape
-    scale_f32 = group_max_f32.squeeze(axis=tuple(reduce_axes_grouped)) / 7.0
+    scale_f32 = group_max_f32.squeeze(axis=tuple(reduce_axes_grouped)) / float(max_val)
     scale = scale_f32.astype(val.dtype)
 
     del val_padded, val_grouped, quantized_grouped, quantized_padded
     del group_max_f32, scale_grouped_f32, scale_f32
-    # Tag the int8 container with int4 metadata so coremltools serializes
-    # the data as packed 4-bit (halving on-disk weight storage).
-    quantized = quantized.view(_INT4_NP_DTYPE)
+    if nbits == 4:
+        # Tag the int8 container with int4 metadata so coremltools serializes
+        # the data as packed 4-bit (halving on-disk weight storage).
+        quantized = quantized.view(_INT4_NP_DTYPE)
     return quantized, scale
 
 
@@ -174,41 +195,28 @@ def _quantize_symmetric_blockwise(val: np.ndarray, axis: int = 0,
 def _quantize_consts_in_block(block):
     import gc as _gc
 
-    # Phase 1: scan block.operations once to find const ops and recurse into
-    # any sub-blocks.  We do NOT modify the block here, so it is safe to
-    # iterate block.operations directly (no snapshot needed).
-    #
-    # Collecting only const ops avoids iterating tens of thousands of non-const
-    # ops in the main quantize loop (Phase 2).  The previous all-ops snapshot
-    # loop continued iterating non-const ops *after* the last const op, which
-    # triggered Python's automatic GC at an unsafe callstack position.
-    const_ops = []
+    # Phase 1: classify ops — collect quantizable consts, warn on constexpr skips
+    ops_to_quantize = []   # list of (op, 'int4' | 'int8')
     for op in block.operations:
         for b in op.blocks:
             _quantize_consts_in_block(b)
-        if _should_quantize(op):
-            const_ops.append(op)
+        cls = _classify_quantize(op)
+        if cls == "skip_constexpr":
+            _counter_skip[0] += 1
+            val = op.outputs[0].val
+            child_types = [c.op_type for c in op.outputs[0].child_ops]
+            print(
+                f"    ⚠ SKIP (already constexpr) {op.name}  "
+                f"shape={val.shape}  dtype={val.dtype}  consumers={child_types}",
+                flush=True,
+            )
+        elif cls in ("int4", "int8"):
+            ops_to_quantize.append((op, cls))
 
-    if not const_ops:
+    if not ops_to_quantize:
         return False
 
-    # Phase 2: process only the const ops collected above, using slot-nulling
-    # so that gc.collect() can break the op↔var cycles and release the C-level
-    # fp16 numpy refs before the int8 data accumulates to OOM levels.
-    #
-    # gc.disable() prevents Python's automatic GC from firing at unpredictable
-    # positions inside C extensions (e.g. replace_uses_of_var_after_op iterates
-    # ~50,000 ops, creating hundreds of thousands of Python objects per tensor,
-    # easily pushing gen0 past threshold 700 which would trigger auto-GC while
-    # MLIR/jaxlib tp_finalize objects are on the C stack).
-    #
-    # Every 20 tensors we: (1) re-enable GC, (2) call gc.collect() at a safe
-    # Python boundary, (3) call malloc_zone_pressure_relief() to evict the just-
-    # freed fp16 pages from macOS's malloc large-allocation free list.  Without
-    # madvise, freed 42 MB pages stay in the process jetsam footprint as
-    # compressed pages — 20 tensors × 42 MB = ~840 MB freed per batch; over the
-    # full 317-tensor run that's ~13 GB accumulating even though actual RSS is
-    # only ~5 GB.  macOS jetsam kills at ~51 GB compressed footprint.
+    # Phase 2: quantize with GC management (same strategy as before)
     import gc as _gc
     import ctypes as _ctypes_q, ctypes.util as _ctu_q
     try:
@@ -220,30 +228,30 @@ def _quantize_consts_in_block(block):
         def _madvise_free():
             pass
 
+    total_count = _counter_int4[0] + _counter_int8[0]
     _gc.disable()
     try:
-        n = len(const_ops)
+        n = len(ops_to_quantize)
         for i in range(n):
-            op = const_ops[i]
-            const_ops[i] = None  # drop the list's ref so gc.collect() can collect
+            op, precision = ops_to_quantize[i]
+            ops_to_quantize[i] = (None, None)  # drop ref for GC
 
             val = op.outputs[0].val
             nbytes = val.nbytes
+            nbits = 4 if precision == "int4" else 8
             quantized_data, scale = _quantize_symmetric_blockwise(
-                val, axis=0, group_size=_GROUP_SIZE,
+                val, axis=0, group_size=_GROUP_SIZE, nbits=nbits,
             )
 
-            # Clear the Python-visible sym_val ref (belt-and-suspenders).
-            # The C-level ref inside the op object is released only when the
-            # op is garbage-collected after gc.collect() breaks the op↔var cycle.
             op.outputs[0]._sym_val = None
             del val
 
+            suffix = f"_{precision}"
             new_var = mb.constexpr_blockwise_shift_scale(
                 data=quantized_data,
                 scale=scale,
                 before_op=op,
-                name=op.name + "_int4",
+                name=op.name + suffix,
             )
 
             block.replace_uses_of_var_after_op(
@@ -254,29 +262,26 @@ def _quantize_consts_in_block(block):
             )
             block.remove_ops([op])
 
-            _counter[0] += 1
-            _counter[1] += nbytes
+            if precision == "int4":
+                _counter_int4[0] += 1
+                _counter_int4[1] += nbytes
+            else:
+                _counter_int8[0] += 1
+                _counter_int8[1] += nbytes
 
-            del op  # drop local ref; only the op↔var cycle remains
+            total_count += 1
+            del op
 
-            # Batched flush (every 20 tensors): write(2) releases the GIL
-            # briefly, giving background threads a chance to drop MLIR/jaxlib
-            # cycle refs before our explicit gc.collect().
-
-            if _counter[0] % 20 == 0 or i == n - 1:
+            if total_count % 20 == 0 or i == n - 1:
                 print(
-                    f"    quantized {_counter[0]} tensors  "
-                    f"({_counter[1] / 1e9:.2f} GB fp16 → int4)",
+                    f"    quantized {_counter_int4[0]} int4 + "
+                    f"{_counter_int8[0]} int8  "
+                    f"({(_counter_int4[1] + _counter_int8[1]) / 1e9:.2f} GB fp16)",
                     flush=True,
                 )
-                # Collect at a safe Python boundary, then immediately re-disable.
                 _gc.enable()
                 _gc.collect()
                 _gc.disable()
-                # Evict the just-freed fp16 pages from macOS's large-allocation
-                # free list.  Each batch frees ~840 MB of 42 MB numpy arrays;
-                # this call marks those pages as MADV_FREE_REUSABLE so macOS
-                # stops counting them in the process's jetsam phys_footprint.
                 _madvise_free()
     finally:
         _gc.enable()
@@ -288,32 +293,29 @@ def _quantize_consts_in_block(block):
 class quantize_const_weights(AbstractGraphPass):
     """
     Replace large float weight constants with constexpr_blockwise_shift_scale
-    ops using symmetric block-wise int4 quantization (iOS18).
+    ops using symmetric block-wise quantization (iOS18).
 
-    Uses group quantization (GROUP_SIZE=32 elements per block) for accuracy.
-    This is inserted at position 0 in the pass pipeline so that all of
-    coremltools' subsequent optimization passes work on the compressed model
-    rather than a ~17GB fp32 model. This prevents OOM crashes and
-    write_fp16_data failures during ct.convert on memory-constrained machines.
+    Mixed precision: embedding tables (vocab_size dim) → int8 for accuracy,
+    all other large weights → int4 for size. Group quantization with
+    GROUP_SIZE=32 elements per block.
 
-    constexpr_blockwise_shift_scale (iOS18) is exempt from constant folding,
-    so the int4 representation is preserved through to the final .mlpackage.
+    Inserted at position 0 in the pass pipeline so that all subsequent
+    passes work on the compressed model.
     """
 
     def apply(self, prog):
-        _counter[0] = 0
-        _counter[1] = 0
+        _counter_int4[0] = _counter_int4[1] = 0
+        _counter_int8[0] = _counter_int8[1] = 0
+        _counter_skip[0] = 0
         for f in prog.functions.values():
-            # Single pass is sufficient — all const ops in Gemma4 are at the
-            # top level of the main function block (no nesting that would
-            # require a second pass).  A while loop here would call
-            # list(block.operations) a second time over thousands of ops
-            # (including the newly-created constexpr ops), which can crash or
-            # OOM before the pass summary is printed.
             _quantize_consts_in_block(f)
-        if _counter[0]:
+        total = _counter_int4[0] + _counter_int8[0]
+        if total or _counter_skip[0]:
             print(
-                f"    quantized {_counter[0]} tensors total  "
-                f"({_counter[1] / 1e9:.2f} GB fp16 → int4)",
+                f"    quantized {total} tensors total: "
+                f"{_counter_int4[0]} int4 ({_counter_int4[1] / 1e9:.2f} GB), "
+                f"{_counter_int8[0]} int8 ({_counter_int8[1] / 1e9:.2f} GB)"
+                + (f", {_counter_skip[0]} skipped (already constexpr)"
+                   if _counter_skip[0] else ""),
                 flush=True,
             )

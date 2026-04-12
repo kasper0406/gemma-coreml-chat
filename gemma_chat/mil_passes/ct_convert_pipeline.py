@@ -41,6 +41,7 @@ def build_ct_convert_pass_pipeline():
     import gemma_chat.mil_passes.remove_broadcast_tiles  # noqa: F401
     import gemma_chat.mil_passes.replace_decomposed_softmax  # noqa: F401
     import gemma_chat.mil_passes.fuse_attention_to_sdpa  # noqa: F401
+    import gemma_chat.mil_passes.fuse_logit_softcap  # noqa: F401
 
     _patch_backend_pipeline()
 
@@ -54,5 +55,6 @@ def build_ct_convert_pass_pipeline():
     pipeline.append_pass("common::remove_broadcast_tiles")
     # Fusion passes — must run after cleanup
     pipeline.append_pass("common::replace_decomposed_softmax")
+    pipeline.append_pass("common::fuse_logit_softcap")
     pipeline.append_pass("common::fuse_attention_to_sdpa")
     return pipeline

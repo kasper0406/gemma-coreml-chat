@@ -104,6 +104,16 @@ def attention_no_mask(q, k, v):
     return jnp.matmul(weights, v)
 
 
+def attention_standard_scaled(q, k, v, mask):
+    """Standard attention with explicit 1/sqrt(E) scaling (like Llama/Mistral)."""
+    E = q.shape[-1]
+    scores = jnp.matmul(q, jnp.swapaxes(k, -2, -1))
+    scores = scores / jnp.sqrt(jnp.float32(E))
+    scores = jnp.where(mask, scores, jnp.float32(-10000.0))
+    weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
+    return jnp.matmul(weights, v)
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 def test_sdpa_fusion_masked():
@@ -273,6 +283,32 @@ def test_gqa_global_attention():
     print("  ✓ test_gqa_global_attention passed")
 
 
+def test_standard_scaled_attention():
+    """Standard attention with explicit 1/sqrt(E) scaling (Llama/Mistral style).
+
+    The pass should absorb the explicit scaling into SDPA (no Q pre-scaling).
+    """
+    q = jnp.ones((1, 8, 1, 256), dtype=jnp.float32)
+    k = jnp.ones((1, 8, 128, 256), dtype=jnp.float32)
+    v = jnp.ones((1, 8, 128, 256), dtype=jnp.float32)
+    mask = jnp.ones((1, 1, 1, 128), dtype=jnp.bool_)
+
+    prog = _jax_to_mil(attention_standard_scaled, q, k, v, mask)
+    _full_pipeline(prog)
+
+    assert _count_ops(prog, "scaled_dot_product_attention") == 1, \
+        f"Expected 1 SDPA, got {_count_ops(prog, 'scaled_dot_product_attention')}"
+    assert _count_ops(prog, "softmax") == 0, "softmax should be fused away"
+    assert _count_ops(prog, "matmul") == 0, "matmuls should be fused away"
+
+    # Should NOT have Q pre-scaling — the explicit div was absorbed
+    mul_count = _count_ops(prog, "mul")
+    assert mul_count == 0, \
+        f"Expected 0 mul ops (no Q pre-scaling for standard attention), got {mul_count}"
+
+    print("  ✓ test_standard_scaled_attention passed")
+
+
 def test_graph_dump():
     """Diagnostic: dump the graph after each pipeline stage."""
     q = jnp.ones((1, 8, 1, 256), dtype=jnp.float32)
@@ -310,4 +346,5 @@ if __name__ == "__main__":
     test_softmax_alone()
     test_gqa_attention()
     test_gqa_global_attention()
+    test_standard_scaled_attention()
     print("\nAll tests passed ✓")
