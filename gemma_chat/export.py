@@ -276,7 +276,7 @@ def _hlo_to_mlpackage(
             convert_kwargs = dict(
                 source="milinternal",
                 minimum_deployment_target=ct.target.iOS18,
-                compute_precision=ct.precision.FLOAT16,
+                compute_precision=ct.precision.FLOAT32,
                 pass_pipeline=pipeline,
                 skip_model_load=True,
             )

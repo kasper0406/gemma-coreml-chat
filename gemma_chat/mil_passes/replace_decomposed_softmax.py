@@ -1,19 +1,24 @@
 """MIL pass: fuse decomposed softmax into native ``softmax`` op.
 
-JAX's ``jax.nn.softmax`` lowers to a multi-op chain::
+JAX's ``jax.nn.softmax`` lowers to a multi-op chain.  The exact chain
+depends on the input dtype:
 
-    reduce_max(x, axis) → maximum(-inf, max) → reshape →
-    sub(x, max_expanded) → exp → reduce_sum(exp, axis) → [reshape] →
-    real_div(exp, sum_expanded)
+**float32 input** (no internal casts)::
+
+    reduce_max → maximum(-inf) → reshape → sub → exp →
+    reduce_sum → [reshape] → real_div
+
+**float16 input** (JAX promotes reduce_sum to fp32)::
+
+    reduce_max → maximum(-inf) → reshape → sub → exp →
+    cast(fp16→fp32) → reduce_sum(fp32) → [reshape] → cast(fp32→fp16) →
+    real_div
 
 CoreML MIL has a native ``softmax`` op that computes this in a single
-hardware-accelerated instruction on ANE.  This pass matches the
-characteristic chain and replaces it with ``mb.softmax(x, axis)``.
+hardware-accelerated instruction on ANE.  This pass matches both
+variants and replaces them with ``mb.softmax(x, axis)``.
 
 Dead intermediate ops are collected via backward DCE and removed.
-
-Counts from gemma4-e2b.mlpackage: 35 instances per function,
-~245 decomposed ops → 35 softmax ops.
 """
 
 import numpy as np
@@ -78,17 +83,29 @@ def _match_softmax(real_div_op):
 
     softmax_input = sub_op.inputs["x"]
 
-    # Denominator: peel off reshape, expect reduce_sum(exp_output)
+    # Denominator: peel off reshape and/or cast, expect reduce_sum(exp_output).
+    # For fp16 softmax JAX inserts cast(fp32→fp16) between reduce_sum and
+    # real_div, so we may need to peel: [reshape] → [cast] → reduce_sum.
     sum_src = denominator
-    if sum_src.op is not None and sum_src.op.op_type == "reshape":
-        sum_src = sum_src.op.inputs["x"]
+    for _ in range(3):
+        if sum_src.op is not None and sum_src.op.op_type in ("reshape", "cast"):
+            sum_src = sum_src.op.inputs["x"]
+        else:
+            break
     if sum_src.op is None or sum_src.op.op_type != "reduce_sum":
         return None
     reduce_sum_op = sum_src.op
 
-    # reduce_sum must consume the same exp output as the numerator
-    if reduce_sum_op.inputs["x"] is not numerator:
-        return None
+    # reduce_sum must consume the same exp output as the numerator.
+    # For fp16 softmax JAX inserts cast(fp16→fp32) before reduce_sum,
+    # so reduce_sum.inputs["x"] may be cast(numerator) rather than numerator.
+    sum_input = reduce_sum_op.inputs["x"]
+    if sum_input is not numerator:
+        if sum_input.op is not None and sum_input.op.op_type == "cast":
+            if sum_input.op.inputs["x"] is not numerator:
+                return None
+        else:
+            return None
 
     # Trace sub's y input (max value) backward:
     #   [reshape] → [maximum(-inf, ...)] → reduce_max(softmax_input)

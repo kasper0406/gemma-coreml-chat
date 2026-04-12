@@ -77,13 +77,13 @@ def empty_pos_ring(cfg: Gemma4Config = E2B_CONFIG) -> jnp.ndarray:
 def _rmsnorm(x, scale):
     x32 = x.astype(jnp.float32)
     var = jnp.mean(jnp.square(x32), axis=-1, keepdims=True)
-    return (x32 * jax.lax.rsqrt(var + 1e-6) * scale.astype(jnp.float32)).astype(jnp.float16)
+    return x32 * jax.lax.rsqrt(var + 1e-6) * scale.astype(jnp.float32)
 
 
 def _rmsnorm_noscale(x):
     x32 = x.astype(jnp.float32)
     var = jnp.mean(jnp.square(x32), axis=-1, keepdims=True)
-    return (x32 * jax.lax.rsqrt(var + 1e-6)).astype(jnp.float16)
+    return x32 * jax.lax.rsqrt(var + 1e-6)
 
 
 def _ple_for_tokens(params, token_ids, cfg: Gemma4Config):
@@ -119,17 +119,16 @@ def _ffn(lp, x, hidden_dim: int):
     """GeLU-gated FFN. x: (..., D) → (..., D)."""
     gate = jnp.dot(x, lp['mlp']['gate_proj']['kernel'])
     up   = jnp.dot(x, lp['mlp']['up_proj']['kernel'])
-    # GELU in float32 so the erf polynomial stays scalar (avoids constexpr quantization)
-    gate = jax.nn.gelu(gate.astype(jnp.float32), approximate=False).astype(jnp.float16)
-    return jnp.dot(gate * up, lp['mlp']['down_proj']['kernel'])
+    return jnp.dot(jax.nn.gelu(gate, approximate=False) * up,
+                   lp['mlp']['down_proj']['kernel'])
 
 
 def _ple_gate(lp, x, ple_slice):
     """Per-layer input gate block. x: (..., D), ple_slice: (..., d) → (..., D)."""
-    gate_proj = jnp.dot(x, lp['per_layer_input_gate']['kernel'])
     gate = jax.nn.gelu(
-        gate_proj.astype(jnp.float32), approximate=False,
-    ).astype(jnp.float16) * ple_slice
+        jnp.dot(x, lp['per_layer_input_gate']['kernel']),
+        approximate=False,
+    ) * ple_slice
     proj = jnp.dot(gate, lp['per_layer_projection']['kernel'])
     proj = _rmsnorm(proj, lp['post_per_layer_input_norm']['scale'])
     return x + proj
@@ -212,7 +211,7 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
 
     w = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))           # (1, H, 1, max_len)
     w = jnp.where(valid[jnp.newaxis, jnp.newaxis, jnp.newaxis], w, -10000.0)
-    w = jax.nn.softmax(w, axis=-1)
+    w = jax.nn.softmax(w.astype(jnp.float32), axis=-1)
 
     out = jnp.matmul(w, vt)                                 # (1, H, 1, hd)
     out = jnp.transpose(out, (0, 2, 1, 3)).reshape(1, 1, num_heads * hd)
@@ -414,7 +413,7 @@ def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
         mask = pos_k[jnp.newaxis, :] <= pos_q[:, jnp.newaxis]  # (C, max_len)
 
     w = jnp.where(mask[jnp.newaxis, jnp.newaxis], w, -10000.0)
-    w = jax.nn.softmax(w, axis=-1)
+    w = jax.nn.softmax(w.astype(jnp.float32), axis=-1)
 
     out = jnp.matmul(w, vt)                                    # (1, H, C, hd)
     out = jnp.transpose(out, (0, 2, 1, 3)).reshape(1, C, num_heads * hd)
@@ -465,7 +464,7 @@ def _attn_chunk_shared(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type
         mask = pos_k[jnp.newaxis, :] <= pos_q[:, jnp.newaxis]
 
     w = jnp.where(mask[jnp.newaxis, jnp.newaxis], w, -10000.0)
-    w = jax.nn.softmax(w, axis=-1)
+    w = jax.nn.softmax(w.astype(jnp.float32), axis=-1)
 
     out = jnp.transpose(jnp.matmul(w, vt), (0, 2, 1, 3)).reshape(1, C, num_heads * hd)
     return jnp.dot(out, sa['o_proj']['kernel'])
