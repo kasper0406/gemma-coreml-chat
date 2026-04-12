@@ -33,3 +33,9 @@ gemma-export = "gemma_chat.export:main"
 gemma-chat = "gemma_chat.chat:main"
 gemma-compare-inference = "gemma_chat.compare_inference:main"
 gemma-parity-decode = "gemma_chat.parity_decode:main"
+
+[dependency-groups]
+dev = [
+    "pillow>=12.2.0",
+    "pytest>=9.0.3",
+]
