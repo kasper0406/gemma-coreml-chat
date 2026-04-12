@@ -39,6 +39,10 @@ struct InferenceEngine: Sendable {
                     let nChunks = (nReal + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
                     print("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks, prefillOffset=\(prefillOffset)")
 
+                    // Ensure prefill model is loaded (it's released after each
+                    // generation to save ~4-5 GB during decode/idle).
+                    try await self.model.loadPrefill()
+
                     // --- Chunked Prefill ---
                     let prefillStart = CFAbsoluteTimeGetCurrent()
                     var kvState: KVCacheState
@@ -73,6 +77,9 @@ struct InferenceEngine: Sendable {
                     }
                     let prefillTime = CFAbsoluteTimeGetCurrent() - prefillStart
                     print("[Perf] Prefill done: \(String(format: "%.2f", prefillTime))s")
+
+                    // Release the prefill model — only decode is needed from here.
+                    self.model.releasePrefill()
 
                     // Extract the logits for the last real token.
                     let vocabSize = GemmaConfig.vocabSize
@@ -151,7 +158,7 @@ struct InferenceEngine: Sendable {
     func fullPrefill(ids: [Int32]) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
         let emptyKV = KVCacheState.empty(
             kvInputNames: model.prefillKVInputNames,
-            inputDescriptions: model.prefillModel.modelDescription.inputDescriptionsByName
+            inputDescriptions: model.prefillInputDescriptions
         )
         let (logits, kv) = try continuePrefill(ids: ids, fromOffset: 0, kvState: emptyKV)
         guard let logits else {
