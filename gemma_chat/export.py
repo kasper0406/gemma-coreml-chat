@@ -1,4 +1,4 @@
-"""Export Gemma4-E2B chunk_prefill + decode_step to a single multifunction CoreML .mlpackage.
+"""Export Gemma4 chunk_prefill + decode_step to a single multifunction CoreML .mlpackage.
 
 Both functions are merged into one model using CoreML's MultiFunctionDescriptor
 (iOS 18+), sharing weights for automatic deduplication.  The chunked prefill
@@ -6,9 +6,10 @@ processes CHUNK_SIZE tokens per call instead of the full sequence, enabling
 arbitrarily long contexts without quadratic memory growth.
 
 Usage:
-    uv run gemma-export
-    uv run gemma-export --output gemma4-e2b.mlpackage
-    uv run gemma-export --skip-warmup   # save RAM on constrained machines
+    uv run gemma-export                          # E2B (default)
+    uv run gemma-export --variant e4b            # E4B
+    uv run gemma-export --output my.mlpackage    # custom output path
+    uv run gemma-export --skip-warmup            # save RAM on constrained machines
 """
 
 from __future__ import annotations
@@ -61,7 +62,7 @@ from jax._src.interpreters import mlir as jax_mlir
 import coremltools as ct
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
-from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN
+from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN, VARIANTS
 from gemma_chat.model import Gemma4Transformer, Gemma4Config
 from gemma_chat.weight_mapper import load_params
 from gemma_chat.decode_coreml import (
@@ -274,22 +275,22 @@ def export_chunk_prefill(
     model_id: str = HF_MODEL_ID,
     max_seq_len: int = MAX_SEQ_LEN,
     chunk_size: int = CHUNK_SIZE,
+    config: Gemma4Config = E2B_CONFIG,
 ) -> None:
     """Export the chunked-prefill model (process CHUNK_SIZE tokens per call).
 
     Inputs:  tokens (1, chunk_size) int32
              start_position (1,) int32  — absolute position of first token in chunk
-             k_0, v_0, ..., k_14, v_14 — current KV cache arrays float16
+             k_0, v_0, ..., k_N, v_N — current KV cache arrays float16
              sliding_pos_ring (1, sliding_window_size) int32 — ring position tracker
     Outputs: logits (chunk_size, vocab_size) float32
-             k_0_out, v_0_out, ..., k_14_out, v_14_out — updated KV cache float16
+             k_0_out, v_0_out, ..., k_N_out, v_N_out — updated KV cache float16
              sliding_pos_ring_out (1, sliding_window_size) int32 — updated ring
     """
     import gc
     import numpy as np
 
     output_path = Path(output_path)
-    config = E2B_CONFIG
     context = jax_mlir.make_ir_context()
 
     print("=" * 60)
@@ -387,22 +388,22 @@ def export_decode_step(
     model_id: str = HF_MODEL_ID,
     max_seq_len: int = MAX_SEQ_LEN,
     skip_warmup: bool = False,
+    config: Gemma4Config = E2B_CONFIG,
 ) -> None:
     """Export the single-token decode-step model.
 
     Inputs:  token_id (1,) int32
              position (1,) int32  — absolute position of this token
-             k_0, v_0, ..., k_14, v_14 — current KV cache arrays float16
+             k_0, v_0, ..., k_N, v_N — current KV cache arrays float16
              sliding_pos_ring (1, sliding_window_size) int32 — ring position tracker
     Outputs: logits (vocab_size,) float32
-             k_0_out, v_0_out, ..., k_14_out, v_14_out — updated KV cache float16
+             k_0_out, v_0_out, ..., k_N_out, v_N_out — updated KV cache float16
              sliding_pos_ring_out (1, sliding_window_size) int32 — updated ring
     """
     import numpy as np
     import gc
 
     output_path = Path(output_path)
-    config = E2B_CONFIG
     context = jax_mlir.make_ir_context()
 
     print("=" * 60)
@@ -507,19 +508,25 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Export Gemma4-E2B prefill + decode into a single multifunction "
+            "Export Gemma4 prefill + decode into a single multifunction "
             "CoreML .mlpackage with shared (int8-quantized) weights."
         )
     )
     parser.add_argument(
+        "--variant",
+        choices=("e2b", "e4b"),
+        default="e2b",
+        help="Model variant to export (default: e2b)",
+    )
+    parser.add_argument(
         "--output",
-        default="gemma4-e2b.mlpackage",
-        help="Output path for the multifunction .mlpackage (default: gemma4-e2b.mlpackage)",
+        default=None,
+        help="Output path for the multifunction .mlpackage (default: from variant)",
     )
     parser.add_argument(
         "--model-id",
-        default=HF_MODEL_ID,
-        help=f"HuggingFace model ID (default: {HF_MODEL_ID})",
+        default=None,
+        help="HuggingFace model ID (default: from variant)",
     )
     parser.add_argument(
         "--max-seq-len",
@@ -534,7 +541,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    output = Path(args.output)
+    variant = VARIANTS[args.variant]
+    variant_config = variant["config"]
+    model_id = args.model_id or variant["hf_model_id"]
+    output = Path(args.output or variant["mlpackage_path"])
     tmp_dir = Path(tempfile.mkdtemp(prefix="gemma-export-"))
     tmp_prefill = tmp_dir / "prefill.mlpackage"
     tmp_decode = tmp_dir / "decode.mlpackage"
@@ -549,9 +559,10 @@ def main() -> None:
         # -- Phase 1: Export chunk prefill (int8 streaming quantization) --
         export_chunk_prefill(
             output_path=tmp_prefill,
-            model_id=args.model_id,
+            model_id=model_id,
             max_seq_len=args.max_seq_len,
             chunk_size=CHUNK_SIZE,
+            config=variant_config,
         )
         print(f"\n  Chunk-prefill exported to {tmp_prefill}\n")
 
@@ -566,9 +577,10 @@ def main() -> None:
         )
         export_decode_step(
             output_path=tmp_decode,
-            model_id=args.model_id,
+            model_id=model_id,
             max_seq_len=args.max_seq_len,
             skip_warmup=args.skip_warmup,
+            config=variant_config,
         )
         print(f"\n  Decode exported to {tmp_decode}\n")
 
