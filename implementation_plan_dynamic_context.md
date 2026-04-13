@@ -16,6 +16,8 @@ be sized dynamically at runtime.
 
 ### stablehlo-coreml `symbolic-shapes` branch (commit 83de18f)
 
+You can find and modify the code at `/Volumes/git/stablehlo-coreml` in case you need to make changes. Notice that in order for changes to go in this repository, they have to be general in nature.
+
 Already has full converter support for dynamic shapes:
 
 | Op | Handler | Status |

@@ -456,17 +456,21 @@ def generate_kvcached(
 
     dec_in = list(decode_model.input_description)
     dec_out = list(decode_model.output_description)
-    kv_names_in = dec_in[2:]      # 30 KV input names + sliding_pos_ring
-    kv_names_out = dec_out[1:]    # 30 KV output names + sliding_pos_ring_out
+
+    # New symbolic-shape models have a phantom "N" input first (global cache dim).
+    _has_n_input = len(dec_in) > 0 and dec_in[0] == "N"
+    _n_ctrl = 3 if _has_n_input else 2  # N, token_id, position  OR  token_id, position
+    kv_names_in = dec_in[_n_ctrl:]      # KV input names + sliding_pos_ring
+    kv_names_out = dec_out[1:]          # KV output names + sliding_pos_ring_out
 
     # Read decode function's protobuf input descriptors for shape info.
     _dec_state_inputs = []
     for fd in decode_model._model._spec.description.functions:
         if fd.name == "decode":
-            _dec_state_inputs = list(fd.input)[2:]
+            _dec_state_inputs = list(fd.input)[_n_ctrl:]
             break
     if not _dec_state_inputs:
-        _dec_state_inputs = list(decode_model._model._spec.description.input)[2:]
+        _dec_state_inputs = list(decode_model._model._spec.description.input)[_n_ctrl:]
 
     # Only enable dynamic sizing for global caches that have RangeDim.
     # Fixed-shape models → global_names is empty → all caches use spec shapes.
@@ -487,8 +491,10 @@ def generate_kvcached(
 
         pref_in = list(prefill_model.input_description)
         pref_out = list(prefill_model.output_description)
-        pref_kv_in = pref_in[2:]     # 30 KV input names
-        pref_kv_out = pref_out[1:]   # 30 KV output names
+        _pref_has_n = len(pref_in) > 0 and pref_in[0] == "N"
+        _n_pref_ctrl = 3 if _pref_has_n else 2
+        pref_kv_in = pref_in[_n_pref_ctrl:]     # KV input names
+        pref_kv_out = pref_out[1:]               # KV output names
 
         # Compute padded length (needed for global cache sizing).
         n_chunks = (n_real + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -509,7 +515,8 @@ def generate_kvcached(
 
         # Validate prefill token input shape matches CHUNK_SIZE.
         if _all_inputs:
-            _token_shape = tuple(_all_inputs[0].type.multiArrayType.shape)
+            _tok_idx = 1 if _pref_has_n else 0
+            _token_shape = tuple(_all_inputs[_tok_idx].type.multiArrayType.shape)
             _expected = (1, CHUNK_SIZE)
             if _token_shape != _expected:
                 raise ValueError(
@@ -519,9 +526,9 @@ def generate_kvcached(
                     f"uv run gemma-export"
                 )
 
-        pref_global_names = _flexible_global_names(pref_kv_in, _all_inputs[2:])
+        pref_global_names = _flexible_global_names(pref_kv_in, _all_inputs[_n_pref_ctrl:])
         pref_kv_state = _init_kv_state(
-            _all_inputs[2:], pref_global_names, padded_len,
+            _all_inputs[_n_pref_ctrl:], pref_global_names, padded_len,
         )
         del _spec_m, _all_inputs
 
@@ -537,10 +544,22 @@ def generate_kvcached(
         for chunk_idx in range(n_chunks):
             start = chunk_idx * CHUNK_SIZE
             chunk_tokens = prompt_padded[start : start + CHUNK_SIZE]
-            chunk_input = {
-                pref_in[0]: np.array(chunk_tokens, dtype=np.int32)[np.newaxis, :],
-                pref_in[1]: np.array([start], dtype=np.int32),
-            }
+            if _pref_has_n:
+                # pref_in = [N, tokens, start_position, ...]
+                _global_len = next(
+                    (pref_kv_state[n].shape[1] for n in pref_global_names),
+                    padded_len,
+                )
+                chunk_input = {
+                    pref_in[0]: np.array([_global_len], dtype=np.int32),
+                    pref_in[1]: np.array(chunk_tokens, dtype=np.int32)[np.newaxis, :],
+                    pref_in[2]: np.array([start], dtype=np.int32),
+                }
+            else:
+                chunk_input = {
+                    pref_in[0]: np.array(chunk_tokens, dtype=np.int32)[np.newaxis, :],
+                    pref_in[1]: np.array([start], dtype=np.int32),
+                }
             chunk_input.update(pref_kv_state)
 
             pr = prefill_model.predict(chunk_input)
@@ -576,10 +595,21 @@ def generate_kvcached(
         if verbose:
             print(f"Processing {n_real} prompt tokens (decode-only)…", flush=True)
         for pos, token_id in enumerate(prompt_ids):
-            step_input = {
-                dec_in[0]: np.array([token_id], dtype=np.int32),
-                dec_in[1]: np.array([pos], dtype=np.int32),
-            }
+            _ensure_global_cache_capacity(kv_state, global_names, pos + 1, max_seq_len)
+            _global_len = next(
+                (kv_state[n].shape[1] for n in global_names), max(n_real, 1),
+            ) if _has_n_input else 0
+            if _has_n_input:
+                step_input = {
+                    dec_in[0]: np.array([_global_len], dtype=np.int32),
+                    dec_in[1]: np.array([token_id], dtype=np.int32),
+                    dec_in[2]: np.array([pos], dtype=np.int32),
+                }
+            else:
+                step_input = {
+                    dec_in[0]: np.array([token_id], dtype=np.int32),
+                    dec_in[1]: np.array([pos], dtype=np.int32),
+                }
             step_input.update(kv_state)
             result = decode_model.predict(step_input)
             logits_key = dec_out[0] if dec_out[0] in result else next(
@@ -605,10 +635,20 @@ def generate_kvcached(
         position = n_real + step
         _ensure_global_cache_capacity(kv_state, global_names, position + 1, max_seq_len)
 
-        decode_input = {
-            dec_in[0]: np.array([next_id], dtype=np.int32),
-            dec_in[1]: np.array([position], dtype=np.int32),
-        }
+        _global_len = next(
+            (kv_state[n].shape[1] for n in global_names), 0,
+        ) if _has_n_input else 0
+        if _has_n_input:
+            decode_input = {
+                dec_in[0]: np.array([_global_len], dtype=np.int32),
+                dec_in[1]: np.array([next_id], dtype=np.int32),
+                dec_in[2]: np.array([position], dtype=np.int32),
+            }
+        else:
+            decode_input = {
+                dec_in[0]: np.array([next_id], dtype=np.int32),
+                dec_in[1]: np.array([position], dtype=np.int32),
+            }
         decode_input.update(kv_state)
 
         decode_result = decode_model.predict(decode_input)
