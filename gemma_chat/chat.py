@@ -1,6 +1,8 @@
-"""Terminal chat for Gemma4-E2B (Textual UI): CoreML or JAX reference.
+"""Terminal chat for Gemma4 (Textual UI): CoreML or JAX reference.
 
 Usage:
+    uv run gemma-chat                                    # E2B CoreML (default)
+    uv run gemma-chat --variant e4b                      # E4B CoreML
     uv run gemma-chat --model gemma4-e2b.mlpackage
     uv run gemma-chat --model gemma4-e2b.mlpackage --decode-only
     uv run gemma-chat --backend jax
@@ -18,7 +20,7 @@ import sys
 
 import coremltools as ct
 
-from gemma_chat.config import E2B_CONFIG, HF_MODEL_ID
+from gemma_chat.config import VARIANTS
 from gemma_chat.generate import load_coreml_model, load_tokenizer
 from gemma_chat.weight_mapper import load_params
 
@@ -68,7 +70,13 @@ def main() -> None:
     from gemma_chat.tui_app import ChatRuntimeConfig, run_chat_tui
 
     parser = argparse.ArgumentParser(
-        description="Chat with Gemma4-E2B (CoreML or JAX)."
+        description="Chat with Gemma4 (CoreML or JAX)."
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("e2b", "e4b"),
+        default="e2b",
+        help="Model variant (default: e2b)",
     )
     parser.add_argument(
         "--backend",
@@ -78,10 +86,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default="gemma4-e2b.mlpackage",
-        help=(
-            "Path to the multifunction .mlpackage (default: gemma4-e2b.mlpackage)"
-        ),
+        default=None,
+        help="Path to the multifunction .mlpackage (default: from variant)",
     )
     parser.add_argument(
         "--compute-units",
@@ -99,8 +105,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--model-id",
-        default=HF_MODEL_ID,
-        help=f"HuggingFace model ID for tokenizer / JAX weights (default: {HF_MODEL_ID})",
+        default=None,
+        help="HuggingFace model ID for tokenizer / JAX weights (default: from variant)",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -127,31 +133,35 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    variant = VARIANTS[args.variant]
+    model_id = args.model_id or variant["hf_model_id"]
+    model_path = args.model or variant["mlpackage_path"]
+
     if args.backend == "coreml":
         compute_units = parse_compute_units(args.compute_units)
         print("Loading tokenizer…", flush=True)
-        tokenizer = load_tokenizer(args.model_id)
+        tokenizer = load_tokenizer(model_id)
 
         # Pre-load decode model (always needed); prefill loaded only if not --decode-only.
         print(
-            f"Loading CoreML decode function from {args.model!r} "
+            f"Loading CoreML decode function from {model_path!r} "
             f"(compute_units={args.compute_units})…",
             flush=True,
         )
         decode_model = load_coreml_model(
-            args.model,
+            model_path,
             compute_units=compute_units,
             function_name="decode",
         )
         prefill_model = None
         if not args.decode_only:
             print(
-                f"Loading CoreML prefill function from {args.model!r} "
+                f"Loading CoreML prefill function from {model_path!r} "
                 f"(compute_units={args.compute_units})…",
                 flush=True,
             )
             prefill_model = load_coreml_model(
-                args.model,
+                model_path,
                 compute_units=compute_units,
                 function_name="prefill",
             )
@@ -163,20 +173,21 @@ def main() -> None:
             temperature=args.temperature,
             top_p=args.top_p,
             system_prompt=args.system,
-            model_path=args.model,
+            model_path=model_path,
             decode_only=args.decode_only,
             decode_model=decode_model,
             prefill_model=prefill_model,
+            variant=args.variant,
         )
     else:
-        jax_cfg = E2B_CONFIG
+        jax_cfg = variant["config"]
         print("Loading tokenizer…", flush=True)
-        tokenizer = load_tokenizer(args.model_id)
+        tokenizer = load_tokenizer(model_id)
         print(
-            f"Loading JAX weights ({args.model_id})…",
+            f"Loading JAX weights ({model_id})…",
             flush=True,
         )
-        params = load_params(model_id=args.model_id, config=jax_cfg)
+        params = load_params(model_id=model_id, config=jax_cfg)
         cfg = ChatRuntimeConfig(
             backend="jax",
             tokenizer=tokenizer,
@@ -186,6 +197,7 @@ def main() -> None:
             system_prompt=args.system,
             jax_params=params,
             jax_cfg=jax_cfg,
+            variant=args.variant,
         )
 
     try:

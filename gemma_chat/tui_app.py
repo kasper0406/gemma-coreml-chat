@@ -30,6 +30,7 @@ class ChatRuntimeConfig:
     prefill_model: Any | None = None
     jax_params: dict[str, Any] | None = None
     jax_cfg: Any | None = None
+    variant: str = "e2b"
 
 
 class GemmaChatApp(App[None]):
@@ -77,7 +78,7 @@ class GemmaChatApp(App[None]):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top_row"):
-            yield Static("Gemma4-E2B Chat  [dim]/help[/]", id="title")
+            yield Static(f"Gemma4-{self._cfg.variant.upper()} Chat  [dim]/help[/]", id="title")
             yield Static("", id="stats")
         yield RichLog(id="log", wrap=True, highlight=False, markup=True)
         yield Static("", id="stream_row")
