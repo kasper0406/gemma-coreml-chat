@@ -2,20 +2,29 @@
 
 After ``replace_decomposed_softmax`` runs (and with cleanup passes having
 removed noop slice_updates, broadcast tiles, and redundant maximums), each
-attention layer appears as a 3D batch-folded matmul pattern::
+attention layer appears in one of two forms:
+
+**Concrete shapes** (batch-folded, typical for sliding attention)::
 
     Q_raw [B,H,L,E]   → reshape → Q_3d [BH,L,E]
     K_raw [H,B,S,E]   → reshape → K_3d [HB,S,E]
     matmul(Q_3d, K_3d, transpose_y=True) → scores_3d [BH,L,S]
       → reshape → transpose → scores_4d [B,H,L,S]
-    [optional: real_div(scores_4d, sqrt(E)) — standard attention scaling]
-    select(mask, scores_4d, -10000)
-    [cast(fp32)]
-    softmax(axis=-1) → weights_4d [B,H,L,S]
-      → reshape → weights_3d [BH,L,S]
+    ...softmax...
     V_raw [H,B,EV,S]  → reshape → V_3d [HB,EV,S]
     matmul(weights_3d, V_3d, transpose_y=True) → out_3d [BH,L,EV]
       → reshape → transpose → out_4d [B,H,L,EV]
+
+**Symbolic shapes** (B=1, typical for global attention with dynamic cache)::
+
+    Q_raw [1,H,L,E]   → squeeze → Q_3d [H,L,E]
+    K_raw [1,1,S,E]   → squeeze → K_3d [1,S,E]
+    matmul(Q_3d, K_3d, transpose_y=True) → scores_3d [H,L,S]
+      → expand_dims → transpose → scores_4d [1,H,L,S]
+    ...softmax...
+    V_raw [1,1,EV,S]  → squeeze → V_3d [1,EV,S]
+    matmul(weights_3d, V_3d, transpose_y=True) → out_3d [H,L,EV]
+      → expand_dims → transpose → out_4d [1,H,L,EV]
 
 This pass handles two attention scaling styles:
 
@@ -149,59 +158,94 @@ def _match_sdpa(softmax_op):
             scores_4d = candidate.inputs["x"]
             has_explicit_scaling = True
 
-    # ── scores_4d ← transpose ← reshape ← matmul_0 ─────────────────
+    # ── scores_4d ← transpose ← reshape/expand_dims ← matmul_0 ────
+    # Concrete shapes: matmul [BH,L,S] → reshape [B,H,L,S] → transpose
+    # Symbolic shapes (B=1): matmul [H,L,S] → expand_dims [H,L,1,S] → transpose
     scores_src, scores_unwrap = _peel_back(scores_4d, "transpose", "reshape")
     if scores_src.op is None or scores_src.op.op_type != "matmul":
-        # Try without transpose (scores might be directly from reshape)
-        scores_src, scores_unwrap = _peel_back(scores_4d, "reshape")
+        scores_src, scores_unwrap = _peel_back(scores_4d, "transpose", "expand_dims")
         if scores_src.op is None or scores_src.op.op_type != "matmul":
-            return None
+            scores_src, scores_unwrap = _peel_back(scores_4d, "reshape")
+            if scores_src.op is None or scores_src.op.op_type != "matmul":
+                if scores_4d.op is not None and scores_4d.op.op_type == "matmul":
+                    scores_src = scores_4d
+                    scores_unwrap = []
+                else:
+                    return None
 
     matmul_0 = scores_src.op
     Q_3d = matmul_0.inputs["x"]
     K_3d = matmul_0.inputs["y"]
 
-    # ── Q_raw ← reshape ← Q_3d ──────────────────────────────────────
+    # ── Q_raw ← reshape/squeeze ← Q_3d ─────────────────────────────
     Q_raw, q_prep = _peel_back(Q_3d, "reshape")
     if Q_raw.rank is None or Q_raw.rank < 4:
-        return None
+        Q_raw, q_prep = _peel_back(Q_3d, "squeeze")
+        if Q_raw.rank is None or Q_raw.rank < 4:
+            if Q_3d.rank is not None and Q_3d.rank >= 4:
+                Q_raw = Q_3d
+                q_prep = []
+            else:
+                return None
 
-    # ── K_raw ← reshape ← K_3d (peel reshape only, not transpose) ──
+    # ── K_raw ← reshape/squeeze ← K_3d ──────────────────────────────
     K_raw, k_prep = _peel_back(K_3d, "reshape")
     if K_raw.rank is None or K_raw.rank < 4:
-        return None
+        K_raw, k_prep = _peel_back(K_3d, "squeeze")
+        if K_raw.rank is None or K_raw.rank < 4:
+            if K_3d.rank is not None and K_3d.rank >= 4:
+                K_raw = K_3d
+                k_prep = []
+            else:
+                return None
 
-    # ── forward from softmax: reshape → matmul_1 ────────────────────
+    # ── forward from softmax: reshape/squeeze → matmul_1 ─────────────
     sm_out = softmax_op.outputs[0]
     weights_3d, weights_reshape = _peel_fwd_single(sm_out, "reshape")
+    if weights_3d is None:
+        weights_3d, weights_reshape = _peel_fwd_single(sm_out, "squeeze")
     if weights_3d is not None:
-        # weights_3d → matmul_1
         w_consumers = list(weights_3d.child_ops)
         if len(w_consumers) != 1 or w_consumers[0].op_type != "matmul":
             return None
         matmul_1 = w_consumers[0]
     else:
-        # Direct: softmax → matmul_1
         consumers = list(sm_out.child_ops)
         if len(consumers) != 1 or consumers[0].op_type != "matmul":
             return None
         matmul_1 = consumers[0]
         weights_reshape = None
 
-    # ── V_raw ← reshape ← V_3d (peel reshape only, not transpose) ──
+    # ── V_raw ← reshape/squeeze ← V_3d ─────────────────────────────
     V_3d = matmul_1.inputs["y"]
     V_raw, v_prep = _peel_back(V_3d, "reshape")
     if V_raw.rank is None or V_raw.rank < 4:
-        return None
+        V_raw, v_prep = _peel_back(V_3d, "squeeze")
+        if V_raw.rank is None or V_raw.rank < 4:
+            if V_3d.rank is not None and V_3d.rank >= 4:
+                V_raw = V_3d
+                v_prep = []
+            else:
+                return None
 
-    # ── forward from matmul_1: reshape → transpose → out_4d ─────────
+    # ── forward from matmul_1: reshape/expand_dims → transpose → out_4d
     out_3d = matmul_1.outputs[0]
     out_reshaped, out_reshape_op = _peel_fwd_single(out_3d, "reshape")
     if out_reshaped is None:
-        return None
-    out_4d, out_transpose_op = _peel_fwd_single(out_reshaped, "transpose")
-    if out_4d is None:
-        return None
+        out_reshaped, out_reshape_op = _peel_fwd_single(out_3d, "expand_dims")
+    if out_reshaped is not None:
+        out_4d, out_transpose_op = _peel_fwd_single(out_reshaped, "transpose")
+        if out_4d is None:
+            return None
+    else:
+        if out_3d.rank is not None and out_3d.rank >= 4:
+            out_4d, out_transpose_op = _peel_fwd_single(out_3d, "transpose")
+            if out_4d is not None:
+                out_reshape_op = None
+            else:
+                return None
+        else:
+            return None
 
     # ── validate shapes ──────────────────────────────────────────────
     if Q_raw.rank is not None and Q_raw.rank < 3:
@@ -223,34 +267,43 @@ def _match_sdpa(softmax_op):
     # SDPA always outputs [B, H, L, EV].  If the original output layout
     # differs (e.g. [B, L, H, EV] when the JAX code transposes H↔L after
     # attention), we need a compensating transpose after SDPA.
-    B_ref_val = out_4d.shape[0] if out_4d.shape is not None else 1
-    reshape_4d = list(out_reshaped.shape)[:3]
-    out_perm = [int(x) for x in np.asarray(out_transpose_op.inputs["perm"].val)]
 
-    # Find B's position in the 4D reshaped tensor (prefer rightmost).
-    b_pos = None
-    for i in range(2, -1, -1):
-        if reshape_4d[i] == B_ref_val:
-            b_pos = i
-            break
-    if b_pos is None:
-        return None
+    if out_reshape_op is not None:
+        B_ref_val = out_4d.shape[0] if out_4d.shape is not None else 1
+        reshape_4d = list(out_reshaped.shape)[:3]
+        out_perm = [int(x) for x in np.asarray(out_transpose_op.inputs["perm"].val)]
 
-    # Build P: perm mapping SDPA [B,H,L,EV] positions → reshaped positions.
-    # In the reshaped tensor, H (merged) is at the first non-B slot, L at
-    # the second, because reshape preserves data order from [merged, L, EV].
-    non_b = [i for i in range(3) if i != b_pos]
-    P = [0, 0, 0, 3]
-    P[b_pos] = 0       # B (SDPA pos 0) → b_pos in reshaped
-    P[non_b[0]] = 1    # H (SDPA pos 1) → first non-B slot
-    P[non_b[1]] = 2    # L (SDPA pos 2) → second non-B slot
+        # Find B's position in the 4D reshaped tensor (prefer rightmost).
+        b_pos = None
+        for i in range(2, -1, -1):
+            if reshape_4d[i] == B_ref_val:
+                b_pos = i
+                break
+        if b_pos is None:
+            return None
 
-    # Compensating perm: compose P with the output transpose.
-    # out_layout_perm[i] = P[out_perm[i]]
-    out_layout_perm = [P[out_perm[i]] for i in range(4)]
+        # Build P: perm mapping SDPA [B,H,L,EV] positions → reshaped positions.
+        non_b = [i for i in range(3) if i != b_pos]
+        P = [0, 0, 0, 3]
+        P[b_pos] = 0       # B (SDPA pos 0) → b_pos in reshaped
+        P[non_b[0]] = 1    # H (SDPA pos 1) → first non-B slot
+        P[non_b[1]] = 2    # L (SDPA pos 2) → second non-B slot
+
+        # Compensating perm: compose P with the output transpose.
+        out_layout_perm = [P[out_perm[i]] for i in range(4)]
+    else:
+        # No reshape: matmul output is already 4D, just have transpose.
+        # The transpose directly maps from matmul output to final layout.
+        # SDPA outputs [B,H,L,EV]. The matmul outputs [B,H,L,EV] or similar,
+        # and the transpose reorders it. The compensating perm is just the
+        # transpose perm itself since there's no reshape to account for.
+        out_perm = [int(x) for x in np.asarray(out_transpose_op.inputs["perm"].val)]
+        out_layout_perm = out_perm
 
     # ── collect dead ops ─────────────────────────────────────────────
-    dead = {matmul_0, matmul_1, softmax_op, out_reshape_op, out_transpose_op}
+    dead = {matmul_0, matmul_1, softmax_op, out_transpose_op}
+    if out_reshape_op is not None:
+        dead.add(out_reshape_op)
     for op in scores_unwrap:
         dead.add(op)
     if select_op:

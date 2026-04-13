@@ -84,12 +84,17 @@ def _coreml_kv_state_after_decode(
 def _global_kv_input_names(kv_names: list[str]) -> set[str]:
     """Return the KV input names that correspond to global attention caches.
 
-    ``kv_names`` is the full list of state input names (30 KV + 1 ring),
-    ordered ``[k_0, v_0, k_1, v_1, ..., k_14, v_14, sliding_pos_ring]``.
+    ``kv_names`` is the list of state input names (2*num_slots KV + 1 ring),
+    ordered ``[k_0, v_0, k_1, v_1, ..., sliding_pos_ring]``.
+    Handles truncated models (e.g. ``--num-layers 5``) by capping at the
+    actual number of KV slots present.
     """
     specs = build_cache_specs()
+    n_slots = (len(kv_names) - 1) // 2  # exclude trailing sliding_pos_ring
     names: set[str] = set()
     for slot, spec in enumerate(specs):
+        if slot >= n_slots:
+            break
         if spec.attn_type == AttentionType.GLOBAL:
             names.add(kv_names[slot * 2])      # k
             names.add(kv_names[slot * 2 + 1])  # v
@@ -181,7 +186,10 @@ def stop_token_ids(tokenizer) -> set[int]:
 
 # ── CoreML model ───────────────────────────────────────────────────────────
 
+import json as _json
 import re as _re
+import shutil as _shutil
+import tempfile as _tempfile
 
 
 class _CompiledModelWrapper:
@@ -197,9 +205,11 @@ class _CompiledModelWrapper:
         model: ct.models.MLModel,
         function_name: str | None = None,
         package_path: Path | None = None,
+        _tmp_dir: str | None = None,
     ):
         self._model = model
         self._package_path = package_path
+        self._tmp_dir = _tmp_dir  # kept alive while model is in use
 
         # Try top-level description first (single-function models).
         in_desc = list(model.input_description)
@@ -222,6 +232,86 @@ class _CompiledModelWrapper:
     def predict(self, data):
         return self._model.predict(data)
 
+    def __del__(self):
+        if self._tmp_dir is not None:
+            _shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+
+def _extract_function_as_single_model(
+    mlpackage_path: Path,
+    function_name: str,
+    compute_units,
+) -> tuple[ct.models.MLModel, str]:
+    """Extract one function from a multifunction .mlpackage into a temp
+    single-function model that symlinks back to the original weights.
+
+    Works around a macOS ≥26 issue where multifunction ML Program models
+    with symbolic dimensions fail to load via ``MLModel.modelWithContentsOfURL``.
+    """
+    from coremltools.proto import Model_pb2
+
+    full_spec = ct.models.MLModel(str(mlpackage_path), skip_model_load=True).get_spec()
+
+    single_spec = Model_pb2.Model()
+    single_spec.specificationVersion = full_spec.specificationVersion
+    single_spec.mlProgram.version = full_spec.mlProgram.version
+    single_spec.mlProgram.functions["main"].CopyFrom(
+        full_spec.mlProgram.functions[function_name]
+    )
+
+    for fd in full_spec.description.functions:
+        if fd.name == function_name:
+            for inp in fd.input:
+                single_spec.description.input.append(inp)
+            for out in fd.output:
+                single_spec.description.output.append(out)
+            break
+
+    tmp_dir = _tempfile.mkdtemp(prefix=f"coreml-{function_name}-")
+    pkg_path = Path(tmp_dir) / f"{function_name}.mlpackage"
+    data_dir = pkg_path / "Data" / "com.apple.CoreML"
+    weights_dir = data_dir / "weights"
+    weights_dir.mkdir(parents=True)
+
+    (data_dir / "model.mlmodel").write_bytes(single_spec.SerializeToString())
+
+    src_weights = mlpackage_path / "Data" / "com.apple.CoreML" / "weights" / "weight.bin"
+    (weights_dir / "weight.bin").symlink_to(src_weights)
+
+    manifest = {
+        "fileFormatVersion": "1.0.0",
+        "itemInfoEntries": {
+            "spec": {
+                "author": "com.apple.CoreML",
+                "description": "CoreML Model Specification",
+                "name": "model.mlmodel",
+                "path": "com.apple.CoreML/model.mlmodel",
+            },
+            "wt": {
+                "author": "com.apple.CoreML",
+                "description": "CoreML Model Weights",
+                "name": "weights",
+                "path": "com.apple.CoreML/weights",
+            },
+        },
+        "rootModelIdentifier": "spec",
+    }
+    (pkg_path / "Manifest.json").write_text(_json.dumps(manifest, indent=4))
+
+    import warnings
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        model = ct.models.MLModel(str(pkg_path), compute_units=compute_units)
+
+    if model.__proxy__ is None:
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"Failed to load extracted function '{function_name}' from {mlpackage_path}"
+        )
+
+    return model, tmp_dir
+
 
 def load_coreml_model(
     mlpackage_path: str | Path = MLPACKAGE_PATH,
@@ -241,12 +331,29 @@ def load_coreml_model(
     fn_label = f" (function={function_name})" if function_name else ""
     print(f"Loading CoreML model from {path}{fn_label} …")
 
+    import warnings
+
     kwargs: dict = {"compute_units": compute_units}
     if function_name is not None:
         kwargs["function_name"] = function_name
 
-    loaded = ct.models.MLModel(str(path), **kwargs)
-    model = _CompiledModelWrapper(loaded, function_name=function_name, package_path=path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loaded = ct.models.MLModel(str(path), **kwargs)
+
+    tmp_dir = None
+    if loaded.__proxy__ is None and function_name is not None:
+        print(
+            f"  Multifunction load failed; extracting '{function_name}' "
+            "as single-function model …"
+        )
+        loaded, tmp_dir = _extract_function_as_single_model(
+            path, function_name, compute_units
+        )
+
+    model = _CompiledModelWrapper(
+        loaded, function_name=function_name, package_path=path, _tmp_dir=tmp_dir
+    )
     print("  Model loaded.")
     return model
 
