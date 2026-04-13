@@ -30,6 +30,9 @@ from gemma_chat.config import E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN
 from gemma_chat.decode_coreml import decode_step, empty_pos_ring, kv_cache_shapes
 from gemma_chat.generate import (
     _coreml_kv_state_after_decode,
+    _ensure_global_cache_capacity,
+    _flexible_global_names,
+    _init_kv_state,
     load_coreml_model,
     load_tokenizer,
 )
@@ -90,13 +93,9 @@ def _coreml_slow_prefill_logits(
             break
     if not kv_inputs:
         kv_inputs = list(spec_m._spec.description.input)[2:]
-    kv_state = {}
-    for inp in kv_inputs:
-        shape = tuple(inp.type.multiArrayType.shape)
-        if len(shape) == 2:  # (1, W) — sliding_pos_ring
-            kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
-        else:  # (1, cache_len, nkv, hd) — KV cache
-            kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
+    global_names = _flexible_global_names(kv_names_in, kv_inputs)
+    n_prompt = len(prompt_ids)
+    kv_state = _init_kv_state(kv_inputs, global_names, max(n_prompt, 1))
 
     logits = None
     for pos, tid in enumerate(prompt_ids):
@@ -183,13 +182,9 @@ def _coreml_greedy_tokens_after_prefill(
             break
     if not kv_inputs:
         kv_inputs = list(spec_m._spec.description.input)[2:]
-    kv_state = {}
-    for inp in kv_inputs:
-        shape = tuple(inp.type.multiArrayType.shape)
-        if len(shape) == 2:
-            kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
-        else:
-            kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
+    global_names = _flexible_global_names(kv_names_in, kv_inputs)
+    n_prompt = len(prompt_ids)
+    kv_state = _init_kv_state(kv_inputs, global_names, max(n_prompt, 1))
 
     logits = None
     for pos, tid in enumerate(prompt_ids):
@@ -208,6 +203,7 @@ def _coreml_greedy_tokens_after_prefill(
     for i in range(n_extra):
         tid = int(np.argmax(logits))
         out.append(tid)
+        _ensure_global_cache_capacity(kv_state, global_names, t + i + 1, max_seq_len)
         decode_input = {
             dec_in[0]: np.array([tid], dtype=np.int32),
             dec_in[1]: np.array([t + i], dtype=np.int32),

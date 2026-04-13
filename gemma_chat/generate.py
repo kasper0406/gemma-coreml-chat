@@ -1,8 +1,8 @@
 """Autoregressive text generation using the exported CoreML model.
 
-The CoreML model expects a fixed-shape int32 tensor (1, MAX_SEQ_LEN).
-We right-pad the current token sequence so the *last real* token sits at
-position len(tokens)-1 and its logits drive the next-token prediction.
+Global attention KV caches use dynamic sizing — they start small and grow
+as the conversation extends, avoiding the cost of ``Q @ K^T`` over thousands
+of empty slots.  Sliding attention caches are fixed-size ring buffers.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ from typing import Iterator
 
 import coremltools as ct
 
+from gemma_chat.cache_spec import build_cache_specs
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN, MLPACKAGE_PATH, HF_MODEL_ID
+from gemma_chat.model import AttentionType
 
 
 def _validate_decode_step_inputs(_spec_m: ct.models.MLModel, package_path: str) -> None:
@@ -75,6 +77,84 @@ def _coreml_kv_state_after_decode(
             )
         state[kin] = result[kout]
     return state
+
+
+# ── Dynamic global KV cache helpers ────────────────────────────────────────
+
+def _global_kv_input_names(kv_names: list[str]) -> set[str]:
+    """Return the KV input names that correspond to global attention caches.
+
+    ``kv_names`` is the full list of state input names (30 KV + 1 ring),
+    ordered ``[k_0, v_0, k_1, v_1, ..., k_14, v_14, sliding_pos_ring]``.
+    """
+    specs = build_cache_specs()
+    names: set[str] = set()
+    for slot, spec in enumerate(specs):
+        if spec.attn_type == AttentionType.GLOBAL:
+            names.add(kv_names[slot * 2])      # k
+            names.add(kv_names[slot * 2 + 1])  # v
+    return names
+
+
+def _flexible_global_names(kv_names: list[str], state_inputs) -> set[str]:
+    """Return global KV input names that have RangeDim (flexible shapes).
+
+    Models exported with symbolic shapes declare ``shapeRange`` on global KV
+    inputs.  For fixed-shape models this returns an empty set, disabling
+    dynamic cache sizing (caches use the spec shape instead).
+    """
+    arch_global = _global_kv_input_names(kv_names)
+    flex: set[str] = set()
+    for inp in state_inputs:
+        if inp.name in arch_global:
+            sr = inp.type.multiArrayType.shapeRange
+            if sr and sr.sizeRanges:
+                flex.add(inp.name)
+    return flex
+
+
+def _ensure_global_cache_capacity(
+    kv_state: dict[str, np.ndarray],
+    global_names: set[str],
+    needed_len: int,
+    max_len: int,
+) -> None:
+    """Grow global KV caches (doubling strategy) if dim-1 < ``needed_len``."""
+    for name in global_names:
+        arr = kv_state[name]
+        cur = arr.shape[1]
+        if cur >= needed_len:
+            continue
+        new_len = min(max(cur * 2, needed_len), max_len)
+        grown = np.zeros(
+            (arr.shape[0], new_len, arr.shape[2], arr.shape[3]),
+            dtype=arr.dtype,
+        )
+        grown[:, :cur] = arr
+        kv_state[name] = grown
+
+
+def _init_kv_state(
+    state_inputs,
+    global_names: set[str],
+    global_cache_len: int,
+) -> dict[str, np.ndarray]:
+    """Build initial KV state dict with dynamic global cache sizing.
+
+    ``state_inputs`` are the protobuf input descriptors (after tokens + position).
+    Global caches use ``global_cache_len``; sliding caches use the spec shape.
+    """
+    kv: dict[str, np.ndarray] = {}
+    for inp in state_inputs:
+        shape = tuple(inp.type.multiArrayType.shape)
+        if len(shape) == 2:  # (1, W) — sliding_pos_ring
+            kv[inp.name] = np.full(shape, -1, dtype=np.int32)
+        elif inp.name in global_names:
+            shape = (shape[0], global_cache_len, shape[2], shape[3])
+            kv[inp.name] = np.zeros(shape, dtype=np.float16)
+        else:
+            kv[inp.name] = np.zeros(shape, dtype=np.float16)
+    return kv
 
 
 # ── Tokenizer ──────────────────────────────────────────────────────────────
@@ -376,10 +456,24 @@ def generate_kvcached(
 
     dec_in = list(decode_model.input_description)
     dec_out = list(decode_model.output_description)
-    kv_names_in = dec_in[2:]      # 30 KV input names
-    kv_names_out = dec_out[1:]    # 30 KV output names
+    kv_names_in = dec_in[2:]      # 30 KV input names + sliding_pos_ring
+    kv_names_out = dec_out[1:]    # 30 KV output names + sliding_pos_ring_out
 
-    # Read KV shapes from spec.
+    # Read decode function's protobuf input descriptors for shape info.
+    _dec_state_inputs = []
+    for fd in decode_model._model._spec.description.functions:
+        if fd.name == "decode":
+            _dec_state_inputs = list(fd.input)[2:]
+            break
+    if not _dec_state_inputs:
+        _dec_state_inputs = list(decode_model._model._spec.description.input)[2:]
+
+    # Only enable dynamic sizing for global caches that have RangeDim.
+    # Fixed-shape models → global_names is empty → all caches use spec shapes.
+    global_names = _flexible_global_names(kv_names_in, _dec_state_inputs)
+    if global_names and verbose:
+        print(f"  Dynamic global KV caches: {len(global_names)} inputs", flush=True)
+
     kv_state: dict[str, np.ndarray] = {}
 
     logits: np.ndarray | None = None
@@ -396,7 +490,11 @@ def generate_kvcached(
         pref_kv_in = pref_in[2:]     # 30 KV input names
         pref_kv_out = pref_out[1:]   # 30 KV output names
 
-        # Initialize KV caches as zeros with shapes from the prefill function.
+        # Compute padded length (needed for global cache sizing).
+        n_chunks = (n_real + CHUNK_SIZE - 1) // CHUNK_SIZE
+        padded_len = n_chunks * CHUNK_SIZE
+
+        # Initialize KV caches — global caches sized to padded_len, not max_seq_len.
         _spec_m = ct.models.MLModel(str(model_path.resolve()), skip_model_load=True,
                                      function_name="prefill")
         _all_inputs = []
@@ -421,25 +519,18 @@ def generate_kvcached(
                     f"uv run gemma-export"
                 )
 
-        _state_inputs = _all_inputs[2:]
-        pref_kv_state = {}
-        for inp in _state_inputs:
-            shape = tuple(inp.type.multiArrayType.shape)
-            if len(shape) == 2:  # (1, W) — sliding_pos_ring
-                pref_kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
-            else:  # (1, cache_len, nkv, hd) — KV cache
-                pref_kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
-        del _spec_m, _all_inputs, _state_inputs
+        pref_global_names = _flexible_global_names(pref_kv_in, _all_inputs[2:])
+        pref_kv_state = _init_kv_state(
+            _all_inputs[2:], pref_global_names, padded_len,
+        )
+        del _spec_m, _all_inputs
 
-        # Pad prompt to a multiple of CHUNK_SIZE
-        n_chunks = (n_real + CHUNK_SIZE - 1) // CHUNK_SIZE
-        padded_len = n_chunks * CHUNK_SIZE
         prompt_padded = list(prompt_ids) + [pad_id] * (padded_len - n_real)
 
         if verbose:
             print(
                 f"Prefill: {n_real} tokens in {n_chunks} chunks "
-                f"(chunk_size={CHUNK_SIZE})…",
+                f"(chunk_size={CHUNK_SIZE}, global_kv={padded_len})…",
                 flush=True,
             )
 
@@ -480,27 +571,7 @@ def generate_kvcached(
             kv_state[dk_in] = pr[pk_out]
     else:
         # ── Token-by-token "slow prefill" ────────────────────────────────────
-        # Initialize KV caches as zeros with shapes from the function description.
-        _spec_m = ct.models.MLModel(str(model_path.resolve()), skip_model_load=True,
-                                     function_name="decode")
-        # For multifunction models, I/O is in spec.description.functions.
-        _kv_inputs = []
-        func_descs = _spec_m._spec.description.functions
-        if func_descs:
-            for fd in func_descs:
-                if fd.name == "decode":
-                    _kv_inputs = list(fd.input)[2:]
-                    break
-        else:
-            _kv_inputs = list(_spec_m._spec.description.input)[2:]
-        kv_state = {}
-        for inp in _kv_inputs:
-            shape = tuple(inp.type.multiArrayType.shape)
-            if len(shape) == 2:  # (1, W) — sliding_pos_ring
-                kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
-            else:  # (1, cache_len, nkv, hd) — KV cache
-                kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
-        del _spec_m, _kv_inputs
+        kv_state = _init_kv_state(_dec_state_inputs, global_names, max(n_real, 1))
 
         if verbose:
             print(f"Processing {n_real} prompt tokens (decode-only)…", flush=True)
@@ -532,6 +603,8 @@ def generate_kvcached(
             break
 
         position = n_real + step
+        _ensure_global_cache_capacity(kv_state, global_names, position + 1, max_seq_len)
+
         decode_input = {
             dec_in[0]: np.array([next_id], dtype=np.int32),
             dec_in[1]: np.array([position], dtype=np.int32),
