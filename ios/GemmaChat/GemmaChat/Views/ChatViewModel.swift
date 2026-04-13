@@ -83,8 +83,9 @@ final class ChatViewModel {
             eagerPrefill = EagerPrefillManager(
                 engine: eng,
                 tokenizer: tok,
+                model: coreml,
                 kvInputNames: coreml.prefillKVInputNames,
-                inputDescriptions: coreml.prefillModel.modelDescription.inputDescriptionsByName
+                inputDescriptions: coreml.prefillInputDescriptions
             )
 
             // Listen for memory warnings (view model lives for app lifetime)
