@@ -6,8 +6,9 @@
 import Foundation
 
 enum GemmaConfig {
-    /// Maximum sequence length the CoreML model was exported with.
-    static let maxSeqLen = 10_000
+    /// Upper bound for global KV caches.  Models exported with RangeDim
+    /// can dynamically grow up to this limit.
+    static let maxSeqLen = 65_536
 
     /// Sliding window size for LOCAL_SLIDING layers (ring-buffer length).
     static let slidingWindowSize = 512

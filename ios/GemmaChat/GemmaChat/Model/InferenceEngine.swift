@@ -63,10 +63,12 @@ struct InferenceEngine: Sendable {
                             // All chunks were already prefilled by eager prefill.
                             // Run a single decode step with the last token to get logits.
                             let lastToken = ids[nReal - 1]
+                            let gcSize = kvState.currentGlobalCacheSize.map { Int32($0) }
                             let (decLogits, decKV) = try model.decode(
                                 token: lastToken,
                                 position: Int32(nReal - 1),
-                                kvState: prefillKV
+                                kvState: prefillKV,
+                                globalCacheSize: gcSize
                             )
                             logits = decLogits
                             kvState = decKV
@@ -119,12 +121,21 @@ struct InferenceEngine: Sendable {
                         if GemmaConfig.stopTokenIDs.contains(nextID) { break }
                         if Task.isCancelled { break }
 
-                        let decStart = CFAbsoluteTimeGetCurrent()
                         let position = Int32(nReal + step)
+
+                        // Grow global caches if needed (doubling strategy)
+                        currentKV = currentKV.grownToFit(
+                            needed: Int(position) + 1,
+                            maxLen: GemmaConfig.maxSeqLen
+                        )
+
+                        let decStart = CFAbsoluteTimeGetCurrent()
+                        let gcSize = currentKV.currentGlobalCacheSize.map { Int32($0) }
                         let (decLogits, decKV) = try model.decode(
                             token: nextID,
                             position: position,
-                            kvState: currentKV
+                            kvState: currentKV,
+                            globalCacheSize: gcSize
                         )
                         let decTime = CFAbsoluteTimeGetCurrent() - decStart
                         totalDecodeTime += decTime
@@ -156,9 +167,14 @@ struct InferenceEngine: Sendable {
 
     /// Run full prefill from scratch.
     func fullPrefill(ids: [Int32]) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+        let nChunks = (ids.count + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
+        let paddedLen = nChunks * GemmaConfig.chunkSize
+
         let emptyKV = KVCacheState.empty(
             kvInputNames: model.prefillKVInputNames,
-            inputDescriptions: model.prefillInputDescriptions
+            inputDescriptions: model.prefillInputDescriptions,
+            globalNames: model.globalKVInputNames,
+            initialGlobalSize: model.globalKVInputNames.isEmpty ? nil : paddedLen
         )
         let (logits, kv) = try continuePrefill(ids: ids, fromOffset: 0, kvState: emptyKV)
         guard let logits else {
@@ -193,10 +209,12 @@ struct InferenceEngine: Sendable {
             let chunkTokens = Array(padded[start..<(start + GemmaConfig.chunkSize)])
 
             let tokens = MLMultiArray.int32Row(chunkTokens)
+            let gcSize = currentKV.currentGlobalCacheSize.map { Int32($0) }
             let (logits, newKV) = try model.prefill(
                 tokens: tokens,
                 seqLen: Int32(start),
-                kvState: currentKV
+                kvState: currentKV,
+                globalCacheSize: gcSize
             )
             currentKV = newKV.withProcessedTokens(start + GemmaConfig.chunkSize)
             lastLogits = logits
@@ -217,10 +235,12 @@ struct InferenceEngine: Sendable {
     ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
         precondition(chunkTokens.count == GemmaConfig.chunkSize)
         let tokens = MLMultiArray.int32Row(chunkTokens)
+        let gcSize = kvState.currentGlobalCacheSize.map { Int32($0) }
         let (logits, newKV) = try model.prefill(
             tokens: tokens,
             seqLen: Int32(startPosition),
-            kvState: kvState
+            kvState: kvState,
+            globalCacheSize: gcSize
         )
         return (logits, newKV.withProcessedTokens(startPosition + GemmaConfig.chunkSize))
     }
