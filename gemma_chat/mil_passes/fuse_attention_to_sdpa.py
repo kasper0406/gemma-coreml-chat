@@ -152,10 +152,13 @@ def _match_sdpa(softmax_op):
     # ── scores_4d ← transpose ← reshape ← matmul_0 ─────────────────
     scores_src, scores_unwrap = _peel_back(scores_4d, "transpose", "reshape")
     if scores_src.op is None or scores_src.op.op_type != "matmul":
-        # Try without transpose (scores might be directly from reshape)
-        scores_src, scores_unwrap = _peel_back(scores_4d, "reshape")
+        # Try transpose ← expand_dims ← matmul (symbolic-dim variant)
+        scores_src, scores_unwrap = _peel_back(scores_4d, "transpose", "expand_dims")
         if scores_src.op is None or scores_src.op.op_type != "matmul":
-            return None
+            # Try without transpose (scores might be directly from reshape)
+            scores_src, scores_unwrap = _peel_back(scores_4d, "reshape")
+            if scores_src.op is None or scores_src.op.op_type != "matmul":
+                return None
 
     matmul_0 = scores_src.op
     Q_3d = matmul_0.inputs["x"]
@@ -192,13 +195,19 @@ def _match_sdpa(softmax_op):
     V_3d = matmul_1.inputs["y"]
     V_raw, v_prep = _peel_back(V_3d, "reshape")
     if V_raw.rank is None or V_raw.rank < 4:
-        return None
+        # Try expand_dims (symbolic-dim variant)
+        V_raw, v_prep = _peel_back(V_3d, "expand_dims")
+        if V_raw.rank is None or V_raw.rank < 4:
+            return None
 
     # ── forward from matmul_1: reshape → transpose → out_4d ─────────
     out_3d = matmul_1.outputs[0]
     out_reshaped, out_reshape_op = _peel_fwd_single(out_3d, "reshape")
     if out_reshaped is None:
-        return None
+        # Try expand_dims (symbolic-dim variant)
+        out_reshaped, out_reshape_op = _peel_fwd_single(out_3d, "expand_dims")
+        if out_reshaped is None:
+            return None
     out_4d, out_transpose_op = _peel_fwd_single(out_reshaped, "transpose")
     if out_4d is None:
         return None
