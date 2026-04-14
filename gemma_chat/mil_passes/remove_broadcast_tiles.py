@@ -5,9 +5,9 @@ StableHLO requires explicit shape matching, so the lowering inserts
 ops natively support NumPy-style broadcasting — these tiles are unnecessary.
 
 Only tiles whose *every* consumer is a known-broadcast-capable op are removed.
-
-Counts from multi-chunk.mlpackage:
-  decode: 390, prefill: 354 → up to 744 tile ops eliminated.
+``select`` is excluded: E5RT's multifunction validator fails to propagate
+shapes through ``select`` with implicit broadcasting (it reports
+"Incompatible Dimension" for the internal lowering).
 """
 
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
@@ -17,13 +17,14 @@ from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 import numpy as np
 
 # Ops that support implicit NumPy-style broadcasting.
+# ``select`` is intentionally excluded — E5RT cannot handle implicit
+# broadcasting in ``select`` when the model is loaded as multifunction.
 _BROADCAST_OPS = frozenset({
     "add", "sub", "mul", "real_div",
     "maximum", "minimum",
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
     "logical_and", "logical_or",
     "pow", "floor_div", "mod",
-    "select",  # condition broadcasting
 })
 
 
