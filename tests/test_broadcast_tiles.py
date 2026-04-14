@@ -1,10 +1,28 @@
 """Test remove_broadcast_tiles pass.
 
-Verifies that:
-1. Tiles feeding broadcast-capable ops (add, mul, …) are removed.
-2. Tiles feeding ``select`` are preserved — E5RT's multifunction validator
-   cannot propagate shapes through ``select`` with implicit broadcasting.
+Root cause being tested
+-----------------------
+E5RT (Apple's CoreML runtime) cannot handle ``select`` ops with implicit
+broadcasting when the model is loaded as a multifunction ``.mlpackage``
+(two functions sharing weights via ``MultiFunctionDescriptor``).  In
+single-function mode the shape mismatch is a non-fatal warning, but in
+multifunction mode E5RT's shape propagation fails fatally:
+
+    Failed to PropagateInputTensorShapes: Validation error during type
+    inference for select: at unknown location: Incompatible Dimension
+
+The ``remove_broadcast_tiles`` pass strips ``tile`` ops whose consumers
+support NumPy-style broadcasting.  If ``select`` is included in that set,
+the removed tile leaves behind a dim-1-vs-dim-N mismatch that E5RT rejects.
+
+Fix: exclude ``select`` from the broadcast-capable op set so that explicit
+``tile`` ops feeding ``select`` are always preserved.
+
+Tests verify:
+1. Tiles feeding broadcast-capable ops (add, mul, …) are still removed.
+2. Tiles feeding ``select`` are preserved.
 3. The pass is idempotent and handles mixed consumers correctly.
+4. Numerical correctness is maintained.
 """
 
 import copy
