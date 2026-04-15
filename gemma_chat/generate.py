@@ -8,6 +8,7 @@ of empty slots.  Sliding attention caches are fixed-size ring buffers.
 from __future__ import annotations
 
 import gc
+import warnings
 import numpy as np
 from pathlib import Path
 from typing import Iterator
@@ -511,6 +512,15 @@ def generate_kvcached(
     global_names = _flexible_global_names(kv_names_in, _dec_state_inputs)
     # Architectural global cache names.
     _arch_global = _global_kv_input_names(kv_names_in)
+    if _arch_global and not global_names:
+        warnings.warn(
+            "Decode model has global attention layers but no RangeDim on their "
+            "KV caches — falling back to static shapes. Global caches will be "
+            f"allocated at full max_seq_len={max_seq_len}, costing O(max_seq_len) "
+            "per step instead of O(actual_context). Re-export with: "
+            "uv run gemma-export",
+            stacklevel=2,
+        )
     if global_names and verbose:
         print(f"  Dynamic global KV caches: {len(global_names)} inputs", flush=True)
 
@@ -558,6 +568,14 @@ def generate_kvcached(
                 )
 
         pref_global_names = _flexible_global_names(pref_kv_in, _all_inputs[_n_pref_ctrl:])
+        _pref_arch_global = _global_kv_input_names(pref_kv_in)
+        if _pref_arch_global and not pref_global_names:
+            warnings.warn(
+                "Prefill model has global attention layers but no RangeDim on "
+                "their KV caches — falling back to static shapes. Re-export "
+                "with: uv run gemma-export",
+                stacklevel=2,
+            )
         pref_kv_state = _init_kv_state(
             _all_inputs[_n_pref_ctrl:], pref_global_names, padded_len,
         )
