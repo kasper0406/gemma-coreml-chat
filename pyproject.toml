@@ -16,7 +16,7 @@ dependencies = [
     "flax>=0.12.5",
     "numpy~=2.0",
     "coremltools>=9.0",
-    "stablehlo-coreml-experimental>=0.0.18",
+    "stablehlo-coreml>=0.1.1",
     "transformers>=4.50",
     "huggingface_hub>=0.24",
     "flatbuffers",
