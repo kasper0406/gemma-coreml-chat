@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import warnings
 import numpy as np
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -18,6 +19,28 @@ import coremltools as ct
 from gemma_chat.cache_spec import build_cache_specs
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN, MLPACKAGE_PATH, HF_MODEL_ID
 from gemma_chat.model import AttentionType
+
+
+@dataclass
+class KVCacheSession:
+    """Persistent KV cache state for reuse across conversation turns.
+
+    Pass to ``generate_kvcached`` to skip re-prefilling tokens already
+    processed in previous turns.  Updated **in-place** during generation.
+    """
+
+    kv_state: dict[str, np.ndarray] | None = None
+    seq_len: int = 0
+    processed_ids: list[int] = field(default_factory=list)
+
+
+def _longest_common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Return the length of the longest common prefix of two token-ID lists."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
 
 
 def _validate_decode_step_inputs(_spec_m: ct.models.MLModel, package_path: str) -> None:
@@ -458,6 +481,7 @@ def generate_kvcached(
     verbose: bool = True,
     decode_model: "_CompiledModelWrapper | None" = None,
     prefill_model: "_CompiledModelWrapper | None" = None,
+    session: KVCacheSession | None = None,
 ) -> Iterator[int]:
     """Yield generated token IDs using KV-cached decode inference.
 
@@ -480,6 +504,34 @@ def generate_kvcached(
     )
     n_real = len(prompt_ids)
     model_path = Path(model_path)
+
+    # ── Check for KV cache reuse from a previous turn ────────────────────────
+    skip_len = 0
+    if (
+        not decode_only
+        and session is not None
+        and session.kv_state is not None
+        and session.seq_len > 0
+    ):
+        prefix_match = _longest_common_prefix_len(prompt_ids, session.processed_ids)
+        if prefix_match >= session.seq_len:
+            skip_len = session.seq_len
+            if verbose:
+                print(
+                    f"KV cache hit: {skip_len} tokens cached, "
+                    f"{n_real - skip_len} new to prefill",
+                    flush=True,
+                )
+        else:
+            if verbose:
+                print(
+                    f"KV cache miss (prefix match {prefix_match}/{session.seq_len}), "
+                    f"full re-prefill",
+                    flush=True,
+                )
+            session.kv_state = None
+            session.seq_len = 0
+            session.processed_ids = []
 
     # ── Load decode model ────────────────────────────────────────────────────
     if decode_model is None:
@@ -576,9 +628,25 @@ def generate_kvcached(
                 "with: uv run gemma-export",
                 stacklevel=2,
             )
-        pref_kv_state = _init_kv_state(
-            _all_inputs[_n_pref_ctrl:], pref_global_names, padded_len,
-        )
+
+        # ── Initialize or reuse KV state ────────────────────────────────────
+        if skip_len > 0 and session is not None and session.kv_state is not None:
+            n_skip_chunks = skip_len // CHUNK_SIZE
+            # Always process at least the last chunk to obtain logits.
+            n_skip_chunks = min(n_skip_chunks, n_chunks - 1)
+            # Convert session's decode-named KV state → prefill input names.
+            pref_kv_state = {}
+            for dk_in, pk_in in zip(kv_names_in, pref_kv_in):
+                pref_kv_state[pk_in] = session.kv_state[dk_in]
+            # Grow global caches to accommodate the full prompt.
+            _ensure_global_cache_capacity(
+                pref_kv_state, pref_global_names, padded_len, max_seq_len,
+            )
+        else:
+            n_skip_chunks = 0
+            pref_kv_state = _init_kv_state(
+                _all_inputs[_n_pref_ctrl:], pref_global_names, padded_len,
+            )
         del _all_inputs
 
         prompt_padded = list(prompt_ids) + [pad_id] * (padded_len - n_real)
@@ -592,13 +660,17 @@ def generate_kvcached(
         )
 
         if verbose:
+            skip_info = (
+                f", skipping {n_skip_chunks} cached chunks"
+                if n_skip_chunks else ""
+            )
             print(
                 f"Prefill: {n_real} tokens in {n_chunks} chunks "
-                f"(chunk_size={CHUNK_SIZE}, global_kv={_actual_gkv})…",
+                f"(chunk_size={CHUNK_SIZE}, global_kv={_actual_gkv}{skip_info})…",
                 flush=True,
             )
 
-        for chunk_idx in range(n_chunks):
+        for chunk_idx in range(n_skip_chunks, n_chunks):
             start = chunk_idx * CHUNK_SIZE
             chunk_tokens = prompt_padded[start : start + CHUNK_SIZE]
             if _pref_has_n:
@@ -672,6 +744,12 @@ def generate_kvcached(
                 kv_names_in, kv_names_out, result
             )
 
+    # ── Persist KV state into session after prefill ──────────────────────────
+    if session is not None:
+        session.kv_state = kv_state
+        session.seq_len = n_real
+        session.processed_ids = list(prompt_ids)
+
     # ── Decode loop ───────────────────────────────────────────────────────────
     if logits is None:
         raise RuntimeError("internal error: logits unset after prefill")
@@ -705,6 +783,10 @@ def generate_kvcached(
         kv_state = _coreml_kv_state_after_decode(
             kv_names_in, kv_names_out, decode_result
         )
+        if session is not None:
+            session.kv_state = kv_state
+            session.seq_len = position + 1
+            session.processed_ids.append(next_id)
 
 def generate_text_kvcached(
     prompt: str,
