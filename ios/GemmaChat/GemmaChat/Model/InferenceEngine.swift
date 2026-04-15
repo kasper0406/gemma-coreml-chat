@@ -199,7 +199,7 @@ struct InferenceEngine: Sendable {
                                    count: paddedLen - nReal)
 
         let startChunk = fromOffset / GemmaConfig.chunkSize
-        var currentKV = kvState
+        var currentKV = kvState.grownToFit(needed: paddedLen, maxLen: GemmaConfig.maxSeqLen)
         var lastLogits: MLMultiArray? = nil
         let chunksToProcess = nChunks - startChunk
 

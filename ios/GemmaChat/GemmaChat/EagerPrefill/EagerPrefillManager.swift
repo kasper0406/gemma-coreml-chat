@@ -229,13 +229,17 @@ actor EagerPrefillManager {
         print("[Perf] Eager prefill: \(totalToProcess) chunks (\(startChunk)..<\(upToChunk))")
         let batchStart = CFAbsoluteTimeGetCurrent()
 
-        // If starting from scratch, size global caches to the padded prompt length
-        if startChunk == 0 && !globalKVNames.isEmpty {
-            let paddedLen = upToChunk * GemmaConfig.chunkSize
-            kvState = Self.makeEmptyKV(
-                names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes,
-                globalNames: globalKVNames, initialGlobalSize: paddedLen
-            )
+        // Size/grow global caches to fit all chunks we're about to process
+        if !globalKVNames.isEmpty {
+            let neededSize = upToChunk * GemmaConfig.chunkSize
+            if startChunk == 0 {
+                kvState = Self.makeEmptyKV(
+                    names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes,
+                    globalNames: globalKVNames, initialGlobalSize: neededSize
+                )
+            } else {
+                kvState = kvState.grownToFit(needed: neededSize, maxLen: GemmaConfig.maxSeqLen)
+            }
         }
 
         do {
