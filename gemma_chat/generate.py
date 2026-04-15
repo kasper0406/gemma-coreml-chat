@@ -489,9 +489,10 @@ def generate_kvcached(
     dec_in = list(decode_model.input_description)
     dec_out = list(decode_model.output_description)
 
-    # New symbolic-shape models have a phantom "N" input first (global cache dim).
-    _has_n_input = len(dec_in) > 0 and dec_in[0] == "N"
-    _n_ctrl = 3 if _has_n_input else 2  # N, token_id, position  OR  token_id, position
+    # First input is the phantom "N" (current global cache length), then
+    # token_id, position, followed by KV cache arrays + sliding_pos_ring.
+    assert dec_in[0] == "N", f"Expected 'N' as first input, got {dec_in[0]!r}"
+    _n_ctrl = 3  # N, token_id, position
     kv_names_in = dec_in[_n_ctrl:]      # KV input names + sliding_pos_ring
     kv_names_out = dec_out[1:]          # KV output names + sliding_pos_ring_out
 
@@ -508,7 +509,7 @@ def generate_kvcached(
     # Only enable dynamic sizing for global caches that have RangeDim.
     # Fixed-shape models → global_names is empty → all caches use spec shapes.
     global_names = _flexible_global_names(kv_names_in, _dec_state_inputs)
-    # Architectural global cache names (always present, even when concretized).
+    # Architectural global cache names.
     _arch_global = _global_kv_input_names(kv_names_in)
     if global_names and verbose:
         print(f"  Dynamic global KV caches: {len(global_names)} inputs", flush=True)
@@ -564,7 +565,7 @@ def generate_kvcached(
 
         prompt_padded = list(prompt_ids) + [pad_id] * (padded_len - n_real)
 
-        # Actual global KV size (may differ from padded_len when concretized).
+        # Actual global KV size (matches padded_len for dynamic models).
         _actual_gkv = next(
             (pref_kv_state[n].shape[1]
              for n in _global_kv_input_names(pref_kv_in)
@@ -637,18 +638,12 @@ def generate_kvcached(
             _global_len = next(
                 (kv_state[n].shape[1] for n in _arch_global if n in kv_state),
                 max(n_real, 1),
-            ) if _has_n_input else 0
-            if _has_n_input:
-                step_input = {
-                    dec_in[0]: np.array([_global_len], dtype=np.int32),
-                    dec_in[1]: np.array([token_id], dtype=np.int32),
-                    dec_in[2]: np.array([pos], dtype=np.int32),
-                }
-            else:
-                step_input = {
-                    dec_in[0]: np.array([token_id], dtype=np.int32),
-                    dec_in[1]: np.array([pos], dtype=np.int32),
-                }
+            )
+            step_input = {
+                dec_in[0]: np.array([_global_len], dtype=np.int32),
+                dec_in[1]: np.array([token_id], dtype=np.int32),
+                dec_in[2]: np.array([pos], dtype=np.int32),
+            }
             step_input.update(kv_state)
             result = decode_model.predict(step_input)
             logits_key = dec_out[0] if dec_out[0] in result else next(
@@ -676,18 +671,12 @@ def generate_kvcached(
 
         _global_len = next(
             (kv_state[n].shape[1] for n in _arch_global if n in kv_state), 0,
-        ) if _has_n_input else 0
-        if _has_n_input:
-            decode_input = {
-                dec_in[0]: np.array([_global_len], dtype=np.int32),
-                dec_in[1]: np.array([next_id], dtype=np.int32),
-                dec_in[2]: np.array([position], dtype=np.int32),
-            }
-        else:
-            decode_input = {
-                dec_in[0]: np.array([next_id], dtype=np.int32),
-                dec_in[1]: np.array([position], dtype=np.int32),
-            }
+        )
+        decode_input = {
+            dec_in[0]: np.array([_global_len], dtype=np.int32),
+            dec_in[1]: np.array([next_id], dtype=np.int32),
+            dec_in[2]: np.array([position], dtype=np.int32),
+        }
         decode_input.update(kv_state)
 
         decode_result = decode_model.predict(decode_input)
