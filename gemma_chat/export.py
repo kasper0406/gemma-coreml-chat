@@ -1,9 +1,8 @@
-"""Export Gemma4-E2B chunk_prefill + decode_step to a single multifunction CoreML .mlpackage.
+"""Export Gemma4-E2B chunk_prefill + decode_step as a CoreML .mlpackage.
 
-Both functions are merged into one model using CoreML's MultiFunctionDescriptor
-(iOS 18+), sharing weights for automatic deduplication.  The chunked prefill
-processes CHUNK_SIZE tokens per call instead of the full sequence, enabling
-arbitrarily long contexts without quadratic memory growth.
+By default, both functions are merged into a single multifunction .mlpackage
+with shared (int4-quantized) weights and RangeDim on global KV caches for
+dynamic context window sizing up to 60k tokens.
 
 Usage:
     uv run gemma-export
@@ -689,14 +688,14 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Export Gemma4-E2B prefill + decode into a single multifunction "
-            "CoreML .mlpackage with shared (int8-quantized) weights."
+            "Export Gemma4-E2B prefill + decode as a CoreML .mlpackage "
+            "with dynamic shapes (RangeDim) for global KV caches."
         )
     )
     parser.add_argument(
         "--output",
         default="gemma4-e2b.mlpackage",
-        help="Output path for the multifunction .mlpackage (default: gemma4-e2b.mlpackage)",
+        help="Output path (default: gemma4-e2b.mlpackage)",
     )
     parser.add_argument(
         "--model-id",
@@ -720,6 +719,19 @@ def main() -> None:
         default=None,
         help="Truncate model to this many layers (for fast iteration / testing)",
     )
+    parser.add_argument(
+        "--decode-only",
+        action="store_true",
+        help="Export only the decode model (skip prefill)",
+    )
+    parser.add_argument(
+        "--separate",
+        action="store_true",
+        help=(
+            "Export prefill and decode as separate .mlpackage files "
+            "instead of a single multifunction model."
+        ),
+    )
     # Internal: run a single phase (used by subprocess isolation).
     parser.add_argument("--_phase", help=argparse.SUPPRESS)
     parser.add_argument("--_phase-output", help=argparse.SUPPRESS)
@@ -731,15 +743,6 @@ def main() -> None:
         return
 
     output = Path(args.output)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="gemma-export-"))
-    tmp_prefill = tmp_dir / "prefill.mlpackage"
-    tmp_decode = tmp_dir / "decode.mlpackage"
-
-    print(
-        f"\nExport plan: chunk_prefill (chunk_size={CHUNK_SIZE}) + decode -> {output}\n"
-        f"  Temp dir: {tmp_dir}\n",
-        flush=True,
-    )
 
     def _subprocess_phase(phase: str, phase_output: Path) -> None:
         """Re-invoke ourselves in a subprocess for memory isolation."""
@@ -760,50 +763,91 @@ def main() -> None:
             print(f"\n!!! {phase} export failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(result.returncode)
 
-    try:
-        # -- Phase 1: Prefill (subprocess for memory isolation) --
-        _subprocess_phase("prefill", tmp_prefill)
-        print(f"\n  Chunk-prefill exported to {tmp_prefill}\n")
+    if args.separate:
+        # ── Separate models: each gets its own .mlpackage with RangeDim ──
+        output.mkdir(parents=True, exist_ok=True)
+        out_decode = output / "decode.mlpackage"
 
-        # -- Phase 2: Decode (subprocess for memory isolation) --
+        phases = ["decode"] if args.decode_only else ["prefill", "decode"]
         print(
-            "=" * 60,
-            "\nDecode-step export (second artifact).\n",
-            "=" * 60,
-            "\n",
-            sep="",
+            f"\nExport plan (separate models): {' + '.join(phases)} -> {output}/\n",
             flush=True,
         )
-        _subprocess_phase("decode", tmp_decode)
-        print(f"\n  Decode exported to {tmp_decode}\n")
 
-        # -- Phase 3: Merge (lightweight, runs in this process) --
-        from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
+        try:
+            if not args.decode_only:
+                out_prefill = output / "prefill.mlpackage"
+                if out_prefill.exists():
+                    shutil.rmtree(out_prefill)
+                _subprocess_phase("prefill", out_prefill)
+                print(f"\n  Chunk-prefill exported to {out_prefill}\n")
 
-        print("=" * 60)
-        print("Merging chunk_prefill + decode (int8 weight deduplication) ...")
-        print("=" * 60)
+                print("=" * 60, "\nDecode-step export.\n", "=" * 60, "\n",
+                      sep="", flush=True)
 
-        desc = MultiFunctionDescriptor()
-        desc.add_function(str(tmp_prefill), src_function_name="main", target_function_name="prefill")
-        desc.add_function(str(tmp_decode), src_function_name="main", target_function_name="decode")
-        desc.default_function_name = "decode"
+            if out_decode.exists():
+                shutil.rmtree(out_decode)
+            _subprocess_phase("decode", out_decode)
+            print(f"\n  Decode exported to {out_decode}\n")
 
-        if output.exists():
-            shutil.rmtree(output)
-        save_multifunction(desc, str(output))
+            sizes = []
+            for p in sorted(output.glob("*.mlpackage")):
+                sz = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                sizes.append(f"    {p.name}  ({sz / 1e9:.2f} GB)")
+            print("\n  Export complete:\n" + "\n".join(sizes) + "\n")
 
-        shutil.rmtree(tmp_prefill, ignore_errors=True)
-        shutil.rmtree(tmp_decode, ignore_errors=True)
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # ── Multifunction export (default): merge prefill + decode ──
+        tmp_dir = Path(tempfile.mkdtemp(prefix="gemma-export-"))
+        tmp_prefill = tmp_dir / "prefill.mlpackage"
+        tmp_decode = tmp_dir / "decode.mlpackage"
 
-        final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
-        print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
+        phases = ["decode"] if args.decode_only else ["prefill", "decode"]
+        print(
+            f"\nExport plan (multifunction): {' + '.join(phases)} -> {output}\n"
+            f"  Temp dir: {tmp_dir}\n",
+            flush=True,
+        )
 
-    except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        sys.exit(1)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        try:
+            if not args.decode_only:
+                _subprocess_phase("prefill", tmp_prefill)
+                print(f"\n  Chunk-prefill exported to {tmp_prefill}\n")
+                print("=" * 60, "\nDecode-step export.\n", "=" * 60, "\n",
+                      sep="", flush=True)
+
+            _subprocess_phase("decode", tmp_decode)
+            print(f"\n  Decode exported to {tmp_decode}\n")
+
+            from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
+
+            print("=" * 60)
+            print("Merging into multifunction .mlpackage (weight deduplication) ...")
+            print("=" * 60)
+
+            desc = MultiFunctionDescriptor()
+            if not args.decode_only:
+                desc.add_function(str(tmp_prefill), src_function_name="main",
+                                  target_function_name="prefill")
+            desc.add_function(str(tmp_decode), src_function_name="main",
+                              target_function_name="decode")
+            desc.default_function_name = "decode"
+
+            if output.exists():
+                shutil.rmtree(output)
+            save_multifunction(desc, str(output))
+
+            final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
+            print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
+
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """
 Monkey-patch stablehlo-coreml StableHloConverter.op_constant for streaming
 int8 weights during HLO→MIL (replaces a fork-only _constant_quantizer hook).
-Works with PyPI stablehlo-coreml-experimental; an upstream optional callback
+Works with PyPI stablehlo-coreml; an upstream optional callback
 could replace this later.
 """
 

@@ -49,5 +49,7 @@ E2B_CONFIG = Gemma4Config(
 # HuggingFace model ID for Gemma4-E2B instruction-tuned
 HF_MODEL_ID = "google/gemma-4-E2B-it"
 
-# Path where the exported multifunction CoreML model is saved
+# Path to the exported CoreML multifunction .mlpackage containing both
+# prefill and decode functions with shared (int4-quantized) weights.
+# Global KV caches use RangeDim(1, MAX_SEQ_LEN) for dynamic context sizing.
 MLPACKAGE_PATH = "gemma4-e2b.mlpackage"

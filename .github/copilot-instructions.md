@@ -37,7 +37,6 @@ This is a two-phase pipeline for running `google/gemma-4-E2B-it` locally on Appl
 - `jax_generate.py` provides a JAX-only token stream using `decode_jax.py` (for `--backend jax`).
 - `decode_jax.py` provides a pure-JAX KV-cached decode path with `prefill()` and `decode_step()` for reference and parity testing.
 
-**Key dependency:** `stablehlo-coreml-experimental` from PyPI (see `pyproject.toml`). Gemma does not depend on a local stablehlo-coreml fork.
 
 ## Key Conventions
 

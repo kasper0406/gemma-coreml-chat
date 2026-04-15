@@ -57,11 +57,13 @@ Commands:
 
 
 def parse_compute_units(value: str) -> ct.ComputeUnit:
-        mapping = {
-                "all": ct.ComputeUnit.ALL,
-                "cpu-only": ct.ComputeUnit.CPU_ONLY,
-        }
-        return mapping[value]
+    mapping = {
+        "all": ct.ComputeUnit.ALL,
+        "cpu-only": ct.ComputeUnit.CPU_ONLY,
+        "cpu-and-gpu": ct.ComputeUnit.CPU_AND_GPU,
+        "cpu-and-ane": ct.ComputeUnit.CPU_AND_NE,
+    }
+    return mapping[value]
 
 
 def main() -> None:
@@ -80,16 +82,20 @@ def main() -> None:
         "--model",
         default="gemma4-e2b.mlpackage",
         help=(
-            "Path to the multifunction .mlpackage (default: gemma4-e2b.mlpackage)"
+            "Path to multifunction .mlpackage, or a directory containing "
+            "decode.mlpackage + prefill.mlpackage (default: gemma4-e2b.mlpackage)"
         ),
     )
     parser.add_argument(
         "--compute-units",
-        choices=("all", "cpu-only"),
+        choices=("all", "cpu-only", "cpu-and-gpu", "cpu-and-ane"),
         default="all",
         help=(
-            "CoreML compute target: all for best runtime performance, "
-            "cpu-only for much faster first-load compilation"
+            "CoreML compute target: "
+            "'all' uses CPU+GPU+ANE for best runtime performance (slow first-load compilation); "
+            "'cpu-only' for fastest compilation during development; "
+            "'cpu-and-gpu' skips ANE for faster compilation with good performance; "
+            "'cpu-and-ane' skips GPU, useful when GPU is busy with other work"
         ),
     )
     parser.add_argument(

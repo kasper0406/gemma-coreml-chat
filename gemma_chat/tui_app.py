@@ -12,7 +12,9 @@ from textual.widgets import Input, RichLog, Static
 
 from gemma_chat.chat import HELP_TEXT, format_chat_prompt
 from gemma_chat.config import MAX_SEQ_LEN
-from gemma_chat.generate import generate_kvcached, stop_token_ids, truncate_prompt_ids
+from gemma_chat.generate import (
+    KVCacheSession, generate_kvcached, stop_token_ids, truncate_prompt_ids,
+)
 from gemma_chat.jax_generate import generate_jax_stream
 
 
@@ -74,6 +76,7 @@ class GemmaChatApp(App[None]):
         self._cfg = cfg
         self._history: list[dict[str, str]] = []
         self._generating = False
+        self._kv_session: KVCacheSession | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top_row"):
@@ -130,6 +133,7 @@ class GemmaChatApp(App[None]):
                 return
             if low == "/reset":
                 self._history.clear()
+                self._kv_session = None
                 self.query_one("#log", RichLog).write("[dim][History cleared][/]")
                 self.query_one("#stream_row", Static).update("")
                 self._set_stats(0, 0, False, 0, MAX_SEQ_LEN)
@@ -181,6 +185,8 @@ class GemmaChatApp(App[None]):
         try:
             if cfg.backend == "coreml":
                 assert cfg.model_path is not None
+                if self._kv_session is None:
+                    self._kv_session = KVCacheSession()
                 it = generate_kvcached(
                     fed_ids,
                     model_path=cfg.model_path,
@@ -194,6 +200,7 @@ class GemmaChatApp(App[None]):
                     top_p=cfg.top_p,
                     max_seq_len=MAX_SEQ_LEN,
                     verbose=False,
+                    session=self._kv_session,
                 )
             else:
                 assert cfg.jax_params is not None and cfg.jax_cfg is not None
@@ -245,6 +252,8 @@ class GemmaChatApp(App[None]):
             ui(finish)
             self._history.append({"role": "model", "content": reply})
         except Exception as exc:
+            # History rolls back (user msg popped), so KV session is stale.
+            self._kv_session = None
 
             def err(e: BaseException = exc) -> None:
                 self.query_one("#stream_row", Static).update("")
