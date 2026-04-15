@@ -1,8 +1,8 @@
 """Terminal chat for Gemma4-E2B (Textual UI): CoreML or JAX reference.
 
 Usage:
-    uv run gemma-chat --model gemma4-e2b.mlpackage
-    uv run gemma-chat --model gemma4-e2b.mlpackage --decode-only
+    uv run gemma-chat --model gemma4-e2b
+    uv run gemma-chat --model gemma4-e2b --decode-only
     uv run gemma-chat --backend jax
     uv run python -m gemma_chat.chat --help
 
@@ -78,9 +78,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default="gemma4-e2b.mlpackage",
+        default="gemma4-e2b",
         help=(
-            "Path to the multifunction .mlpackage (default: gemma4-e2b.mlpackage)"
+            "Path to model directory (containing decode.mlpackage + prefill.mlpackage) "
+            "or a single multifunction .mlpackage (default: gemma4-e2b)"
         ),
     )
     parser.add_argument(

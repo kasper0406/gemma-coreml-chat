@@ -49,5 +49,8 @@ E2B_CONFIG = Gemma4Config(
 # HuggingFace model ID for Gemma4-E2B instruction-tuned
 HF_MODEL_ID = "google/gemma-4-E2B-it"
 
-# Path where the exported multifunction CoreML model is saved
-MLPACKAGE_PATH = "gemma4-e2b.mlpackage"
+# Directory containing the exported CoreML models (decode.mlpackage + prefill.mlpackage).
+# Previously this was a single multifunction .mlpackage, but macOS cannot load
+# multifunction models with RangeDim (flexible shapes).  Two separate single-function
+# models preserve full dynamic shape support for the 60k context window.
+MLPACKAGE_DIR = "gemma4-e2b"
