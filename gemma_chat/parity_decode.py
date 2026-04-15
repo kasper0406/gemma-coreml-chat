@@ -11,10 +11,10 @@ Requires network/HF cache for weights unless already downloaded.
 
 Example::
 
-    uv run gemma-parity-decode --model gemma4-e2b \\
+    uv run gemma-parity-decode --model gemma4-e2b.mlpackage \\
         --prompt "Hello" --max-tokens 8
 
-    uv run gemma-parity-decode --model gemma4-e2b \\
+    uv run gemma-parity-decode --model gemma4-e2b.mlpackage \\
         --prompt "Hello" --greedy-steps 32
 """
 
@@ -215,8 +215,8 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=Path,
-        default=Path("gemma4-e2b"),
-        help="Model directory or multifunction .mlpackage (default: gemma4-e2b)",
+        default=Path("gemma4-e2b.mlpackage"),
+        help="Multifunction .mlpackage or model directory (default: gemma4-e2b.mlpackage)",
     )
     parser.add_argument(
         "--prompt",

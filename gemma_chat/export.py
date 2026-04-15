@@ -1,13 +1,12 @@
-"""Export Gemma4-E2B chunk_prefill + decode_step as separate CoreML .mlpackage files.
+"""Export Gemma4-E2B chunk_prefill + decode_step as a CoreML .mlpackage.
 
-Each function is exported as its own single-function model with RangeDim on
-global KV caches, enabling dynamic context window sizing at runtime.  macOS
-cannot load multifunction models with RangeDim (flexible shapes), so we keep
-them separate.  The two models share the same weight data but in separate files.
+By default, both functions are merged into a single multifunction .mlpackage
+with shared (int4-quantized) weights and RangeDim on global KV caches for
+dynamic context window sizing up to 60k tokens.
 
 Usage:
     uv run gemma-export
-    uv run gemma-export --output gemma4-e2b
+    uv run gemma-export --output gemma4-e2b.mlpackage
     uv run gemma-export --skip-warmup   # save RAM on constrained machines
 """
 
@@ -689,14 +688,14 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Export Gemma4-E2B prefill + decode as CoreML .mlpackage files "
+            "Export Gemma4-E2B prefill + decode as a CoreML .mlpackage "
             "with dynamic shapes (RangeDim) for global KV caches."
         )
     )
     parser.add_argument(
         "--output",
-        default="gemma4-e2b",
-        help="Output directory (default: gemma4-e2b)",
+        default="gemma4-e2b.mlpackage",
+        help="Output path (default: gemma4-e2b.mlpackage)",
     )
     parser.add_argument(
         "--model-id",
@@ -726,12 +725,11 @@ def main() -> None:
         help="Export only the decode model (skip prefill)",
     )
     parser.add_argument(
-        "--multifunction",
+        "--separate",
         action="store_true",
         help=(
-            "Merge prefill + decode into a single multifunction .mlpackage "
-            "(shared weights). Note: macOS currently cannot load multifunction "
-            "models with RangeDim (dynamic shapes)."
+            "Export prefill and decode as separate .mlpackage files "
+            "instead of a single multifunction model."
         ),
     )
     # Internal: run a single phase (used by subprocess isolation).
@@ -765,8 +763,44 @@ def main() -> None:
             print(f"\n!!! {phase} export failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(result.returncode)
 
-    if args.multifunction:
-        # ── Multifunction export: merge prefill + decode into one .mlpackage ──
+    if args.separate:
+        # ── Separate models: each gets its own .mlpackage with RangeDim ──
+        output.mkdir(parents=True, exist_ok=True)
+        out_decode = output / "decode.mlpackage"
+
+        phases = ["decode"] if args.decode_only else ["prefill", "decode"]
+        print(
+            f"\nExport plan (separate models): {' + '.join(phases)} -> {output}/\n",
+            flush=True,
+        )
+
+        try:
+            if not args.decode_only:
+                out_prefill = output / "prefill.mlpackage"
+                if out_prefill.exists():
+                    shutil.rmtree(out_prefill)
+                _subprocess_phase("prefill", out_prefill)
+                print(f"\n  Chunk-prefill exported to {out_prefill}\n")
+
+                print("=" * 60, "\nDecode-step export.\n", "=" * 60, "\n",
+                      sep="", flush=True)
+
+            if out_decode.exists():
+                shutil.rmtree(out_decode)
+            _subprocess_phase("decode", out_decode)
+            print(f"\n  Decode exported to {out_decode}\n")
+
+            sizes = []
+            for p in sorted(output.glob("*.mlpackage")):
+                sz = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                sizes.append(f"    {p.name}  ({sz / 1e9:.2f} GB)")
+            print("\n  Export complete:\n" + "\n".join(sizes) + "\n")
+
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # ── Multifunction export (default): merge prefill + decode ──
         tmp_dir = Path(tempfile.mkdtemp(prefix="gemma-export-"))
         tmp_prefill = tmp_dir / "prefill.mlpackage"
         tmp_decode = tmp_dir / "decode.mlpackage"
@@ -814,42 +848,6 @@ def main() -> None:
             sys.exit(1)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-    else:
-        # ── Separate models: each gets its own .mlpackage with RangeDim ──
-        output.mkdir(parents=True, exist_ok=True)
-        out_decode = output / "decode.mlpackage"
-
-        phases = ["decode"] if args.decode_only else ["prefill", "decode"]
-        print(
-            f"\nExport plan: {' + '.join(phases)} -> {output}/\n",
-            flush=True,
-        )
-
-        try:
-            if not args.decode_only:
-                out_prefill = output / "prefill.mlpackage"
-                if out_prefill.exists():
-                    shutil.rmtree(out_prefill)
-                _subprocess_phase("prefill", out_prefill)
-                print(f"\n  Chunk-prefill exported to {out_prefill}\n")
-
-                print("=" * 60, "\nDecode-step export.\n", "=" * 60, "\n",
-                      sep="", flush=True)
-
-            if out_decode.exists():
-                shutil.rmtree(out_decode)
-            _subprocess_phase("decode", out_decode)
-            print(f"\n  Decode exported to {out_decode}\n")
-
-            sizes = []
-            for p in sorted(output.glob("*.mlpackage")):
-                sz = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-                sizes.append(f"    {p.name}  ({sz / 1e9:.2f} GB)")
-            print("\n  Export complete:\n" + "\n".join(sizes) + "\n")
-
-        except KeyboardInterrupt:
-            print("\nInterrupted.", file=sys.stderr)
-            sys.exit(1)
 
 
 if __name__ == "__main__":

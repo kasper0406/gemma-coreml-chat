@@ -15,7 +15,7 @@ from typing import Iterator
 import coremltools as ct
 
 from gemma_chat.cache_spec import build_cache_specs
-from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN, MLPACKAGE_DIR, HF_MODEL_ID
+from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN, MLPACKAGE_PATH, HF_MODEL_ID
 from gemma_chat.model import AttentionType
 
 
@@ -231,15 +231,15 @@ def load_coreml_model(
     compute_units: "ct.ComputeUnit" = None,
     function_name: str | None = None,
 ) -> _CompiledModelWrapper:
-    """Load a CoreML model, handling both directory and multifunction layouts.
+    """Load a CoreML model, handling both multifunction and directory layouts.
 
-    **Directory layout** (default export):
+    **Multifunction layout** (default export):
+        ``mlpackage_path`` is a single ``.mlpackage`` containing both functions
+        (prefill + decode) with shared weights.  Loaded with ``function_name``.
+
+    **Directory layout** (``--separate`` export):
         ``mlpackage_path/decode.mlpackage``, ``mlpackage_path/prefill.mlpackage``
-        — each is a single-function model with full RangeDim support.
-
-    **Multifunction layout** (``--multifunction`` export):
-        ``mlpackage_path`` is a single ``.mlpackage`` containing both functions.
-        Loaded directly with ``function_name``.
+        — each is a single-function model.
     """
     if compute_units is None:
         compute_units = ct.ComputeUnit.ALL

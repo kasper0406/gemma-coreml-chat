@@ -18,7 +18,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from gemma_chat.config import HF_MODEL_ID, MLPACKAGE_DIR, MAX_SEQ_LEN
+from gemma_chat.config import HF_MODEL_ID, MLPACKAGE_PATH, MAX_SEQ_LEN
 from gemma_chat.generate import (
     generate_text,
     generate_text_kvcached,
@@ -38,7 +38,7 @@ def main() -> None:
         "--full-model",
         type=Path,
         default=None,
-        help=f"Full forward .mlpackage (default: {MLPACKAGE_DIR})",
+        help=f"Full forward .mlpackage (default: {MLPACKAGE_PATH})",
     )
     parser.add_argument(
         "--decode-model",
@@ -82,7 +82,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    full_path = args.full_model or Path(MLPACKAGE_DIR)
+    full_path = args.full_model or Path(MLPACKAGE_PATH)
     if not full_path.exists():
         print(f"Full model not found: {full_path}", file=sys.stderr)
         sys.exit(1)

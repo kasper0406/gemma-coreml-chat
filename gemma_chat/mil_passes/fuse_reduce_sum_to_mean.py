@@ -152,6 +152,14 @@ def _fuse_in_block(block):
                 x=rs_input, axes=axes, keep_dims=keep_dims,
                 before_op=op, name=op.name + "_mean",
             )
+            # Match dtype of the adjusted constant to the mean output.
+            mean_dtype = mean_var.dtype
+            if hasattr(mean_dtype, '__name__'):
+                np_dtype = {'fp16': np.float16, 'fp32': np.float32}.get(mean_dtype.__name__, np.float32)
+            else:
+                np_dtype = np.float32
+            adjusted_val = adjusted_val.astype(np_dtype)
+
             new_add = mb.add(
                 x=mean_var, y=adjusted_val,
                 before_op=op, name=add_op.name,
