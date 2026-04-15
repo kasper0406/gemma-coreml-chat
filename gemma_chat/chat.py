@@ -80,7 +80,8 @@ def main() -> None:
         "--model",
         default="gemma4-e2b.mlpackage",
         help=(
-            "Path to the multifunction .mlpackage (default: gemma4-e2b.mlpackage)"
+            "Path to multifunction .mlpackage, or a directory containing "
+            "decode.mlpackage + prefill.mlpackage (default: gemma4-e2b.mlpackage)"
         ),
     )
     parser.add_argument(

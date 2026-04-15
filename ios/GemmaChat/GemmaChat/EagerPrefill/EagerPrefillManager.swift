@@ -25,6 +25,8 @@ actor EagerPrefillManager {
     private let kvInputNames: [String]
     private let kvShapes: [String: [NSNumber]]
     private let kvDtypes: [String: MLMultiArrayDataType]
+    /// Names of global KV inputs with flexible shapes.
+    private let globalKVNames: Set<String>
 
     /// Tokens that have been prefilled so far.
     private var prefillTokens: [Int] = []
@@ -49,6 +51,7 @@ actor EagerPrefillManager {
         self.tokenizer = tokenizer
         self.model = model
         self.kvInputNames = kvInputNames
+        self.globalKVNames = model.globalKVInputNames
         // Pre-extract shapes and dtypes so we don't store non-Sendable MLFeatureDescription
         var shapes: [String: [NSNumber]] = [:]
         var dtypes: [String: MLMultiArrayDataType] = [:]
@@ -62,25 +65,34 @@ actor EagerPrefillManager {
         }
         self.kvShapes = shapes
         self.kvDtypes = dtypes
-        self.kvState = Self.makeEmptyKV(names: kvInputNames, shapes: shapes, dtypes: dtypes)
+        self.kvState = Self.makeEmptyKV(
+            names: kvInputNames, shapes: shapes, dtypes: dtypes,
+            globalNames: model.globalKVInputNames, initialGlobalSize: nil
+        )
     }
 
     private static func makeEmptyKV(
-        names: [String], shapes: [String: [NSNumber]], dtypes: [String: MLMultiArrayDataType]
+        names: [String], shapes: [String: [NSNumber]], dtypes: [String: MLMultiArrayDataType],
+        globalNames: Set<String>, initialGlobalSize: Int?
     ) -> KVCacheState {
         var dict: [String: MLMultiArray] = [:]
         for name in names {
-            let shape = shapes[name] ?? [1]
+            var shape = (shapes[name] ?? [1]).map { $0.intValue }
             let dtype = dtypes[name] ?? .float16
-            let array = try! MLMultiArray(shape: shape, dataType: dtype)
+            // Override dim-1 for global caches
+            if let size = initialGlobalSize, globalNames.contains(name), shape.count == 4 {
+                shape[1] = size
+            }
+            let nsShape = shape.map { NSNumber(value: $0) }
+            let array = try! MLMultiArray(shape: nsShape, dataType: dtype)
             if dtype == .int32 {
-                // Ring position tracker: -1 means "empty slot"
                 let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: array.count)
                 for i in 0..<array.count { ptr[i] = -1 }
             }
             dict[name] = array
         }
-        return KVCacheState(arraysByName: dict, inputNames: names, processedTokens: 0)
+        return KVCacheState(arraysByName: dict, inputNames: names, processedTokens: 0,
+                            globalNames: globalNames)
     }
 
     /// Called when the user's input text changes.
@@ -179,7 +191,10 @@ actor EagerPrefillManager {
             clearInternalState()
             return (
                 promptIDs,
-                Self.makeEmptyKV(names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes),
+                Self.makeEmptyKV(
+                    names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes,
+                    globalNames: globalKVNames, initialGlobalSize: nil
+                ),
                 0
             )
         }
@@ -195,7 +210,10 @@ actor EagerPrefillManager {
     private func clearInternalState() {
         prefillTokens = []
         completedChunks = 0
-        kvState = Self.makeEmptyKV(names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes)
+        kvState = Self.makeEmptyKV(
+            names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes,
+            globalNames: globalKVNames, initialGlobalSize: nil
+        )
         lastLogits = nil
         isPrefilling = false
     }
@@ -210,6 +228,15 @@ actor EagerPrefillManager {
         let totalToProcess = upToChunk - startChunk
         print("[Perf] Eager prefill: \(totalToProcess) chunks (\(startChunk)..<\(upToChunk))")
         let batchStart = CFAbsoluteTimeGetCurrent()
+
+        // If starting from scratch, size global caches to the padded prompt length
+        if startChunk == 0 && !globalKVNames.isEmpty {
+            let paddedLen = upToChunk * GemmaConfig.chunkSize
+            kvState = Self.makeEmptyKV(
+                names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes,
+                globalNames: globalKVNames, initialGlobalSize: paddedLen
+            )
+        }
 
         do {
             // Ensure prefill model is loaded before first use

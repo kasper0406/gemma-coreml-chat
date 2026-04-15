@@ -100,6 +100,9 @@ def kv_shared_sources(
     """Return mapping: shared_layer_idx → source_layer_idx for KV-shared layers."""
     n = cfg.num_layers
     kv_shared_start = n - cfg.num_kv_shared_layers
+    if cfg.num_kv_shared_layers == 0:
+        return {}
+
     attn = list(cfg.attention_types)
     prev = attn[:kv_shared_start]
 

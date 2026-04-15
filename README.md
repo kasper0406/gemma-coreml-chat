@@ -36,7 +36,9 @@ Loads the `.mlpackage`, runs autoregressive inference with KV caching, and provi
 **Export options:**
 
 ```bash
-uv run gemma-export                            # int8 weights → gemma4-e2b.mlpackage
+uv run gemma-export                            # multifunction .mlpackage with shared int4 weights
+uv run gemma-export --decode-only              # decode only (no prefill)
+uv run gemma-export --separate                 # separate decode + prefill .mlpackage files
 ```
 
 **Chat options:**
@@ -44,7 +46,7 @@ uv run gemma-export                            # int8 weights → gemma4-e2b.mlp
 ```bash
 uv run gemma-chat                             # uses gemma4-e2b.mlpackage (default)
 uv run gemma-chat --compute-units cpu-only   # faster first-load compilation for iteration
-uv run gemma-chat --model path/to/other.mlpackage
+uv run gemma-chat --model path/to/model.mlpackage
 uv run gemma-chat --backend jax               # use JAX/Flax weights directly (for comparison)
 ```
 

@@ -1,9 +1,8 @@
-"""Export Gemma4-E2B chunk_prefill + decode_step to a single multifunction CoreML .mlpackage.
+"""Export Gemma4-E2B chunk_prefill + decode_step as a CoreML .mlpackage.
 
-Both functions are merged into one model using CoreML's MultiFunctionDescriptor
-(iOS 18+), sharing weights for automatic deduplication.  The chunked prefill
-processes CHUNK_SIZE tokens per call instead of the full sequence, enabling
-arbitrarily long contexts without quadratic memory growth.
+By default, both functions are merged into a single multifunction .mlpackage
+with shared (int4-quantized) weights and RangeDim on global KV caches for
+dynamic context window sizing up to 60k tokens.
 
 Usage:
     uv run gemma-export
@@ -14,6 +13,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
+import subprocess
 import sys
 import os as _os
 import signal as _signal
@@ -37,11 +38,34 @@ def _inplace_bf16_to_f16(d: dict) -> None:
 
 
 def _rss_mb() -> float:
+    """Current (not peak) RSS in MB."""
     try:
-        import resource
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
+        # macOS: read from ps for current RSS (ru_maxrss is peak only).
+        import subprocess as _sp
+        out = _sp.check_output(
+            ["ps", "-o", "rss=", "-p", str(_os.getpid())],
+            text=True,
+        ).strip()
+        return int(out) / 1024  # ps gives KB on macOS
     except Exception:
-        return 0.0
+        try:
+            import resource
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
+        except Exception:
+            return 0.0
+
+
+def _release_malloc() -> None:
+    """Force macOS malloc to return freed memory to the OS."""
+    gc.collect()
+    gc.collect()
+    try:
+        import ctypes as _c, ctypes.util as _cu
+        _c.CDLL(_cu.find_library("c")).malloc_zone_pressure_relief(
+            _c.c_void_p(0), _c.c_size_t(0),
+        )
+    except Exception:
+        pass
 
 
 def _signal_handler(signum, frame):
@@ -55,19 +79,59 @@ _signal.signal(_signal.SIGTERM, _signal_handler)
 
 import jax
 import jax.numpy as jnp
-from jax._src.lib.mlir import ir
-from jax._src.interpreters import mlir as jax_mlir
 
 import coremltools as ct
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN
-from gemma_chat.model import Gemma4Transformer, Gemma4Config
+from gemma_chat.model import Gemma4Transformer, Gemma4Config, AttentionType
 from gemma_chat.weight_mapper import load_params
 from gemma_chat.decode_coreml import (
-    chunk_prefill_step, decode_step, empty_pos_ring, kv_cache_shapes,
-    kv_non_shared_layers,
+    chunk_prefill_step, decode_step, empty_pos_ring,
 )
+from gemma_chat.cache_spec import build_cache_specs
+
+
+# ── Truncated config / params for --num-layers ────────────────────────────
+
+
+def _truncated_config(cfg: Gemma4Config, num_layers: int) -> Gemma4Config:
+    """Return a copy of *cfg* truncated to *num_layers*.
+
+    KV sharing is disabled (the truncated model is too short for the shared
+    tail).  ``wide_mlp_from_layer`` is clamped so layers beyond the cutoff
+    don't widen.
+    """
+    if num_layers >= cfg.num_layers:
+        return cfg
+    import dataclasses
+    return dataclasses.replace(
+        cfg,
+        attention_types=cfg.attention_types[:num_layers],
+        num_kv_shared_layers=0,
+        wide_mlp_from_layer=(
+            cfg.wide_mlp_from_layer
+            if cfg.wide_mlp_from_layer >= 0 and cfg.wide_mlp_from_layer < num_layers
+            else -1
+        ),
+    )
+
+
+def _truncate_params(params: dict, num_layers: int, ple_dim: int) -> dict:
+    """Drop layers beyond *num_layers* and slice PLE embedding in-place."""
+    # Remove per-layer dicts for layers we don't need
+    for i in list(params.keys()):
+        if i.startswith("layers."):
+            idx = int(i.split(".")[1])
+            if idx >= num_layers:
+                del params[i]
+    # Slice PLE embedding: (vocab, full_layers*d) → (vocab, num_layers*d)
+    full = params["embed_tokens_per_layer"]
+    params["embed_tokens_per_layer"] = full[:, :num_layers * ple_dim]
+    # Slice per_layer_model_projection: (D, full_layers*d) → (D, num_layers*d)
+    proj = params["per_layer_model_projection"]["kernel"]
+    params["per_layer_model_projection"]["kernel"] = proj[:, :num_layers * ple_dim]
+    return params
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────
@@ -116,30 +180,18 @@ def _rename_model_io(
             rename_feature(spec, feat.name, new_name, rename_inputs=False)
 
 
-def _hlo_to_mlpackage(
-    hlo_module,
-    output_path: Path,
-    input_names: list[str] | None = None,
-    output_names: list[str] | None = None,
-) -> None:
-    """Run hlo_to_mil → ct.convert → save in the current process.
+def _hlo_to_mil_streaming(hlo_module):
+    """Convert StableHLO to MIL with streaming int8/int4 quantization.
 
-    Streaming int8 quantization runs during HLO→MIL conversion and
-    ``quantize_const_weights`` catches any remaining large float constants
-    in the MIL pipeline. The resulting ``.mlpackage`` uses
-    ``constexpr_blockwise_shift_scale`` ops whose ``const`` inputs (int8
-    data, fp16 scale) are visible to ``save_multifunction``'s cross-function
-    ``const_deduplication`` pass — so weight sharing still works when
-    merging quantized functions.
+    Returns the MIL program.  The caller should ``del hlo_module`` after
+    this returns to free the MLIR IR (~3.5 GB) before the heavier
+    ct.convert + save steps.
     """
     import ctypes as _ctypes, ctypes.util as _ctypes_util
-    import threading
-    import traceback as _tb
 
     import numpy as np
     from coremltools.converters.mil import Builder as mb
 
-    from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
     from gemma_chat.mil_passes.quantize_const_weights import (
         _quantize_symmetric_blockwise,
         _GROUP_SIZE,
@@ -160,7 +212,6 @@ def _hlo_to_mlpackage(
 
     # ── Streaming mixed-precision quantization during HLO→MIL ──
     _WEIGHT_THRESHOLD = 2048
-    _VOCAB_SIZE = 262144
     _stream_counter = [0, 0, 0]  # [count_int4, count_int8, total_bytes]
 
     def _stream_quantize(arr: np.ndarray, name: str):
@@ -213,6 +264,28 @@ def _hlo_to_mlpackage(
     else:
         print(f"  StableHLO→MIL conversion done.", flush=True)
 
+    return mil_program
+
+
+def _mil_to_mlpackage(
+    mil_program,
+    output_path: Path,
+    input_names: list[str] | None = None,
+    output_names: list[str] | None = None,
+    flexible_shapes: dict[str, tuple[int, int]] | None = None,
+) -> None:
+    """Run ct.convert → rename → flex shapes → save.
+
+    flexible_shapes: maps input names (after renaming) to ``(lower, upper)``
+        bounds for dimension 1. Applied directly to the protobuf spec after
+        rename. This bypasses ``ct.convert(inputs=...)`` which cannot match
+        names generated by the stablehlo converter.
+    """
+    import threading
+    import traceback as _tb
+
+    from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
+
     # ── MIL pass pipeline (quantize_const_weights as belt-and-suspenders) ──
     pipeline = build_ct_convert_pass_pipeline()
     pipeline.remove_passes([
@@ -231,8 +304,7 @@ def _hlo_to_mlpackage(
     threading.Thread(target=_monitor, daemon=True).start()
     try:
         try:
-            cml_model = ct.convert(
-                mil_program,
+            convert_kwargs = dict(
                 source="milinternal",
                 minimum_deployment_target=ct.target.iOS18,
                 # When using ct.precision.FLOAT16 the model output becomes unstable and garbage
@@ -242,6 +314,7 @@ def _hlo_to_mlpackage(
                 pass_pipeline=pipeline,
                 skip_model_load=True,
             )
+            cml_model = ct.convert(mil_program, **convert_kwargs)
         except BaseException as _e:
             print(f"\n!!! [convert] ct.convert raised {type(_e).__name__}: {_e}", flush=True)
             _tb.print_exc()
@@ -250,9 +323,47 @@ def _hlo_to_mlpackage(
         _stop.set()
 
     del mil_program, pipeline
+    _release_malloc()
+    print(f"  [convert] ct.convert done  RSS={_rss_mb():.0f} MB", flush=True)
 
     if input_names or output_names:
         _rename_model_io(cml_model, input_names or [], output_names or [])
+
+    # Apply flexible shape ranges directly to the protobuf spec.
+    if flexible_shapes:
+        spec = cml_model._spec
+        # Build output lookup: "k_4_out" → ("k_4" range)
+        out_flex = {}
+        for name, bounds in flexible_shapes.items():
+            out_flex[name + "_out"] = bounds
+
+        def _apply_flex(feature_desc, lookup):
+            if feature_desc.name not in lookup:
+                return
+            lo, hi = lookup[feature_desc.name]
+            arr = feature_desc.type.multiArrayType
+            # Fix empty output shapes: set shape to [1, lo, ...] default
+            if len(arr.shape) == 0:
+                # Need a concrete shape for the spec. Find matching input.
+                for inp in spec.description.input:
+                    if inp.name in flexible_shapes and inp.name == feature_desc.name.removesuffix("_out"):
+                        for d in inp.type.multiArrayType.shape:
+                            arr.shape.append(d)
+                        break
+            arr.ClearField("shapeRange")
+            for dim_idx, dim_size in enumerate(arr.shape):
+                sr = arr.shapeRange.sizeRanges.add()
+                if dim_idx == 1:
+                    sr.lowerBound = lo
+                    sr.upperBound = hi
+                else:
+                    sr.lowerBound = dim_size
+                    sr.upperBound = dim_size
+
+        for inp in spec.description.input:
+            _apply_flex(inp, flexible_shapes)
+        for out in spec.description.output:
+            _apply_flex(out, out_flex)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"  [convert {_os.getpid()}] saving to {output_path} …", flush=True)
@@ -274,34 +385,44 @@ def export_chunk_prefill(
     model_id: str = HF_MODEL_ID,
     max_seq_len: int = MAX_SEQ_LEN,
     chunk_size: int = CHUNK_SIZE,
+    num_layers: int | None = None,
 ) -> None:
     """Export the chunked-prefill model (process CHUNK_SIZE tokens per call).
 
-    Inputs:  tokens (1, chunk_size) int32
+    Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
+    so a single model works at any cache length up to ``max_seq_len``.
+
+    Inputs:  N (1,) int32 — phantom dim for current global cache length
+             tokens (1, chunk_size) int32
              start_position (1,) int32  — absolute position of first token in chunk
-             k_0, v_0, ..., k_14, v_14 — current KV cache arrays float16
-             sliding_pos_ring (1, sliding_window_size) int32 — ring position tracker
+             k_0, v_0, ..., k_N, v_N — current KV cache arrays float16
+             sliding_pos_ring (1, sliding_window_size) int32
     Outputs: logits (chunk_size, vocab_size) float32
-             k_0_out, v_0_out, ..., k_14_out, v_14_out — updated KV cache float16
-             sliding_pos_ring_out (1, sliding_window_size) int32 — updated ring
+             k_0_out, v_0_out, ..., k_N_out, v_N_out — updated KV caches
+             sliding_pos_ring_out (1, sliding_window_size) int32
     """
     import gc
     import numpy as np
+    from jax import export as jax_export
 
     output_path = Path(output_path)
     config = E2B_CONFIG
-    context = jax_mlir.make_ir_context()
+    if num_layers is not None and num_layers < config.num_layers:
+        config = _truncated_config(config, num_layers)
+        print(f"  Truncated config to {config.num_layers} layers: "
+              f"{[a[:3] for a in config.attention_types]}")
 
     print("=" * 60)
     print("Chunk-prefill export — Step 1/3  Loading weights")
     print("=" * 60)
     params = load_params(model_id=model_id, config=config)
+    if num_layers is not None and num_layers < E2B_CONFIG.num_layers:
+        _truncate_params(params, num_layers, config.per_layer_input_dim)
 
     print("=" * 60)
     print(f"Chunk-prefill export — Step 2/3  Tracing (chunk_size={chunk_size})")
     print("=" * 60)
 
-    # Eager warmup to prime XLA PJRT.
     from flax import nnx
     from gemma_chat.weight_mapper import load_params_into_model
     model_tmp = Gemma4Transformer(config=config, rngs=nnx.Rngs(params=0))
@@ -316,41 +437,43 @@ def export_chunk_prefill(
 
     gc.disable()
     try:
-        kv_shapes = kv_cache_shapes(config, max_seq_len)
+        cache_specs = build_cache_specs(config, max_seq_len)
+        has_global = any(s.attn_type == AttentionType.GLOBAL for s in cache_specs)
+        if has_global:
+            (N,) = jax_export.symbolic_shape("N", constraints=[f"N >= {CHUNK_SIZE}"])
         pos_ring_shape = (1, config.sliding_window_size)
 
         def chunk_prefill_fn(tokens, start_pos_1d, *kv_and_ring):
-            """
-            tokens: (1, chunk_size) int32
-            start_pos_1d: (1,) int32 — absolute position of first token
-            kv_and_ring: 30 KV arrays + 1 sliding_pos_ring
-            """
             kv_flat = list(kv_and_ring[:-1])
             sliding_pos_ring = kv_and_ring[-1]
             start_pos = start_pos_1d[0]
             logits, kv_new, ring_new = chunk_prefill_step(
                 params, tokens, start_pos, kv_flat, sliding_pos_ring,
-                cfg=config, chunk_size=chunk_size, max_seq_len=max_seq_len,
+                cfg=config, chunk_size=chunk_size,
             )
             return (logits,) + tuple(kv_new) + (ring_new,)
 
         kv_flat_shapes = []
-        for shape in kv_shapes:
+        for s in cache_specs:
+            shape = (1, s.cache_len, s.num_kv_heads, s.head_dim)
+            if s.attn_type == AttentionType.GLOBAL:
+                shape = (1, N, s.num_kv_heads, s.head_dim)
             kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # k
             kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # v
         ring_shape = jax.ShapeDtypeStruct(pos_ring_shape, jnp.int32)
 
-        print("  Lowering chunk_prefill_step to StableHLO …", flush=True)
-        lowered = jax.jit(chunk_prefill_fn).lower(
+        print("  Tracing chunk_prefill_step with symbolic shapes …", flush=True)
+        traced = jax.jit(chunk_prefill_fn).trace(
             jax.ShapeDtypeStruct((1, chunk_size), jnp.int32),  # tokens
-            jax.ShapeDtypeStruct((1,), jnp.int32),            # start_position
+            jax.ShapeDtypeStruct((1,), jnp.int32),             # start_position
             *kv_flat_shapes,
-            ring_shape,                                        # sliding_pos_ring
+            ring_shape,
         )
-        hlo_module = lowered.compiler_ir('stablehlo')
-        print("  Lowering OK.", flush=True)
+        hlo_module = traced.lower().compiler_ir('stablehlo')
+        print("  Tracing OK.", flush=True)
 
-        del lowered, params
+        del traced, params
+        _release_malloc()
 
         mlir_cache = output_path.with_suffix('.mlirbc')
         print(f"  Saving MLIR cache → {mlir_cache} …", flush=True)
@@ -365,15 +488,30 @@ def export_chunk_prefill(
         print("=" * 60)
         print("Chunk-prefill export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        n_kv = len(kv_shapes)
+        n_kv = len(cache_specs)
         kv_names = _build_kv_names(n_kv)
-        # Output names use _out suffix to avoid SSA variable shadowing in MLProgram
-        # (input and output cannot share a name in the same scope).
         kv_out_names = [n + "_out" for n in kv_names]
-        _hlo_to_mlpackage(
-            hlo_module, output_path,
-            input_names=["tokens", "start_position"] + kv_names + ["sliding_pos_ring"],
+
+        # Build flexible_shapes for global cache dims (prefill).
+        flex_shapes: dict[str, tuple[int, int]] = {}
+        for slot, spec in enumerate(cache_specs):
+            if spec.attn_type == AttentionType.GLOBAL:
+                k_name = kv_names[slot * 2]
+                v_name = kv_names[slot * 2 + 1]
+                flex_shapes[k_name] = (1, max_seq_len)
+                flex_shapes[v_name] = (1, max_seq_len)
+
+        mil_program = _hlo_to_mil_streaming(hlo_module)
+        del hlo_module
+        _release_malloc()
+        print(f"  [memory] RSS after HLO release: {_rss_mb():.0f} MB", flush=True)
+
+        n_prefix = ["N"] if has_global else []
+        _mil_to_mlpackage(
+            mil_program, output_path,
+            input_names=n_prefix + ["tokens", "start_position"] + kv_names + ["sliding_pos_ring"],
             output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
+            flexible_shapes=flex_shapes,
         )
     finally:
         gc.enable()
@@ -387,34 +525,44 @@ def export_decode_step(
     model_id: str = HF_MODEL_ID,
     max_seq_len: int = MAX_SEQ_LEN,
     skip_warmup: bool = False,
+    num_layers: int | None = None,
 ) -> None:
     """Export the single-token decode-step model.
 
-    Inputs:  token_id (1,) int32
+    Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
+    so a single model works at any cache length up to ``max_seq_len``.
+
+    Inputs:  N (1,) int32 — phantom dim for current global cache length
+             token_id (1,) int32
              position (1,) int32  — absolute position of this token
-             k_0, v_0, ..., k_14, v_14 — current KV cache arrays float16
-             sliding_pos_ring (1, sliding_window_size) int32 — ring position tracker
+             k_0, v_0, ..., k_N, v_N — current KV cache arrays float16
+             sliding_pos_ring (1, sliding_window_size) int32
     Outputs: logits (vocab_size,) float32
-             k_0_out, v_0_out, ..., k_14_out, v_14_out — updated KV cache float16
-             sliding_pos_ring_out (1, sliding_window_size) int32 — updated ring
+             k_0_out, v_0_out, ..., k_N_out, v_N_out — updated KV caches
+             sliding_pos_ring_out (1, sliding_window_size) int32
     """
     import numpy as np
     import gc
+    from jax import export as jax_export
 
     output_path = Path(output_path)
     config = E2B_CONFIG
-    context = jax_mlir.make_ir_context()
+    if num_layers is not None and num_layers < config.num_layers:
+        config = _truncated_config(config, num_layers)
+        print(f"  Truncated config to {config.num_layers} layers: "
+              f"{[a[:3] for a in config.attention_types]}")
 
     print("=" * 60)
     print("Decode export — Step 1/3  Loading weights")
     print("=" * 60)
     params = load_params(model_id=model_id, config=config)
+    if num_layers is not None and num_layers < E2B_CONFIG.num_layers:
+        _truncate_params(params, num_layers, config.per_layer_input_dim)
 
     print("=" * 60)
     print("Decode export — Step 2/3  Tracing to StableHLO")
     print("=" * 60)
 
-    # Eager warmup to prime XLA PJRT (skippable to save memory on RAM-constrained machines).
     if not skip_warmup:
         from flax import nnx
         from gemma_chat.weight_mapper import load_params_into_model
@@ -432,65 +580,78 @@ def export_decode_step(
 
     gc.disable()
     try:
-        # Build KV cache shapes: one per non-shared layer; k and v share shape.
-        kv_shapes = kv_cache_shapes(config, max_seq_len)  # list of 15 shapes
+        cache_specs = build_cache_specs(config, max_seq_len)
+        has_global = any(s.attn_type == AttentionType.GLOBAL for s in cache_specs)
+        if has_global:
+            (N,) = jax_export.symbolic_shape("N", constraints=["N >= 1"])
         pos_ring_shape = (1, config.sliding_window_size)
 
         def decode_fn(token_id_1d, position_1d, *kv_and_ring):
-            """
-            token_id_1d: (1,) int32
-            position_1d: (1,) int32 — absolute decode position
-            kv_and_ring: 30 KV arrays + 1 sliding_pos_ring
-            """
             kv_flat = list(kv_and_ring[:-1])
             sliding_pos_ring = kv_and_ring[-1]
             token_id = token_id_1d[0]
             position = position_1d[0]
             logits, kv_new, ring_new = decode_step(
                 params, token_id, position, kv_flat, sliding_pos_ring,
-                cfg=config, max_seq_len=max_seq_len,
+                cfg=config,
             )
             return (logits,) + tuple(kv_new) + (ring_new,)
 
-        # Build shape specs for all inputs.
         kv_flat_shapes = []
-        for shape in kv_shapes:
+        for s in cache_specs:
+            shape = (1, s.cache_len, s.num_kv_heads, s.head_dim)
+            if s.attn_type == AttentionType.GLOBAL:
+                shape = (1, N, s.num_kv_heads, s.head_dim)
             kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # k
             kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # v
         ring_shape = jax.ShapeDtypeStruct(pos_ring_shape, jnp.int32)
 
-        print("  Lowering decode_step to StableHLO …", flush=True)
-        lowered = jax.jit(decode_fn).lower(
-            jax.ShapeDtypeStruct((1,), jnp.int32),   # token_id
-            jax.ShapeDtypeStruct((1,), jnp.int32),   # position
+        print("  Tracing decode_step with symbolic shapes …", flush=True)
+        traced = jax.jit(decode_fn).trace(
+            jax.ShapeDtypeStruct((1,), jnp.int32),  # token_id
+            jax.ShapeDtypeStruct((1,), jnp.int32),  # position
             *kv_flat_shapes,
-            ring_shape,                               # sliding_pos_ring
+            ring_shape,
         )
-        hlo_module = lowered.compiler_ir('stablehlo')
-        print("  Lowering OK.", flush=True)
+        hlo_module = traced.lower().compiler_ir('stablehlo')
+        print("  Tracing OK.", flush=True)
 
-        del lowered, params
+        del traced, params
+        jax.clear_caches()
+        _release_malloc()
+        print(f"  [memory] RSS after trace cleanup: {_rss_mb():.0f} MB", flush=True)
 
-        mlir_cache = output_path.with_suffix('.mlirbc')
-        print(f"  Saving MLIR cache → {mlir_cache} …", flush=True)
-        try:
-            with open(mlir_cache, 'wb') as _f:
-                hlo_module.operation.write_bytecode(_f)
-            sz = mlir_cache.stat().st_size
-            print(f"  MLIR cache saved ({sz/1e9:.2f} GB).", flush=True)
-        except Exception as _we:
-            print(f"  WARNING: write_bytecode failed: {_we}", flush=True)
+        # Skip MLIR cache save for decode — it's 3.5 GB and we need the
+        # memory headroom for ct.convert + save.  Prefill cache is sufficient
+        # for debugging.
 
         print("=" * 60)
         print("Decode export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        n_kv = len(kv_shapes)
+        n_kv = len(cache_specs)
         kv_names = _build_kv_names(n_kv)
         kv_out_names = [n + "_out" for n in kv_names]
-        _hlo_to_mlpackage(
-            hlo_module, output_path,
-            input_names=["token_id", "position"] + kv_names + ["sliding_pos_ring"],
+
+        # Build flexible_shapes for global cache dims (decode).
+        flex_shapes: dict[str, tuple[int, int]] = {}
+        for slot, spec in enumerate(cache_specs):
+            if spec.attn_type == AttentionType.GLOBAL:
+                k_name = kv_names[slot * 2]
+                v_name = kv_names[slot * 2 + 1]
+                flex_shapes[k_name] = (1, max_seq_len)
+                flex_shapes[v_name] = (1, max_seq_len)
+
+        mil_program = _hlo_to_mil_streaming(hlo_module)
+        del hlo_module
+        _release_malloc()
+        print(f"  [memory] RSS after HLO release: {_rss_mb():.0f} MB", flush=True)
+
+        n_prefix = ["N"] if has_global else []
+        _mil_to_mlpackage(
+            mil_program, output_path,
+            input_names=n_prefix + ["token_id", "position"] + kv_names + ["sliding_pos_ring"],
             output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
+            flexible_shapes=flex_shapes,
         )
     finally:
         gc.enable()
@@ -499,22 +660,42 @@ def export_decode_step(
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 
+def _run_phase(phase: str, args: argparse.Namespace, output_path: Path) -> None:
+    """Run a single export phase (prefill or decode) in this process."""
+    if phase == "prefill":
+        export_chunk_prefill(
+            output_path=output_path,
+            model_id=args.model_id,
+            max_seq_len=args.max_seq_len,
+            chunk_size=CHUNK_SIZE,
+            num_layers=args.num_layers,
+        )
+    elif phase == "decode":
+        export_decode_step(
+            output_path=output_path,
+            model_id=args.model_id,
+            max_seq_len=args.max_seq_len,
+            skip_warmup=args.skip_warmup,
+            num_layers=args.num_layers,
+        )
+    else:
+        raise ValueError(f"Unknown phase: {phase}")
+
+
 def main() -> None:
     import shutil
     import tempfile
 
-    from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
-
     parser = argparse.ArgumentParser(
         description=(
-            "Export Gemma4-E2B prefill + decode into a single multifunction "
-            "CoreML .mlpackage with shared (int8-quantized) weights."
+            "Export Gemma4-E2B prefill + decode as a CoreML .mlpackage "
+            "with dynamic shapes (RangeDim) for global KV caches."
         )
     )
     parser.add_argument(
         "--output",
         default="gemma4-e2b.mlpackage",
-        help="Output path for the multifunction .mlpackage (default: gemma4-e2b.mlpackage)",
+        help="Output path (default: gemma4-e2b.mlpackage)",
     )
     parser.add_argument(
         "--model-id",
@@ -532,71 +713,141 @@ def main() -> None:
         action="store_true",
         help="Skip eager XLA warmup to save ~2 GB RAM (use on memory-constrained machines)",
     )
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="Truncate model to this many layers (for fast iteration / testing)",
+    )
+    parser.add_argument(
+        "--decode-only",
+        action="store_true",
+        help="Export only the decode model (skip prefill)",
+    )
+    parser.add_argument(
+        "--separate",
+        action="store_true",
+        help=(
+            "Export prefill and decode as separate .mlpackage files "
+            "instead of a single multifunction model."
+        ),
+    )
+    # Internal: run a single phase (used by subprocess isolation).
+    parser.add_argument("--_phase", help=argparse.SUPPRESS)
+    parser.add_argument("--_phase-output", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
+    # If invoked as a subprocess for a single phase, run it and exit.
+    if args._phase:
+        _run_phase(args._phase, args, Path(args._phase_output))
+        return
+
     output = Path(args.output)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="gemma-export-"))
-    tmp_prefill = tmp_dir / "prefill.mlpackage"
-    tmp_decode = tmp_dir / "decode.mlpackage"
 
-    print(
-        f"\nExport plan: chunk_prefill (chunk_size={CHUNK_SIZE}) + decode -> {output}\n"
-        f"  Temp dir: {tmp_dir}\n",
-        flush=True,
-    )
+    def _subprocess_phase(phase: str, phase_output: Path) -> None:
+        """Re-invoke ourselves in a subprocess for memory isolation."""
+        cmd = [sys.executable, "-m", "gemma_chat.export"]
+        # Forward user args.
+        cmd += ["--output", str(args.output)]
+        cmd += ["--model-id", args.model_id]
+        cmd += ["--max-seq-len", str(args.max_seq_len)]
+        if args.skip_warmup:
+            cmd += ["--skip-warmup"]
+        if args.num_layers is not None:
+            cmd += ["--num-layers", str(args.num_layers)]
+        # Phase-specific args.
+        cmd += ["--_phase", phase, "--_phase-output", str(phase_output)]
 
-    try:
-        # -- Phase 1: Export chunk prefill (int8 streaming quantization) --
-        export_chunk_prefill(
-            output_path=tmp_prefill,
-            model_id=args.model_id,
-            max_seq_len=args.max_seq_len,
-            chunk_size=CHUNK_SIZE,
-        )
-        print(f"\n  Chunk-prefill exported to {tmp_prefill}\n")
+        result = subprocess.run(cmd, env={**_os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        if result.returncode != 0:
+            print(f"\n!!! {phase} export failed (exit {result.returncode})", file=sys.stderr)
+            sys.exit(result.returncode)
 
-        # -- Phase 2: Export decode (int8 streaming quantization) --
+    if args.separate:
+        # ── Separate models: each gets its own .mlpackage with RangeDim ──
+        output.mkdir(parents=True, exist_ok=True)
+        out_decode = output / "decode.mlpackage"
+
+        phases = ["decode"] if args.decode_only else ["prefill", "decode"]
         print(
-            "=" * 60,
-            "\nDecode-step export (second artifact).\n",
-            "=" * 60,
-            "\n",
-            sep="",
+            f"\nExport plan (separate models): {' + '.join(phases)} -> {output}/\n",
             flush=True,
         )
-        export_decode_step(
-            output_path=tmp_decode,
-            model_id=args.model_id,
-            max_seq_len=args.max_seq_len,
-            skip_warmup=args.skip_warmup,
+
+        try:
+            if not args.decode_only:
+                out_prefill = output / "prefill.mlpackage"
+                if out_prefill.exists():
+                    shutil.rmtree(out_prefill)
+                _subprocess_phase("prefill", out_prefill)
+                print(f"\n  Chunk-prefill exported to {out_prefill}\n")
+
+                print("=" * 60, "\nDecode-step export.\n", "=" * 60, "\n",
+                      sep="", flush=True)
+
+            if out_decode.exists():
+                shutil.rmtree(out_decode)
+            _subprocess_phase("decode", out_decode)
+            print(f"\n  Decode exported to {out_decode}\n")
+
+            sizes = []
+            for p in sorted(output.glob("*.mlpackage")):
+                sz = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                sizes.append(f"    {p.name}  ({sz / 1e9:.2f} GB)")
+            print("\n  Export complete:\n" + "\n".join(sizes) + "\n")
+
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # ── Multifunction export (default): merge prefill + decode ──
+        tmp_dir = Path(tempfile.mkdtemp(prefix="gemma-export-"))
+        tmp_prefill = tmp_dir / "prefill.mlpackage"
+        tmp_decode = tmp_dir / "decode.mlpackage"
+
+        phases = ["decode"] if args.decode_only else ["prefill", "decode"]
+        print(
+            f"\nExport plan (multifunction): {' + '.join(phases)} -> {output}\n"
+            f"  Temp dir: {tmp_dir}\n",
+            flush=True,
         )
-        print(f"\n  Decode exported to {tmp_decode}\n")
 
-        # -- Phase 3: Merge int8 models (const dedup shares weight blobs) --
-        print("=" * 60)
-        print("Merging chunk_prefill + decode (int8 weight deduplication) ...")
-        print("=" * 60)
+        try:
+            if not args.decode_only:
+                _subprocess_phase("prefill", tmp_prefill)
+                print(f"\n  Chunk-prefill exported to {tmp_prefill}\n")
+                print("=" * 60, "\nDecode-step export.\n", "=" * 60, "\n",
+                      sep="", flush=True)
 
-        desc = MultiFunctionDescriptor()
-        desc.add_function(str(tmp_prefill), src_function_name="main", target_function_name="prefill")
-        desc.add_function(str(tmp_decode), src_function_name="main", target_function_name="decode")
-        desc.default_function_name = "decode"
+            _subprocess_phase("decode", tmp_decode)
+            print(f"\n  Decode exported to {tmp_decode}\n")
 
-        if output.exists():
-            shutil.rmtree(output)
-        save_multifunction(desc, str(output))
+            from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
 
-        shutil.rmtree(tmp_prefill, ignore_errors=True)
-        shutil.rmtree(tmp_decode, ignore_errors=True)
+            print("=" * 60)
+            print("Merging into multifunction .mlpackage (weight deduplication) ...")
+            print("=" * 60)
 
-        final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
-        print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
+            desc = MultiFunctionDescriptor()
+            if not args.decode_only:
+                desc.add_function(str(tmp_prefill), src_function_name="main",
+                                  target_function_name="prefill")
+            desc.add_function(str(tmp_decode), src_function_name="main",
+                              target_function_name="decode")
+            desc.default_function_name = "decode"
 
-    except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        sys.exit(1)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            if output.exists():
+                shutil.rmtree(output)
+            save_multifunction(desc, str(output))
+
+            final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
+            print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
+
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,9 @@ from gemma_chat.config import E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN
 from gemma_chat.decode_coreml import decode_step, empty_pos_ring, kv_cache_shapes
 from gemma_chat.generate import (
     _coreml_kv_state_after_decode,
+    _ensure_global_cache_capacity,
+    _flexible_global_names,
+    _init_kv_state,
     load_coreml_model,
     load_tokenizer,
 )
@@ -62,7 +65,6 @@ def _jax_slow_prefill_logits(
             kv_flat,
             pos_ring,
             cfg=cfg,
-            max_seq_len=max_seq_len,
         )
     return np.asarray(logits, dtype=np.float32), params, cfg
 
@@ -73,31 +75,22 @@ def _coreml_slow_prefill_logits(
     *,
     max_seq_len: int,
 ):
-    import coremltools as ct
-
     dm = load_coreml_model(model_path, function_name="decode")
     dec_in = list(dm.input_description)
     dec_out = list(dm.output_description)
     kv_names_in = dec_in[2:]
     kv_names_out = dec_out[1:]
 
-    # Initialize KV caches from function description (multifunction-aware).
-    spec_path = Path(model_path).resolve()
-    spec_m = ct.models.MLModel(str(spec_path), function_name="decode", skip_model_load=True)
-    kv_inputs = []
-    for fd in spec_m._spec.description.functions:
-        if fd.name == "decode":
-            kv_inputs = list(fd.input)[2:]
-            break
+    # Initialize KV caches from spec input descriptions.
+    kv_inputs = list(dm._model._spec.description.input)[2:]
     if not kv_inputs:
-        kv_inputs = list(spec_m._spec.description.input)[2:]
-    kv_state = {}
-    for inp in kv_inputs:
-        shape = tuple(inp.type.multiArrayType.shape)
-        if len(shape) == 2:  # (1, W) — sliding_pos_ring
-            kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
-        else:  # (1, cache_len, nkv, hd) — KV cache
-            kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
+        for fd in dm._model._spec.description.functions:
+            if fd.name == "decode":
+                kv_inputs = list(fd.input)[2:]
+                break
+    global_names = _flexible_global_names(kv_names_in, kv_inputs)
+    n_prompt = len(prompt_ids)
+    kv_state = _init_kv_state(kv_inputs, global_names, max(n_prompt, 1))
 
     logits = None
     for pos, tid in enumerate(prompt_ids):
@@ -139,7 +132,6 @@ def _jax_greedy_tokens_after_prefill(
             kv_flat,
             pos_ring,
             cfg=cfg,
-            max_seq_len=max_seq_len,
         )
     t = len(prompt_ids)
     out: list[int] = []
@@ -154,7 +146,6 @@ def _jax_greedy_tokens_after_prefill(
             kv_flat,
             pos_ring,
             cfg=cfg,
-            max_seq_len=max_seq_len,
         )
         logits_np = np.asarray(logits, dtype=np.float32)
     return out
@@ -168,31 +159,22 @@ def _coreml_greedy_tokens_after_prefill(
     n_extra: int,
 ) -> list[int]:
     """Greedy argmax for ``n_extra`` tokens after slow prefill (CoreML decode function)."""
-    import coremltools as ct
-
     dm = load_coreml_model(model_path, function_name="decode")
     dec_in = list(dm.input_description)
     dec_out = list(dm.output_description)
     kv_names_in = dec_in[2:]
     kv_names_out = dec_out[1:]
 
-    # Initialize KV caches from function description (multifunction-aware).
-    spec_path = Path(model_path).resolve()
-    spec_m = ct.models.MLModel(str(spec_path), function_name="decode", skip_model_load=True)
-    kv_inputs = []
-    for fd in spec_m._spec.description.functions:
-        if fd.name == "decode":
-            kv_inputs = list(fd.input)[2:]
-            break
+    # Initialize KV caches from spec input descriptions.
+    kv_inputs = list(dm._model._spec.description.input)[2:]
     if not kv_inputs:
-        kv_inputs = list(spec_m._spec.description.input)[2:]
-    kv_state = {}
-    for inp in kv_inputs:
-        shape = tuple(inp.type.multiArrayType.shape)
-        if len(shape) == 2:
-            kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
-        else:
-            kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
+        for fd in dm._model._spec.description.functions:
+            if fd.name == "decode":
+                kv_inputs = list(fd.input)[2:]
+                break
+    global_names = _flexible_global_names(kv_names_in, kv_inputs)
+    n_prompt = len(prompt_ids)
+    kv_state = _init_kv_state(kv_inputs, global_names, max(n_prompt, 1))
 
     logits = None
     for pos, tid in enumerate(prompt_ids):
@@ -211,6 +193,7 @@ def _coreml_greedy_tokens_after_prefill(
     for i in range(n_extra):
         tid = int(np.argmax(logits))
         out.append(tid)
+        _ensure_global_cache_capacity(kv_state, global_names, t + i + 1, max_seq_len)
         decode_input = {
             dec_in[0]: np.array([tid], dtype=np.int32),
             dec_in[1]: np.array([t + i], dtype=np.int32),
@@ -233,7 +216,7 @@ def main() -> None:
         "--model",
         type=Path,
         default=Path("gemma4-e2b.mlpackage"),
-        help="Multifunction .mlpackage (default: gemma4-e2b.mlpackage)",
+        help="Multifunction .mlpackage or model directory (default: gemma4-e2b.mlpackage)",
     )
     parser.add_argument(
         "--prompt",

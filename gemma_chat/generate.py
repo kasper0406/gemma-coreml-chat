@@ -1,20 +1,46 @@
 """Autoregressive text generation using the exported CoreML model.
 
-The CoreML model expects a fixed-shape int32 tensor (1, MAX_SEQ_LEN).
-We right-pad the current token sequence so the *last real* token sits at
-position len(tokens)-1 and its logits drive the next-token prediction.
+Global attention KV caches use dynamic sizing — they start small and grow
+as the conversation extends, avoiding the cost of ``Q @ K^T`` over thousands
+of empty slots.  Sliding attention caches are fixed-size ring buffers.
 """
 
 from __future__ import annotations
 
 import gc
+import warnings
 import numpy as np
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
 import coremltools as ct
 
+from gemma_chat.cache_spec import build_cache_specs
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN, MLPACKAGE_PATH, HF_MODEL_ID
+from gemma_chat.model import AttentionType
+
+
+@dataclass
+class KVCacheSession:
+    """Persistent KV cache state for reuse across conversation turns.
+
+    Pass to ``generate_kvcached`` to skip re-prefilling tokens already
+    processed in previous turns.  Updated **in-place** during generation.
+    """
+
+    kv_state: dict[str, np.ndarray] | None = None
+    seq_len: int = 0
+    processed_ids: list[int] = field(default_factory=list)
+
+
+def _longest_common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Return the length of the longest common prefix of two token-ID lists."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
 
 
 def _validate_decode_step_inputs(_spec_m: ct.models.MLModel, package_path: str) -> None:
@@ -77,6 +103,89 @@ def _coreml_kv_state_after_decode(
     return state
 
 
+# ── Dynamic global KV cache helpers ────────────────────────────────────────
+
+def _global_kv_input_names(kv_names: list[str]) -> set[str]:
+    """Return the KV input names that correspond to global attention caches.
+
+    ``kv_names`` is the list of state input names (2*num_slots KV + 1 ring),
+    ordered ``[k_0, v_0, k_1, v_1, ..., sliding_pos_ring]``.
+    Handles truncated models (e.g. ``--num-layers 5``) by capping at the
+    actual number of KV slots present.
+    """
+    specs = build_cache_specs()
+    n_slots = (len(kv_names) - 1) // 2  # exclude trailing sliding_pos_ring
+    names: set[str] = set()
+    for slot, spec in enumerate(specs):
+        if slot >= n_slots:
+            break
+        if spec.attn_type == AttentionType.GLOBAL:
+            names.add(kv_names[slot * 2])      # k
+            names.add(kv_names[slot * 2 + 1])  # v
+    return names
+
+
+def _flexible_global_names(kv_names: list[str], state_inputs) -> set[str]:
+    """Return global KV input names that have RangeDim (flexible shapes).
+
+    Models exported with symbolic shapes declare ``shapeRange`` on global KV
+    inputs.  For fixed-shape models this returns an empty set, disabling
+    dynamic cache sizing (caches use the spec shape instead).
+    """
+    arch_global = _global_kv_input_names(kv_names)
+    flex: set[str] = set()
+    for inp in state_inputs:
+        if inp.name in arch_global:
+            sr = inp.type.multiArrayType.shapeRange
+            if sr and sr.sizeRanges:
+                flex.add(inp.name)
+    return flex
+
+
+def _ensure_global_cache_capacity(
+    kv_state: dict[str, np.ndarray],
+    global_names: set[str],
+    needed_len: int,
+    max_len: int,
+) -> None:
+    """Grow global KV caches (doubling strategy) if dim-1 < ``needed_len``."""
+    for name in global_names:
+        arr = kv_state[name]
+        cur = arr.shape[1]
+        if cur >= needed_len:
+            continue
+        new_len = min(max(cur * 2, needed_len), max_len)
+        grown = np.zeros(
+            (arr.shape[0], new_len, arr.shape[2], arr.shape[3]),
+            dtype=arr.dtype,
+        )
+        grown[:, :cur] = arr
+        kv_state[name] = grown
+
+
+def _init_kv_state(
+    state_inputs,
+    global_names: set[str],
+    global_cache_len: int,
+) -> dict[str, np.ndarray]:
+    """Build initial KV state dict with dynamic global cache sizing.
+
+    ``state_inputs`` are the protobuf input descriptors (after tokens + position).
+    Global caches use ``global_cache_len``; sliding caches use the spec shape.
+    """
+    kv: dict[str, np.ndarray] = {}
+    for inp in state_inputs:
+        shape = tuple(inp.type.multiArrayType.shape)
+        if len(shape) == 2:  # (1, W) — sliding_pos_ring
+            kv[inp.name] = np.full(shape, -1, dtype=np.int32)
+        elif inp.name in global_names:
+            shape = (shape[0], global_cache_len, shape[2], shape[3])
+            kv[inp.name] = np.zeros(shape, dtype=np.float16)
+        else:
+            kv[inp.name] = np.zeros(shape, dtype=np.float16)
+    return kv
+
+
 # ── Tokenizer ──────────────────────────────────────────────────────────────
 
 def load_tokenizer(model_id: str = HF_MODEL_ID):
@@ -100,8 +209,6 @@ def stop_token_ids(tokenizer) -> set[int]:
 
 
 # ── CoreML model ───────────────────────────────────────────────────────────
-
-import re as _re
 
 
 class _CompiledModelWrapper:
@@ -135,7 +242,7 @@ class _CompiledModelWrapper:
 
         self.input_names: list[str] = in_desc
         self.output_names: list[str] = out_desc
-        # Keep legacy aliases used by parity_decode.py
+        # Legacy aliases used by parity_decode.py
         self.input_description = in_desc
         self.output_description = out_desc
 
@@ -144,29 +251,58 @@ class _CompiledModelWrapper:
 
 
 def load_coreml_model(
-    mlpackage_path: str | Path = MLPACKAGE_PATH,
+    mlpackage_path: str | Path,
     compute_units: "ct.ComputeUnit" = None,
     function_name: str | None = None,
 ) -> _CompiledModelWrapper:
+    """Load a CoreML model, handling both multifunction and directory layouts.
+
+    **Multifunction layout** (default export):
+        ``mlpackage_path`` is a single ``.mlpackage`` containing both functions
+        (prefill + decode) with shared weights.  Loaded with ``function_name``.
+
+    **Directory layout** (``--separate`` export):
+        ``mlpackage_path/decode.mlpackage``, ``mlpackage_path/prefill.mlpackage``
+        — each is a single-function model.
+    """
     if compute_units is None:
         compute_units = ct.ComputeUnit.ALL
 
     path = Path(mlpackage_path).resolve()
+
+    # Resolve the actual .mlpackage path.
+    actual_fn_name: str | None = None  # function_name passed to MLModel()
+    if function_name is not None:
+        sub = path / f"{function_name}.mlpackage"
+        if sub.exists():
+            # Directory layout — load single-function model directly.
+            path = sub
+        else:
+            # Multifunction layout — pass function_name to MLModel.
+            actual_fn_name = function_name
+
     if not path.exists():
         raise FileNotFoundError(
             f"CoreML model not found at {path}.\n"
-            "Run  uv run gemma-export  first to produce the .mlpackage."
+            "Run  uv run gemma-export  first to produce the model."
         )
 
-    fn_label = f" (function={function_name})" if function_name else ""
+    fn_label = f" ({function_name})" if function_name else ""
     print(f"Loading CoreML model from {path}{fn_label} …")
 
-    kwargs: dict = {"compute_units": compute_units}
-    if function_name is not None:
-        kwargs["function_name"] = function_name
+    import warnings
 
-    loaded = ct.models.MLModel(str(path), **kwargs)
-    model = _CompiledModelWrapper(loaded, function_name=function_name, package_path=path)
+    kwargs: dict = {"compute_units": compute_units}
+    if actual_fn_name is not None:
+        kwargs["function_name"] = actual_fn_name
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        loaded = ct.models.MLModel(str(path), **kwargs)
+
+    model = _CompiledModelWrapper(
+        loaded, function_name=function_name, package_path=path,
+    )
     print("  Model loaded.")
     return model
 
@@ -345,12 +481,13 @@ def generate_kvcached(
     verbose: bool = True,
     decode_model: "_CompiledModelWrapper | None" = None,
     prefill_model: "_CompiledModelWrapper | None" = None,
+    session: KVCacheSession | None = None,
 ) -> Iterator[int]:
     """Yield generated token IDs using KV-cached decode inference.
 
-    Loads both chunked-prefill and decode functions from a single multifunction
-    ``.mlpackage``.  Chunked prefill processes the prompt in CHUNK_SIZE-token
-    chunks, then switches to single-token decode for generation.
+    Loads prefill and decode from separate ``.mlpackage`` files under the
+    ``model_path`` directory.  Chunked prefill processes the prompt in
+    CHUNK_SIZE-token chunks, then switches to single-token decode for generation.
 
     With ``decode_only=True``, only the decode function is used (token-by-token
     "slow prefill").
@@ -368,6 +505,34 @@ def generate_kvcached(
     n_real = len(prompt_ids)
     model_path = Path(model_path)
 
+    # ── Check for KV cache reuse from a previous turn ────────────────────────
+    skip_len = 0
+    if (
+        not decode_only
+        and session is not None
+        and session.kv_state is not None
+        and session.seq_len > 0
+    ):
+        prefix_match = _longest_common_prefix_len(prompt_ids, session.processed_ids)
+        if prefix_match >= session.seq_len:
+            skip_len = session.seq_len
+            if verbose:
+                print(
+                    f"KV cache hit: {skip_len} tokens cached, "
+                    f"{n_real - skip_len} new to prefill",
+                    flush=True,
+                )
+        else:
+            if verbose:
+                print(
+                    f"KV cache miss (prefix match {prefix_match}/{session.seq_len}), "
+                    f"full re-prefill",
+                    flush=True,
+                )
+            session.kv_state = None
+            session.seq_len = 0
+            session.processed_ids = []
+
     # ── Load decode model ────────────────────────────────────────────────────
     if decode_model is None:
         if verbose:
@@ -376,10 +541,41 @@ def generate_kvcached(
 
     dec_in = list(decode_model.input_description)
     dec_out = list(decode_model.output_description)
-    kv_names_in = dec_in[2:]      # 30 KV input names
-    kv_names_out = dec_out[1:]    # 30 KV output names
 
-    # Read KV shapes from spec.
+    # First input is the phantom "N" (current global cache length), then
+    # token_id, position, followed by KV cache arrays + sliding_pos_ring.
+    assert dec_in[0] == "N", f"Expected 'N' as first input, got {dec_in[0]!r}"
+    _n_ctrl = 3  # N, token_id, position
+    kv_names_in = dec_in[_n_ctrl:]      # KV input names + sliding_pos_ring
+    kv_names_out = dec_out[1:]          # KV output names + sliding_pos_ring_out
+
+    # Read decode function's protobuf input descriptors for shape info.
+    # Single-function models: spec.description.input
+    # Multifunction models: spec.description.functions[name].input
+    _dec_state_inputs = list(decode_model._model._spec.description.input)[_n_ctrl:]
+    if not _dec_state_inputs:
+        for fd in decode_model._model._spec.description.functions:
+            if fd.name == "decode":
+                _dec_state_inputs = list(fd.input)[_n_ctrl:]
+                break
+
+    # Only enable dynamic sizing for global caches that have RangeDim.
+    # Fixed-shape models → global_names is empty → all caches use spec shapes.
+    global_names = _flexible_global_names(kv_names_in, _dec_state_inputs)
+    # Architectural global cache names.
+    _arch_global = _global_kv_input_names(kv_names_in)
+    if _arch_global and not global_names:
+        warnings.warn(
+            "Decode model has global attention layers but no RangeDim on their "
+            "KV caches — falling back to static shapes. Global caches will be "
+            f"allocated at full max_seq_len={max_seq_len}, costing O(max_seq_len) "
+            "per step instead of O(actual_context). Re-export with: "
+            "uv run gemma-export",
+            stacklevel=2,
+        )
+    if global_names and verbose:
+        print(f"  Dynamic global KV caches: {len(global_names)} inputs", flush=True)
+
     kv_state: dict[str, np.ndarray] = {}
 
     logits: np.ndarray | None = None
@@ -393,25 +589,27 @@ def generate_kvcached(
 
         pref_in = list(prefill_model.input_description)
         pref_out = list(prefill_model.output_description)
-        pref_kv_in = pref_in[2:]     # 30 KV input names
-        pref_kv_out = pref_out[1:]   # 30 KV output names
+        _pref_has_n = len(pref_in) > 0 and pref_in[0] == "N"
+        _n_pref_ctrl = 3 if _pref_has_n else 2
+        pref_kv_in = pref_in[_n_pref_ctrl:]     # KV input names
+        pref_kv_out = pref_out[1:]               # KV output names
 
-        # Initialize KV caches as zeros with shapes from the prefill function.
-        _spec_m = ct.models.MLModel(str(model_path.resolve()), skip_model_load=True,
-                                     function_name="prefill")
-        _all_inputs = []
-        func_descs = _spec_m._spec.description.functions
-        if func_descs:
-            for fd in func_descs:
+        # Compute padded length (needed for global cache sizing).
+        n_chunks = (n_real + CHUNK_SIZE - 1) // CHUNK_SIZE
+        padded_len = n_chunks * CHUNK_SIZE
+
+        # Initialize KV caches — global caches sized to padded_len, not max_seq_len.
+        _all_inputs = list(prefill_model._model._spec.description.input)
+        if not _all_inputs:
+            for fd in prefill_model._model._spec.description.functions:
                 if fd.name == "prefill":
                     _all_inputs = list(fd.input)
                     break
-        else:
-            _all_inputs = list(_spec_m._spec.description.input)
 
         # Validate prefill token input shape matches CHUNK_SIZE.
         if _all_inputs:
-            _token_shape = tuple(_all_inputs[0].type.multiArrayType.shape)
+            _tok_idx = 1 if _pref_has_n else 0
+            _token_shape = tuple(_all_inputs[_tok_idx].type.multiArrayType.shape)
             _expected = (1, CHUNK_SIZE)
             if _token_shape != _expected:
                 raise ValueError(
@@ -421,35 +619,76 @@ def generate_kvcached(
                     f"uv run gemma-export"
                 )
 
-        _state_inputs = _all_inputs[2:]
-        pref_kv_state = {}
-        for inp in _state_inputs:
-            shape = tuple(inp.type.multiArrayType.shape)
-            if len(shape) == 2:  # (1, W) — sliding_pos_ring
-                pref_kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
-            else:  # (1, cache_len, nkv, hd) — KV cache
-                pref_kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
-        del _spec_m, _all_inputs, _state_inputs
+        pref_global_names = _flexible_global_names(pref_kv_in, _all_inputs[_n_pref_ctrl:])
+        _pref_arch_global = _global_kv_input_names(pref_kv_in)
+        if _pref_arch_global and not pref_global_names:
+            warnings.warn(
+                "Prefill model has global attention layers but no RangeDim on "
+                "their KV caches — falling back to static shapes. Re-export "
+                "with: uv run gemma-export",
+                stacklevel=2,
+            )
 
-        # Pad prompt to a multiple of CHUNK_SIZE
-        n_chunks = (n_real + CHUNK_SIZE - 1) // CHUNK_SIZE
-        padded_len = n_chunks * CHUNK_SIZE
+        # ── Initialize or reuse KV state ────────────────────────────────────
+        if skip_len > 0 and session is not None and session.kv_state is not None:
+            n_skip_chunks = skip_len // CHUNK_SIZE
+            # Always process at least the last chunk to obtain logits.
+            n_skip_chunks = min(n_skip_chunks, n_chunks - 1)
+            # Convert session's decode-named KV state → prefill input names.
+            pref_kv_state = {}
+            for dk_in, pk_in in zip(kv_names_in, pref_kv_in):
+                pref_kv_state[pk_in] = session.kv_state[dk_in]
+            # Grow global caches to accommodate the full prompt.
+            _ensure_global_cache_capacity(
+                pref_kv_state, pref_global_names, padded_len, max_seq_len,
+            )
+        else:
+            n_skip_chunks = 0
+            pref_kv_state = _init_kv_state(
+                _all_inputs[_n_pref_ctrl:], pref_global_names, padded_len,
+            )
+        del _all_inputs
+
         prompt_padded = list(prompt_ids) + [pad_id] * (padded_len - n_real)
 
+        # Actual global KV size (matches padded_len for dynamic models).
+        _actual_gkv = next(
+            (pref_kv_state[n].shape[1]
+             for n in _global_kv_input_names(pref_kv_in)
+             if n in pref_kv_state),
+            padded_len,
+        )
+
         if verbose:
+            skip_info = (
+                f", skipping {n_skip_chunks} cached chunks"
+                if n_skip_chunks else ""
+            )
             print(
                 f"Prefill: {n_real} tokens in {n_chunks} chunks "
-                f"(chunk_size={CHUNK_SIZE})…",
+                f"(chunk_size={CHUNK_SIZE}, global_kv={_actual_gkv}{skip_info})…",
                 flush=True,
             )
 
-        for chunk_idx in range(n_chunks):
+        for chunk_idx in range(n_skip_chunks, n_chunks):
             start = chunk_idx * CHUNK_SIZE
             chunk_tokens = prompt_padded[start : start + CHUNK_SIZE]
-            chunk_input = {
-                pref_in[0]: np.array(chunk_tokens, dtype=np.int32)[np.newaxis, :],
-                pref_in[1]: np.array([start], dtype=np.int32),
-            }
+            if _pref_has_n:
+                # pref_in = [N, tokens, start_position, ...]
+                _global_len = next(
+                    (pref_kv_state[n].shape[1] for n in pref_global_names),
+                    _actual_gkv,
+                )
+                chunk_input = {
+                    pref_in[0]: np.array([_global_len], dtype=np.int32),
+                    pref_in[1]: np.array(chunk_tokens, dtype=np.int32)[np.newaxis, :],
+                    pref_in[2]: np.array([start], dtype=np.int32),
+                }
+            else:
+                chunk_input = {
+                    pref_in[0]: np.array(chunk_tokens, dtype=np.int32)[np.newaxis, :],
+                    pref_in[1]: np.array([start], dtype=np.int32),
+                }
             chunk_input.update(pref_kv_state)
 
             pr = prefill_model.predict(chunk_input)
@@ -480,34 +719,20 @@ def generate_kvcached(
             kv_state[dk_in] = pr[pk_out]
     else:
         # ── Token-by-token "slow prefill" ────────────────────────────────────
-        # Initialize KV caches as zeros with shapes from the function description.
-        _spec_m = ct.models.MLModel(str(model_path.resolve()), skip_model_load=True,
-                                     function_name="decode")
-        # For multifunction models, I/O is in spec.description.functions.
-        _kv_inputs = []
-        func_descs = _spec_m._spec.description.functions
-        if func_descs:
-            for fd in func_descs:
-                if fd.name == "decode":
-                    _kv_inputs = list(fd.input)[2:]
-                    break
-        else:
-            _kv_inputs = list(_spec_m._spec.description.input)[2:]
-        kv_state = {}
-        for inp in _kv_inputs:
-            shape = tuple(inp.type.multiArrayType.shape)
-            if len(shape) == 2:  # (1, W) — sliding_pos_ring
-                kv_state[inp.name] = np.full(shape, -1, dtype=np.int32)
-            else:  # (1, cache_len, nkv, hd) — KV cache
-                kv_state[inp.name] = np.zeros(shape, dtype=np.float16)
-        del _spec_m, _kv_inputs
+        kv_state = _init_kv_state(_dec_state_inputs, global_names, max(n_real, 1))
 
         if verbose:
             print(f"Processing {n_real} prompt tokens (decode-only)…", flush=True)
         for pos, token_id in enumerate(prompt_ids):
+            _ensure_global_cache_capacity(kv_state, global_names, pos + 1, max_seq_len)
+            _global_len = next(
+                (kv_state[n].shape[1] for n in _arch_global if n in kv_state),
+                max(n_real, 1),
+            )
             step_input = {
-                dec_in[0]: np.array([token_id], dtype=np.int32),
-                dec_in[1]: np.array([pos], dtype=np.int32),
+                dec_in[0]: np.array([_global_len], dtype=np.int32),
+                dec_in[1]: np.array([token_id], dtype=np.int32),
+                dec_in[2]: np.array([pos], dtype=np.int32),
             }
             step_input.update(kv_state)
             result = decode_model.predict(step_input)
@@ -518,6 +743,12 @@ def generate_kvcached(
             kv_state = _coreml_kv_state_after_decode(
                 kv_names_in, kv_names_out, result
             )
+
+    # ── Persist KV state into session after prefill ──────────────────────────
+    if session is not None:
+        session.kv_state = kv_state
+        session.seq_len = n_real
+        session.processed_ids = list(prompt_ids)
 
     # ── Decode loop ───────────────────────────────────────────────────────────
     if logits is None:
@@ -532,9 +763,15 @@ def generate_kvcached(
             break
 
         position = n_real + step
+        _ensure_global_cache_capacity(kv_state, global_names, position + 1, max_seq_len)
+
+        _global_len = next(
+            (kv_state[n].shape[1] for n in _arch_global if n in kv_state), 0,
+        )
         decode_input = {
-            dec_in[0]: np.array([next_id], dtype=np.int32),
-            dec_in[1]: np.array([position], dtype=np.int32),
+            dec_in[0]: np.array([_global_len], dtype=np.int32),
+            dec_in[1]: np.array([next_id], dtype=np.int32),
+            dec_in[2]: np.array([position], dtype=np.int32),
         }
         decode_input.update(kv_state)
 
@@ -546,6 +783,10 @@ def generate_kvcached(
         kv_state = _coreml_kv_state_after_decode(
             kv_names_in, kv_names_out, decode_result
         )
+        if session is not None:
+            session.kv_state = kv_state
+            session.seq_len = position + 1
+            session.processed_ids.append(next_id)
 
 def generate_text_kvcached(
     prompt: str,

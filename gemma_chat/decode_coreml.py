@@ -232,7 +232,6 @@ def decode_step(
     kv_flat,
     sliding_pos_ring,
     cfg: Gemma4Config = E2B_CONFIG,
-    max_seq_len: int = MAX_SEQ_LEN,
 ):
     """Single-token autoregressive decode with KV cache.
 
@@ -241,9 +240,9 @@ def decode_step(
         token_id:  () int32 — the new token to process.
         position:  () int32 — absolute position of this token (= T + step).
         kv_flat:   List of 30 cache arrays (per-layer shapes, float16).
+                   Global cache dim 1 may vary (symbolic/flexible shapes).
         sliding_pos_ring: (1, sliding_window_size) int32 — ring position tracker.
         cfg:       Model config.
-        max_seq_len: Must match shape of global cache arrays.
 
     Returns:
         logits: (vocab_size,)
@@ -484,7 +483,6 @@ def chunk_prefill_step(
     sliding_pos_ring,
     cfg: Gemma4Config = E2B_CONFIG,
     chunk_size: int = CHUNK_SIZE,
-    max_seq_len: int = MAX_SEQ_LEN,
 ):
     """Process a chunk of tokens through the full model, updating KV caches.
 
@@ -493,10 +491,10 @@ def chunk_prefill_step(
         tokens:         (1, chunk_size) int32 — chunk of tokens (right-padded if last).
         start_position: () int32 — absolute position of the first token in this chunk.
         kv_flat:        List of 30 cache arrays (per-layer shapes, float16).
+                        Global cache dim 1 may vary (symbolic/flexible shapes).
         sliding_pos_ring: (1, sliding_window_size) int32 — ring position tracker.
         cfg:            Model config.
         chunk_size:     Number of tokens per chunk (must match tokens.shape[1]).
-        max_seq_len:    Must match shape of global cache arrays.
 
     Returns:
         logits: (chunk_size, vocab_size) float32 — logits at all chunk positions.
