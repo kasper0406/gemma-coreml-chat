@@ -2,10 +2,10 @@
 
 from gemma_chat.model import AttentionType, Gemma4Config
 
-# Maximum sequence length used for the CoreML export.
-# The model is exported with a fixed shape (1, MAX_SEQ_LEN).
-# Prompts and generated text are padded/truncated to fit.
-MAX_SEQ_LEN = 4096
+# Maximum sequence length for the CoreML export.
+# Global KV caches use RangeDim(1, MAX_SEQ_LEN) and grow dynamically;
+# sliding caches are fixed at sliding_window_size (512).
+MAX_SEQ_LEN = 65536
 
 # Number of tokens processed per chunked-prefill call.
 # Chosen to roughly balance compute and memory-bandwidth on A-series chips,

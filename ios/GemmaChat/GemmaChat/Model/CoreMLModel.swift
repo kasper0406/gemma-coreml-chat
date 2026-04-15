@@ -34,11 +34,18 @@ final class CoreMLModel: @unchecked Sendable {
     let decodePositionInputName: String
     let prefillPositionInputName: String
 
+    /// "N" phantom input name (global cache dim), nil for fixed-shape models.
+    let decodeNInputName: String?
+    let prefillNInputName: String?
+
     /// KV cache input/output names, in matched order.
     let decodeKVInputNames: [String]
     let decodeKVOutputNames: [String]
     let prefillKVInputNames: [String]
     let prefillKVOutputNames: [String]
+
+    /// Global KV input names that have flexible (RangeDim) shapes.
+    let globalKVInputNames: Set<String>
 
     /// Prefill input descriptions for KV cache initialization.
     /// Extracted once so the prefill model can be released between uses.
@@ -50,7 +57,8 @@ final class CoreMLModel: @unchecked Sendable {
         computeUnits: MLComputeUnits,
         prefillIO: ClassifiedIO,
         prefillInputDescriptions: [String: MLFeatureDescription],
-        decodeIO: ClassifiedIO
+        decodeIO: ClassifiedIO,
+        globalKVInputNames: Set<String>
     ) {
         self.decodeModel = decodeModel
         self.prefillModel = nil
@@ -62,11 +70,14 @@ final class CoreMLModel: @unchecked Sendable {
         self.decodeTokenInputName = decodeIO.tokenInputName
         self.prefillPositionInputName = prefillIO.positionInputName
         self.decodePositionInputName = decodeIO.positionInputName
+        self.prefillNInputName = prefillIO.nInputName
+        self.decodeNInputName = decodeIO.nInputName
         self.prefillKVInputNames = prefillIO.kvInputNames
         self.prefillKVOutputNames = prefillIO.kvOutputNames
         self.decodeKVInputNames = decodeIO.kvInputNames
         self.decodeKVOutputNames = decodeIO.kvOutputNames
         self.prefillInputDescriptions = prefillInputDescriptions
+        self.globalKVInputNames = globalKVInputNames
     }
 
     /// Load the multifunction model from the app bundle.
@@ -144,6 +155,17 @@ final class CoreMLModel: @unchecked Sendable {
 
         print("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count)")
         print("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName), token=\(prefillIO.tokenInputName), pos=\(prefillIO.positionInputName), kvIn=\(prefillIO.kvInputNames.count), kvOut=\(prefillIO.kvOutputNames.count)")
+        if decodeIO.nInputName != nil {
+            print("[CoreML] Dynamic context: N input detected (decode=\(decodeIO.nInputName!), prefill=\(prefillIO.nInputName ?? "none"))")
+        }
+
+        // Detect global KV inputs with flexible shapes (RangeDim).
+        let globalNames = Self.detectFlexibleGlobalKV(
+            model: decodeModel, kvInputNames: decodeIO.kvInputNames
+        )
+        if !globalNames.isEmpty {
+            print("[CoreML] Flexible global KV caches: \(globalNames.sorted())")
+        }
 
         // tempPrefill released here — only metadata is kept
         return CoreMLModel(
@@ -152,7 +174,8 @@ final class CoreMLModel: @unchecked Sendable {
             computeUnits: computeUnits,
             prefillIO: prefillIO,
             prefillInputDescriptions: prefillInputDescs,
-            decodeIO: decodeIO
+            decodeIO: decodeIO,
+            globalKVInputNames: globalNames
         )
     }
 
@@ -183,11 +206,13 @@ final class CoreMLModel: @unchecked Sendable {
     ///   - tokens: Int32 array of shape (1, CHUNK_SIZE)
     ///   - seqLen: start position for this chunk
     ///   - kvState: current KV cache state
+    ///   - globalCacheSize: current global KV cache dim (for N input), nil for fixed models
     /// - Returns: (logits as MLMultiArray, updated KVCacheState)
     func prefill(
         tokens: MLMultiArray,
         seqLen: Int32,
-        kvState: KVCacheState
+        kvState: KVCacheState,
+        globalCacheSize: Int32? = nil
     ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
         guard let prefillModel else {
             throw CoreMLModelError.prefillNotLoaded
@@ -195,6 +220,9 @@ final class CoreMLModel: @unchecked Sendable {
         var features: [String: MLMultiArray] = [:]
         features[prefillTokenInputName] = tokens
         features[prefillPositionInputName] = MLMultiArray.int32Scalar(seqLen)
+        if let nName = prefillNInputName, let nValue = globalCacheSize {
+            features[nName] = MLMultiArray.int32Scalar(nValue)
+        }
 
         let provider = try CoreMLInputProvider(
             features: features,
@@ -206,7 +234,8 @@ final class CoreMLModel: @unchecked Sendable {
         let newKV = KVCacheState.from(
             prediction: result,
             outputNames: prefillKVOutputNames,
-            inputNames: prefillKVInputNames
+            inputNames: prefillKVInputNames,
+            globalNames: kvState.globalNames
         )
         return (logits, newKV)
     }
@@ -216,15 +245,20 @@ final class CoreMLModel: @unchecked Sendable {
     ///   - token: single token ID
     ///   - position: absolute position in the sequence
     ///   - kvState: current KV cache state
+    ///   - globalCacheSize: current global KV cache dim (for N input), nil for fixed models
     /// - Returns: (logits as MLMultiArray, updated KVCacheState)
     func decode(
         token: Int32,
         position: Int32,
-        kvState: KVCacheState
+        kvState: KVCacheState,
+        globalCacheSize: Int32? = nil
     ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
         var features: [String: MLMultiArray] = [:]
         features[decodeTokenInputName] = MLMultiArray.int32Scalar(token)
         features[decodePositionInputName] = MLMultiArray.int32Scalar(position)
+        if let nName = decodeNInputName, let nValue = globalCacheSize {
+            features[nName] = MLMultiArray.int32Scalar(nValue)
+        }
 
         let provider = try CoreMLInputProvider(
             features: features,
@@ -236,7 +270,8 @@ final class CoreMLModel: @unchecked Sendable {
         let newKV = KVCacheState.from(
             prediction: result,
             outputNames: decodeKVOutputNames,
-            inputNames: decodeKVInputNames
+            inputNames: decodeKVInputNames,
+            globalNames: kvState.globalNames
         )
         return (logits, newKV)
     }
@@ -248,6 +283,7 @@ final class CoreMLModel: @unchecked Sendable {
         let logitsOutputName: String
         let tokenInputName: String      // "tokens" (prefill) or "token_id" (decode)
         let positionInputName: String   // "start_position" (prefill) or "position" (decode)
+        let nInputName: String?         // "N" for dynamic-shape models, nil otherwise
         let kvInputNames: [String]      // KV cache + ring tracker inputs, naturally sorted
         let kvOutputNames: [String]     // KV cache + ring tracker outputs, naturally sorted
     }
@@ -302,9 +338,9 @@ final class CoreMLModel: @unchecked Sendable {
         assert(kvInputs.count == kvOutputs.count,
                "State input count (\(kvInputs.count)) != output count (\(kvOutputs.count))")
 
-        // Identify token vs position among control inputs.
-        // Token input has more elements (prefill: [1,8] vs [1]) or contains "token" in name.
-        let (tokenName, posName) = Self.identifyControlInputs(
+        // Identify token vs position among control inputs,
+        // and detect the optional N (global cache dim) input.
+        let (tokenName, posName, nName) = Self.identifyControlInputs(
             controlInputs, inputDescs: inputDescs
         )
 
@@ -312,34 +348,66 @@ final class CoreMLModel: @unchecked Sendable {
             logitsOutputName: logitsName,
             tokenInputName: tokenName,
             positionInputName: posName,
+            nInputName: nName,
             kvInputNames: kvInputs,
             kvOutputNames: kvOutputs
         )
     }
 
-    /// Distinguish the token input from the position input among control inputs.
+    /// Distinguish token, position, and optional N inputs among control inputs.
     private static func identifyControlInputs(
         _ names: [String],
         inputDescs: [String: MLFeatureDescription]
-    ) -> (tokenName: String, positionName: String) {
-        precondition(names.count == 2, "Expected exactly 2 control inputs, got \(names.count)")
+    ) -> (tokenName: String, positionName: String, nInputName: String?) {
+        precondition(names.count == 2 || names.count == 3,
+                     "Expected 2 or 3 control inputs, got \(names.count): \(names)")
+
+        // Detect N input by name first (shape (1,) Int32, named "N")
+        var nName: String? = nil
+        var remaining = names
+        if let idx = names.firstIndex(of: "N") {
+            nName = names[idx]
+            remaining.remove(at: idx)
+        }
+        precondition(remaining.count == 2,
+                     "After removing N, expected 2 control inputs, got \(remaining.count)")
 
         // By element count: token input has more elements (prefill: 8 vs 1)
-        let count0 = inputDescs[names[0]]?.multiArrayConstraint?.shape
+        let count0 = inputDescs[remaining[0]]?.multiArrayConstraint?.shape
             .map { $0.intValue }.reduce(1, *) ?? 1
-        let count1 = inputDescs[names[1]]?.multiArrayConstraint?.shape
+        let count1 = inputDescs[remaining[1]]?.multiArrayConstraint?.shape
             .map { $0.intValue }.reduce(1, *) ?? 1
         if count0 != count1 {
-            return count0 > count1 ? (names[0], names[1]) : (names[1], names[0])
+            return count0 > count1
+                ? (remaining[0], remaining[1], nName)
+                : (remaining[1], remaining[0], nName)
         }
 
         // By name: "token" in name → token input
-        if names[0].contains("token") { return (names[0], names[1]) }
-        if names[1].contains("token") { return (names[1], names[0]) }
+        if remaining[0].contains("token") { return (remaining[0], remaining[1], nName) }
+        if remaining[1].contains("token") { return (remaining[1], remaining[0], nName) }
 
-        // Fallback: first naturally-sorted name is token (works for _arg0/_arg1)
-        let sorted = names.sorted { naturalCompare($0, $1) }
-        return (sorted[0], sorted[1])
+        // Fallback: first naturally-sorted name is token
+        let sorted = remaining.sorted { naturalCompare($0, $1) }
+        return (sorted[0], sorted[1], nName)
+    }
+
+    /// Detect KV inputs with flexible shapes (RangeDim) on dim 1.
+    /// These are global attention caches that can grow dynamically.
+    private static func detectFlexibleGlobalKV(
+        model: MLModel,
+        kvInputNames: [String]
+    ) -> Set<String> {
+        var flex: Set<String> = []
+        for name in kvInputNames {
+            guard let desc = model.modelDescription.inputDescriptionsByName[name],
+                  let constraint = desc.multiArrayConstraint else { continue }
+            // RangeDim → shapeConstraint.type == .range
+            if constraint.shapeConstraint.type == .range {
+                flex.insert(name)
+            }
+        }
+        return flex
     }
 
     /// Natural string comparison: numeric segments are compared by value,

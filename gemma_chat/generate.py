@@ -84,12 +84,17 @@ def _coreml_kv_state_after_decode(
 def _global_kv_input_names(kv_names: list[str]) -> set[str]:
     """Return the KV input names that correspond to global attention caches.
 
-    ``kv_names`` is the full list of state input names (30 KV + 1 ring),
-    ordered ``[k_0, v_0, k_1, v_1, ..., k_14, v_14, sliding_pos_ring]``.
+    ``kv_names`` is the list of state input names (2*num_slots KV + 1 ring),
+    ordered ``[k_0, v_0, k_1, v_1, ..., sliding_pos_ring]``.
+    Handles truncated models (e.g. ``--num-layers 5``) by capping at the
+    actual number of KV slots present.
     """
     specs = build_cache_specs()
+    n_slots = (len(kv_names) - 1) // 2  # exclude trailing sliding_pos_ring
     names: set[str] = set()
     for slot, spec in enumerate(specs):
+        if slot >= n_slots:
+            break
         if spec.attn_type == AttentionType.GLOBAL:
             names.add(kv_names[slot * 2])      # k
             names.add(kv_names[slot * 2 + 1])  # v
@@ -181,7 +186,10 @@ def stop_token_ids(tokenizer) -> set[int]:
 
 # ── CoreML model ───────────────────────────────────────────────────────────
 
+import json as _json
 import re as _re
+import shutil as _shutil
+import tempfile as _tempfile
 
 
 class _CompiledModelWrapper:
@@ -197,9 +205,11 @@ class _CompiledModelWrapper:
         model: ct.models.MLModel,
         function_name: str | None = None,
         package_path: Path | None = None,
+        _tmp_dir: str | None = None,
     ):
         self._model = model
         self._package_path = package_path
+        self._tmp_dir = _tmp_dir  # kept alive while model is in use
 
         # Try top-level description first (single-function models).
         in_desc = list(model.input_description)
@@ -222,6 +232,212 @@ class _CompiledModelWrapper:
     def predict(self, data):
         return self._model.predict(data)
 
+    def __del__(self):
+        if self._tmp_dir is not None:
+            _shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+
+import atexit as _atexit
+
+# Cache of concretized multifunction models: resolved source path → temp dir.
+# Both decode/prefill load from the same concretized package, ensuring shape
+# consistency and a single compiled cache (shared weights).
+_concretized_cache: dict[str, str] = {}
+
+
+def _cleanup_concretized_cache():
+    for tmp_dir in _concretized_cache.values():
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+    _concretized_cache.clear()
+
+
+_atexit.register(_cleanup_concretized_cache)
+
+
+def _concretize_multifunction_model(
+    mlpackage_path: Path,
+    function_name: str,
+    compute_units,
+    global_kv_size: int,
+) -> tuple[ct.models.MLModel | None, None]:
+    """Replace symbolic dims in the MIL with concrete values so multifunction
+    loading succeeds on macOS ≥26.
+
+    Returns ``(loaded_model, None)`` or ``(None, None)`` on failure.
+    The temp dir is managed by a module-level cache (cleaned up at exit),
+    so both decode and prefill share the same concretized package.
+
+    Global KV caches are fixed at *global_kv_size* — the ``N`` scalar input
+    still governs which positions are valid.  Weights stay shared because the
+    model is loaded as a true multifunction package (single compiled cache).
+    """
+    cache_key = str(mlpackage_path.resolve())
+
+    if cache_key not in _concretized_cache:
+        spec = ct.models.MLModel(str(mlpackage_path), skip_model_load=True).get_spec()
+
+        # ── Replace every symbolic (unknown) dim in the MIL with a concrete value.
+        def _concretize_tt(tt):
+            for d in tt.dimensions:
+                if not d.HasField("constant"):
+                    d.constant.size = global_kv_size
+
+        def _walk_block(block):
+            for op in block.operations:
+                for out in op.outputs:
+                    if out.type.HasField("tensorType"):
+                        _concretize_tt(out.type.tensorType)
+                for b in op.blocks:
+                    _walk_block(b)
+
+        for func in spec.mlProgram.functions.values():
+            for inp in func.inputs:
+                if inp.type.HasField("tensorType"):
+                    _concretize_tt(inp.type.tensorType)
+            for block in func.block_specializations.values():
+                _walk_block(block)
+
+        # ── Update spec-level description shapes to match, strip RangeDim.
+        for fd in spec.description.functions:
+            for feat in list(fd.input) + list(fd.output):
+                ma = feat.type.multiArrayType
+                if ma.shapeRange.sizeRanges:
+                    shape = list(ma.shape)
+                    for i, r in enumerate(ma.shapeRange.sizeRanges):
+                        if r.upperBound != r.lowerBound:
+                            shape[i] = global_kv_size
+                    del ma.shape[:]
+                    ma.shape.extend(shape)
+                    ma.ClearField("shapeRange")
+
+        # ── Write patched spec with symlinked weights.
+        tmp_dir = _tempfile.mkdtemp(prefix="coreml-concrete-mf-")
+        pkg_path = Path(tmp_dir) / "model.mlpackage"
+        data_dir = pkg_path / "Data" / "com.apple.CoreML"
+        weights_dir = data_dir / "weights"
+        weights_dir.mkdir(parents=True)
+        (data_dir / "model.mlmodel").write_bytes(spec.SerializeToString())
+        src_weights = mlpackage_path / "Data" / "com.apple.CoreML" / "weights" / "weight.bin"
+        (weights_dir / "weight.bin").symlink_to(src_weights)
+        manifest = {
+            "fileFormatVersion": "1.0.0",
+            "itemInfoEntries": {
+                "spec": {
+                    "author": "com.apple.CoreML",
+                    "description": "CoreML Model Specification",
+                    "name": "model.mlmodel",
+                    "path": "com.apple.CoreML/model.mlmodel",
+                },
+                "wt": {
+                    "author": "com.apple.CoreML",
+                    "description": "CoreML Model Weights",
+                    "name": "weights",
+                    "path": "com.apple.CoreML/weights",
+                },
+            },
+            "rootModelIdentifier": "spec",
+        }
+        (pkg_path / "Manifest.json").write_text(_json.dumps(manifest))
+        _concretized_cache[cache_key] = tmp_dir
+
+    # Load the requested function from the cached concretized package.
+    tmp_dir = _concretized_cache[cache_key]
+    pkg_path = Path(tmp_dir) / "model.mlpackage"
+
+    import warnings
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        model = ct.models.MLModel(
+            str(pkg_path), compute_units=compute_units, function_name=function_name
+        )
+
+    if model.__proxy__ is None:
+        return None, None
+
+    return model, None  # tmp_dir managed by _concretized_cache, not __del__
+
+
+def _extract_function_as_single_model(
+    mlpackage_path: Path,
+    function_name: str,
+    compute_units,
+) -> tuple[ct.models.MLModel, str]:
+    """Extract one function from a multifunction .mlpackage into a temp
+    single-function model that symlinks back to the original weights.
+
+    Last-resort fallback: weights are **not** shared between functions because
+    CoreML compiles each single-function model into its own cache.
+    """
+    from coremltools.proto import Model_pb2
+
+    full_spec = ct.models.MLModel(str(mlpackage_path), skip_model_load=True).get_spec()
+
+    single_spec = Model_pb2.Model()
+    single_spec.specificationVersion = full_spec.specificationVersion
+    single_spec.mlProgram.version = full_spec.mlProgram.version
+    single_spec.mlProgram.functions["main"].CopyFrom(
+        full_spec.mlProgram.functions[function_name]
+    )
+
+    for fd in full_spec.description.functions:
+        if fd.name == function_name:
+            for inp in fd.input:
+                single_spec.description.input.append(inp)
+            for out in fd.output:
+                single_spec.description.output.append(out)
+            break
+
+    tmp_dir = _tempfile.mkdtemp(prefix=f"coreml-{function_name}-")
+    pkg_path = Path(tmp_dir) / f"{function_name}.mlpackage"
+    data_dir = pkg_path / "Data" / "com.apple.CoreML"
+    weights_dir = data_dir / "weights"
+    weights_dir.mkdir(parents=True)
+
+    (data_dir / "model.mlmodel").write_bytes(single_spec.SerializeToString())
+
+    src_weights = mlpackage_path / "Data" / "com.apple.CoreML" / "weights" / "weight.bin"
+    (weights_dir / "weight.bin").symlink_to(src_weights)
+
+    manifest = {
+        "fileFormatVersion": "1.0.0",
+        "itemInfoEntries": {
+            "spec": {
+                "author": "com.apple.CoreML",
+                "description": "CoreML Model Specification",
+                "name": "model.mlmodel",
+                "path": "com.apple.CoreML/model.mlmodel",
+            },
+            "wt": {
+                "author": "com.apple.CoreML",
+                "description": "CoreML Model Weights",
+                "name": "weights",
+                "path": "com.apple.CoreML/weights",
+            },
+        },
+        "rootModelIdentifier": "spec",
+    }
+    (pkg_path / "Manifest.json").write_text(_json.dumps(manifest, indent=4))
+
+    import warnings
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        model = ct.models.MLModel(str(pkg_path), compute_units=compute_units)
+
+    if model.__proxy__ is None:
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"Failed to load extracted function '{function_name}' from {mlpackage_path}"
+        )
+
+    return model, tmp_dir
+
+
+# Default fixed size for global KV caches when multifunction loading
+# requires concretized symbolic dims (macOS ≥26 workaround).
+_DEFAULT_GLOBAL_KV_SIZE = 4096
+
 
 def load_coreml_model(
     mlpackage_path: str | Path = MLPACKAGE_PATH,
@@ -241,12 +457,52 @@ def load_coreml_model(
     fn_label = f" (function={function_name})" if function_name else ""
     print(f"Loading CoreML model from {path}{fn_label} …")
 
+    import warnings
+
     kwargs: dict = {"compute_units": compute_units}
     if function_name is not None:
         kwargs["function_name"] = function_name
 
-    loaded = ct.models.MLModel(str(path), **kwargs)
-    model = _CompiledModelWrapper(loaded, function_name=function_name, package_path=path)
+    # If another function from this model already needed concretize,
+    # skip the native load and go straight to the concretized version
+    # for shape consistency (both functions must use the same shapes).
+    cache_key = str(path)
+    tmp_dir = None
+    if cache_key in _concretized_cache and function_name is not None:
+        print(
+            f"  Using cached concretized model "
+            f"(global_kv={_DEFAULT_GLOBAL_KV_SIZE}) …"
+        )
+        loaded, tmp_dir = _concretize_multifunction_model(
+            path, function_name, compute_units, _DEFAULT_GLOBAL_KV_SIZE
+        )
+    else:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            loaded = ct.models.MLModel(str(path), **kwargs)
+
+    if loaded.__proxy__ is None and function_name is not None:
+        # Fallback 1: concretize symbolic dims → keeps multifunction (shared weights).
+        print(
+            f"  Multifunction load failed; concretizing symbolic dims "
+            f"(global_kv={_DEFAULT_GLOBAL_KV_SIZE}) …"
+        )
+        loaded, tmp_dir = _concretize_multifunction_model(
+            path, function_name, compute_units, _DEFAULT_GLOBAL_KV_SIZE
+        )
+        if loaded is None:
+            # Fallback 2: extract single-function model (weights duplicated).
+            print(
+                f"  Concretize failed; extracting '{function_name}' "
+                "as single-function model (weights not shared) …"
+            )
+            loaded, tmp_dir = _extract_function_as_single_model(
+                path, function_name, compute_units
+            )
+
+    model = _CompiledModelWrapper(
+        loaded, function_name=function_name, package_path=path, _tmp_dir=tmp_dir
+    )
     print("  Model loaded.")
     return model
 
@@ -475,6 +731,8 @@ def generate_kvcached(
     # Only enable dynamic sizing for global caches that have RangeDim.
     # Fixed-shape models → global_names is empty → all caches use spec shapes.
     global_names = _flexible_global_names(kv_names_in, _dec_state_inputs)
+    # Architectural global cache names (always present, even when concretized).
+    _arch_global = _global_kv_input_names(kv_names_in)
     if global_names and verbose:
         print(f"  Dynamic global KV caches: {len(global_names)} inputs", flush=True)
 
@@ -501,17 +759,17 @@ def generate_kvcached(
         padded_len = n_chunks * CHUNK_SIZE
 
         # Initialize KV caches — global caches sized to padded_len, not max_seq_len.
-        _spec_m = ct.models.MLModel(str(model_path.resolve()), skip_model_load=True,
-                                     function_name="prefill")
+        # Read spec from the loaded model (not the original .mlpackage) so shapes
+        # match when concretized symbolic dims are in effect.
         _all_inputs = []
-        func_descs = _spec_m._spec.description.functions
+        func_descs = prefill_model._model._spec.description.functions
         if func_descs:
             for fd in func_descs:
                 if fd.name == "prefill":
                     _all_inputs = list(fd.input)
                     break
-        else:
-            _all_inputs = list(_spec_m._spec.description.input)
+        if not _all_inputs:
+            _all_inputs = list(prefill_model._model._spec.description.input)
 
         # Validate prefill token input shape matches CHUNK_SIZE.
         if _all_inputs:
@@ -530,14 +788,22 @@ def generate_kvcached(
         pref_kv_state = _init_kv_state(
             _all_inputs[_n_pref_ctrl:], pref_global_names, padded_len,
         )
-        del _spec_m, _all_inputs
+        del _all_inputs
 
         prompt_padded = list(prompt_ids) + [pad_id] * (padded_len - n_real)
+
+        # Actual global KV size (may differ from padded_len when concretized).
+        _actual_gkv = next(
+            (pref_kv_state[n].shape[1]
+             for n in _global_kv_input_names(pref_kv_in)
+             if n in pref_kv_state),
+            padded_len,
+        )
 
         if verbose:
             print(
                 f"Prefill: {n_real} tokens in {n_chunks} chunks "
-                f"(chunk_size={CHUNK_SIZE}, global_kv={padded_len})…",
+                f"(chunk_size={CHUNK_SIZE}, global_kv={_actual_gkv})…",
                 flush=True,
             )
 
@@ -548,7 +814,7 @@ def generate_kvcached(
                 # pref_in = [N, tokens, start_position, ...]
                 _global_len = next(
                     (pref_kv_state[n].shape[1] for n in pref_global_names),
-                    padded_len,
+                    _actual_gkv,
                 )
                 chunk_input = {
                     pref_in[0]: np.array([_global_len], dtype=np.int32),
@@ -597,7 +863,8 @@ def generate_kvcached(
         for pos, token_id in enumerate(prompt_ids):
             _ensure_global_cache_capacity(kv_state, global_names, pos + 1, max_seq_len)
             _global_len = next(
-                (kv_state[n].shape[1] for n in global_names), max(n_real, 1),
+                (kv_state[n].shape[1] for n in _arch_global if n in kv_state),
+                max(n_real, 1),
             ) if _has_n_input else 0
             if _has_n_input:
                 step_input = {
@@ -636,7 +903,7 @@ def generate_kvcached(
         _ensure_global_cache_capacity(kv_state, global_names, position + 1, max_seq_len)
 
         _global_len = next(
-            (kv_state[n].shape[1] for n in global_names), 0,
+            (kv_state[n].shape[1] for n in _arch_global if n in kv_state), 0,
         ) if _has_n_input else 0
         if _has_n_input:
             decode_input = {

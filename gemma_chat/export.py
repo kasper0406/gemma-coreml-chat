@@ -308,6 +308,9 @@ def _mil_to_mlpackage(
             convert_kwargs = dict(
                 source="milinternal",
                 minimum_deployment_target=ct.target.iOS18,
+                # When using ct.precision.FLOAT16 the model output becomes unstable and garbage
+                # tokens are produced. We use FLOAT16 precision in the model where permissible
+                # by manual casting.
                 compute_precision=ct.precision.FLOAT32,
                 pass_pipeline=pipeline,
                 skip_model_load=True,
