@@ -102,8 +102,6 @@ def _bench_prefill(
     max_seq_len: int,
 ) -> tuple[float, dict[str, np.ndarray], np.ndarray]:
     """Run chunked prefill and return (elapsed_s, kv_state, logits)."""
-    import coremltools as ct
-
     n_real = len(prompt_ids)
 
     # Read model I/O names
@@ -114,21 +112,16 @@ def _bench_prefill(
     pref_kv_in = pref_in[_n_pref_ctrl:]
     pref_kv_out = pref_out[1:]
 
-    # Prefill spec for shape info
-    _spec = ct.models.MLModel(
-        str(Path(prefill_model._model.path).parent),
-        skip_model_load=True,
-        function_name="prefill",
-    )
+    # Get shape info from the already-loaded model spec
     _all_inputs = []
-    func_descs = _spec._spec.description.functions
+    func_descs = prefill_model._model._spec.description.functions
     if func_descs:
         for fd in func_descs:
             if fd.name == "prefill":
                 _all_inputs = list(fd.input)
                 break
     if not _all_inputs:
-        _all_inputs = list(_spec._spec.description.input)
+        _all_inputs = list(prefill_model._model._spec.description.input)
     pref_state_inputs = _all_inputs[_n_pref_ctrl:]
     pref_global = _flexible_global_names(pref_kv_in, pref_state_inputs)
 

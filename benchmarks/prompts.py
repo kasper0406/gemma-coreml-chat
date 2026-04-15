@@ -81,7 +81,12 @@ def _tokenize_chat(
 ) -> list[int]:
     """Apply chat template and tokenize.  Optionally truncate to max_length."""
     messages = [{"role": "user", "content": user_text}]
-    ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    result = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    # Handle both plain list and BatchEncoding returns
+    if hasattr(result, "input_ids"):
+        ids = list(result["input_ids"])
+    else:
+        ids = list(result)
     if max_length is not None:
         ids = ids[:max_length]
     return ids
