@@ -88,8 +88,6 @@ public struct InferenceEngine: Sendable {
                     let nChunks = (nReal + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
                     Log.info("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks, prefillOffset=\(effectivePrefillOffset)")
 
-                    try await self.model.loadPrefill()
-
                     // --- Chunked Prefill ---
                     let prefillStart = CFAbsoluteTimeGetCurrent()
                     var kvState: KVCacheState
@@ -124,8 +122,6 @@ public struct InferenceEngine: Sendable {
                     }
                     let prefillTime = CFAbsoluteTimeGetCurrent() - prefillStart
                     Log.info("[Perf] Prefill done: \(String(format: "%.2f", prefillTime))s")
-
-                    self.model.releasePrefill()
 
                     // Extract the logits for the last real token.
                     let vocabSize = GemmaConfig.vocabSize

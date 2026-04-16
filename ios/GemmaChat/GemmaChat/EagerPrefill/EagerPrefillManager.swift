@@ -214,9 +214,6 @@ actor EagerPrefillManager {
                     kvState = try kvState.grownToFit(needed: neededSize, maxLen: GemmaConfig.maxSeqLen)
                 }
             }
-            // Ensure prefill model is loaded before first use
-            try await model.loadPrefill()
-
             for chunkIdx in startChunk..<upToChunk {
                 let chunkStart = CFAbsoluteTimeGetCurrent()
                 let start = chunkIdx * GemmaConfig.chunkSize

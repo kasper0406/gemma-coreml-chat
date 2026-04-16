@@ -3,25 +3,18 @@
 /// Loads the prefill and decode functions from a single .mlpackage using
 /// `functionName` on `MLModelConfiguration`. Supports both .mlpackage
 /// (compiles and caches .mlmodelc) and pre-compiled .mlmodelc.
+///
+/// Both functions stay resident for the life of the wrapper. The multifunction
+/// export runs `const_deduplication`, so CoreML shares the int8 weight blobs
+/// between prefill and decode — keeping both loaded avoids paying the ~multi-
+/// second prefill reload cost on every turn.
 
 import CoreML
 import Foundation
 
-/// Holds the decode MLModel permanently and the prefill MLModel on demand.
-///
-/// CoreML allocates separate weight buffers for each loaded function, roughly
-/// doubling memory when both are loaded. To avoid this, the prefill model is
-/// loaded only when needed (via ``loadPrefill()``) and released after the
-/// prefill phase (via ``releasePrefill()``).
 public final class CoreMLModel: @unchecked Sendable {
     public let decodeModel: MLModel
-
-    /// Prefill model — loaded on demand, released after use.
-    public private(set) var prefillModel: MLModel?
-
-    /// Stored for on-demand prefill reloading.
-    private let modelURL: URL
-    private let computeUnits: MLComputeUnits
+    public let prefillModel: MLModel
 
     /// Logits output name for each function.
     public let decodeLogitsName: String
@@ -56,9 +49,7 @@ public final class CoreMLModel: @unchecked Sendable {
 
     private init(
         decodeModel: MLModel,
-        prefillModel: MLModel?,
-        modelURL: URL,
-        computeUnits: MLComputeUnits,
+        prefillModel: MLModel,
         prefillIO: ClassifiedIO,
         prefillKVShapes: [String: [NSNumber]],
         prefillKVDtypes: [String: MLMultiArrayDataType],
@@ -67,8 +58,6 @@ public final class CoreMLModel: @unchecked Sendable {
     ) {
         self.decodeModel = decodeModel
         self.prefillModel = prefillModel
-        self.modelURL = modelURL
-        self.computeUnits = computeUnits
         self.prefillLogitsName = prefillIO.logitsOutputName
         self.decodeLogitsName = decodeIO.logitsOutputName
         self.prefillTokenInputName = prefillIO.tokenInputName
@@ -139,9 +128,7 @@ public final class CoreMLModel: @unchecked Sendable {
     /// Load a pre-compiled multifunction .mlmodelc.
     ///
     /// Both decode and prefill functions are loaded with the requested
-    /// compute units.  The prefill model is kept in memory initially but
-    /// can be released via ``releasePrefill()`` and reloaded on demand
-    /// with ``loadPrefill()``.
+    /// compute units and kept resident for the life of the wrapper.
     private static func loadCompiled(
         from url: URL,
         computeUnits: MLComputeUnits
@@ -189,38 +176,15 @@ public final class CoreMLModel: @unchecked Sendable {
             Log.info("[CoreML] Flexible global KV caches: \(globalNames.sorted())")
         }
 
-        // Both models kept — prefill avoids recompilation when needed
         return CoreMLModel(
             decodeModel: decodeModel,
             prefillModel: prefillModel,
-            modelURL: url,
-            computeUnits: computeUnits,
             prefillIO: prefillIO,
             prefillKVShapes: prefillKVShapes,
             prefillKVDtypes: prefillKVDtypes,
             decodeIO: decodeIO,
             globalKVInputNames: globalNames
         )
-    }
-
-    /// Load the prefill model with target compute units.
-    /// Call before using ``prefill()``.  No-op if already loaded.
-    public func loadPrefill() async throws {
-        guard prefillModel == nil else { return }
-        Log.info("[CoreML] Loading prefill model on demand...")
-        let config = MLModelConfiguration()
-        config.computeUnits = computeUnits
-        config.functionName = "prefill"
-        prefillModel = try await MLModel.load(contentsOf: modelURL, configuration: config)
-        Log.info("[CoreML] Prefill model loaded.")
-    }
-
-    /// Release the prefill model to free memory (~4-5 GB).
-    /// Call after the prefill phase when only decode is needed.
-    public func releasePrefill() {
-        guard prefillModel != nil else { return }
-        prefillModel = nil
-        Log.info("[CoreML] Prefill model released.")
     }
 
     // MARK: - Prediction
@@ -232,9 +196,6 @@ public final class CoreMLModel: @unchecked Sendable {
         kvState: KVCacheState,
         globalCacheSize: Int32? = nil
     ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
-        guard let prefillModel else {
-            throw CoreMLModelError.prefillNotLoaded
-        }
         var features: [String: MLMultiArray] = [:]
         features[prefillTokenInputName] = tokens
         features[prefillPositionInputName] = MLMultiArray.int32Scalar(seqLen)
@@ -529,15 +490,12 @@ extension MLMultiArray {
 
 public enum CoreMLModelError: Error, LocalizedError {
     case modelNotFound
-    case prefillNotLoaded
     case missingKVInput(String)
 
     public var errorDescription: String? {
         switch self {
         case .modelNotFound:
             "Model not found at the specified path"
-        case .prefillNotLoaded:
-            "Prefill model not loaded. Call loadPrefill() first."
         case .missingKVInput(let name):
             "KV cache is missing the array for input '\(name)'"
         }
