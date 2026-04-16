@@ -69,6 +69,7 @@ struct GemmaChatCLI {
         }
 
         let engine = InferenceEngine(model: model, temperature: 1.0, topP: 0.9)
+        let genContext = GenerationContext()
         var history: [ChatMessage] = []
 
         // --- Chat loop ---
@@ -93,6 +94,7 @@ struct GemmaChatCLI {
                     return
                 case "/reset", "/clear":
                     history.removeAll()
+                    genContext.reset()
                     print("Conversation reset.\n")
                     continue
                 case "/help", "/h", "/?":
@@ -108,7 +110,12 @@ struct GemmaChatCLI {
             history.append(ChatMessage(role: .user, content: input))
 
             // Encode conversation
-            let promptIDs = tokenizer.encodeChatPrompt(history: history)
+            let promptIDs = tokenizer.encodeChatPrompt(history: history).map { Int32($0) }
+
+            // Check if we can reuse KV cache from the previous turn
+            let (existingKV, prefillOffset) = resolveKVReuse(
+                promptIDs: promptIDs, context: genContext
+            )
 
             // Generate
             print("\ngemma> ", terminator: "")
@@ -116,7 +123,13 @@ struct GemmaChatCLI {
 
             var responseTokens: [Int32] = []
             let genStart = CFAbsoluteTimeGetCurrent()
-            let stream = engine.generate(promptIDs: promptIDs.map { Int32($0) }, maxNewTokens: 1024)
+            let stream = engine.generate(
+                promptIDs: promptIDs,
+                maxNewTokens: 1024,
+                existingKVState: existingKV,
+                prefillOffset: prefillOffset,
+                context: genContext
+            )
 
             for await tokenID in stream {
                 if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
@@ -142,6 +155,35 @@ struct GemmaChatCLI {
             // Add assistant response to history
             history.append(ChatMessage(role: .assistant, content: responseText))
         }
+    }
+
+    // MARK: - KV Reuse
+
+    /// Check if the previous KV cache can be reused for the new prompt.
+    ///
+    /// If `context.cachedTokens` is a prefix of `promptIDs`, returns the
+    /// existing KV state and the offset to resume prefilling from.
+    /// Otherwise returns `(nil, 0)` for a full prefill from scratch.
+    static func resolveKVReuse(
+        promptIDs: [Int32], context: GenerationContext
+    ) -> (KVCacheState?, Int) {
+        guard let kv = context.kvState else { return (nil, 0) }
+        let cached = context.cachedTokens
+        guard !cached.isEmpty, cached.count <= promptIDs.count else {
+            Log.info("[KV] No reusable prefix (cached=\(cached.count), prompt=\(promptIDs.count))")
+            return (nil, 0)
+        }
+
+        // Verify token-by-token prefix match
+        for i in 0..<cached.count {
+            if cached[i] != promptIDs[i] {
+                Log.info("[KV] Prefix mismatch at position \(i) — full prefill")
+                return (nil, 0)
+            }
+        }
+
+        Log.info("[KV] Reusing \(cached.count)/\(promptIDs.count) tokens from cache")
+        return (kv, cached.count)
     }
 
     // MARK: - Logging

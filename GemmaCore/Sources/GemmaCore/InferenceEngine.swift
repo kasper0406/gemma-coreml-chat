@@ -5,6 +5,26 @@
 import CoreML
 import Foundation
 
+/// Captures post-generation KV state for reuse across turns.
+///
+/// Pass the same instance to successive ``InferenceEngine/generate`` calls
+/// to skip re-prefilling tokens that are already in the KV cache.
+public final class GenerationContext: @unchecked Sendable {
+    /// Token sequence currently represented in the KV cache (prompt + generated).
+    public internal(set) var cachedTokens: [Int32] = []
+
+    /// KV cache state after the last generation.
+    public internal(set) var kvState: KVCacheState?
+
+    public init() {}
+
+    /// Discard cached state (e.g., on conversation reset).
+    public func reset() {
+        cachedTokens = []
+        kvState = nil
+    }
+}
+
 public struct InferenceEngine: Sendable {
     public let model: CoreMLModel
     public let temperature: Float
@@ -21,14 +41,16 @@ public struct InferenceEngine: Sendable {
     /// - Parameters:
     ///   - promptIDs: Token IDs for the full prompt (from chat template)
     ///   - maxNewTokens: Maximum tokens to generate
-    ///   - existingKVState: Optional pre-populated KV state (from eager prefill)
+    ///   - existingKVState: Optional pre-populated KV state (from eager prefill or prior turn)
     ///   - prefillOffset: If using existingKVState, how many tokens were already prefilled
+    ///   - context: Optional context for capturing post-generation KV state (enables cross-turn reuse)
     /// - Returns: AsyncStream yielding generated token IDs (including EOS)
     public func generate(
         promptIDs: [Int32],
         maxNewTokens: Int = 256,
         existingKVState: KVCacheState? = nil,
-        prefillOffset: Int = 0
+        prefillOffset: Int = 0,
+        context: GenerationContext? = nil
     ) -> AsyncStream<Int32> {
         AsyncStream { continuation in
             Task.detached { [self] in
@@ -105,6 +127,7 @@ public struct InferenceEngine: Sendable {
                     var totalSampleTime = 0.0
                     var totalDecodeTime = 0.0
                     var decodeSteps = 0
+                    var generatedIDs: [Int32] = []
 
                     for step in 0..<maxSteps {
                         let sampleStart = CFAbsoluteTimeGetCurrent()
@@ -139,6 +162,7 @@ public struct InferenceEngine: Sendable {
                         let decTime = CFAbsoluteTimeGetCurrent() - decStart
                         totalDecodeTime += decTime
                         decodeSteps += 1
+                        generatedIDs.append(nextID)
 
                         if step < 3 {
                             Log.info("[Perf] Step \(step): sample=\(String(format: "%.3f", sampleTime))s, decode=\(String(format: "%.3f", decTime))s")
@@ -155,6 +179,10 @@ public struct InferenceEngine: Sendable {
                     let totalTime = CFAbsoluteTimeGetCurrent() - genStart
                     let tokPerSec = decodeSteps > 0 ? Double(decodeSteps) / totalDecodeTime : 0
                     Log.info("[Perf] Done: \(decodeSteps) tokens in \(String(format: "%.1f", totalTime))s (prefill=\(String(format: "%.1f", prefillTime))s, decode=\(String(format: "%.1f", totalDecodeTime))s, sample=\(String(format: "%.2f", totalSampleTime))s) \(String(format: "%.2f", tokPerSec)) tok/s")
+
+                    // Save state for cross-turn KV reuse
+                    context?.cachedTokens = Array(ids.prefix(nReal)) + generatedIDs
+                    context?.kvState = currentKV
                 } catch {
                     Log.info("Inference error: \(error)")
                 }
