@@ -8,6 +8,7 @@
 
 import CoreML
 import Foundation
+import GemmaCore
 
 /// Observable state for the UI to display prefill progress.
 enum PrefillStatus: Sendable, Equatable {

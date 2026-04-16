@@ -1,15 +1,20 @@
 /// Chunked prefill + single-token decode inference engine.
 ///
-/// Mirrors `generate_kvcached()` from Python's generate.py.
 /// Returns an `AsyncStream<Int32>` of generated token IDs.
 
 import CoreML
 import Foundation
 
-struct InferenceEngine: Sendable {
-    let model: CoreMLModel
-    let temperature: Float
-    let topP: Float
+public struct InferenceEngine: Sendable {
+    public let model: CoreMLModel
+    public let temperature: Float
+    public let topP: Float
+
+    public init(model: CoreMLModel, temperature: Float = 1.0, topP: Float = 0.9) {
+        self.model = model
+        self.temperature = temperature
+        self.topP = topP
+    }
 
     /// Run full generation: chunked prefill of prompt, then decode loop.
     ///
@@ -19,14 +24,13 @@ struct InferenceEngine: Sendable {
     ///   - existingKVState: Optional pre-populated KV state (from eager prefill)
     ///   - prefillOffset: If using existingKVState, how many tokens were already prefilled
     /// - Returns: AsyncStream yielding generated token IDs (including EOS)
-    func generate(
+    public func generate(
         promptIDs: [Int32],
         maxNewTokens: Int = 256,
         existingKVState: KVCacheState? = nil,
         prefillOffset: Int = 0
     ) -> AsyncStream<Int32> {
         AsyncStream { continuation in
-            // Run inference on a background queue to avoid blocking
             Task.detached { [self] in
                 do {
                     let genStart = CFAbsoluteTimeGetCurrent()
@@ -39,8 +43,6 @@ struct InferenceEngine: Sendable {
                     let nChunks = (nReal + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
                     print("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks, prefillOffset=\(prefillOffset)")
 
-                    // Ensure prefill model is loaded (it's released after each
-                    // generation to save ~4-5 GB during decode/idle).
                     try await self.model.loadPrefill()
 
                     // --- Chunked Prefill ---
@@ -49,7 +51,6 @@ struct InferenceEngine: Sendable {
                     var logits: MLMultiArray
 
                     if let existing = existingKVState, prefillOffset > 0 {
-                        // Resume prefill from where eager prefill left off
                         let (prefillLogits, prefillKV) = try self.continuePrefill(
                             ids: ids,
                             fromOffset: prefillOffset,
@@ -60,7 +61,7 @@ struct InferenceEngine: Sendable {
                         if let prefillLogits {
                             logits = prefillLogits
                         } else {
-                            // All chunks were already prefilled by eager prefill.
+                            // All chunks were already prefilled.
                             // Run a single decode step with the last token to get logits.
                             let lastToken = ids[nReal - 1]
                             let gcSize = kvState.currentGlobalCacheSize.map { Int32($0) }
@@ -74,13 +75,11 @@ struct InferenceEngine: Sendable {
                             kvState = decKV
                         }
                     } else {
-                        // Full prefill from scratch
                         (logits, kvState) = try self.fullPrefill(ids: ids)
                     }
                     let prefillTime = CFAbsoluteTimeGetCurrent() - prefillStart
                     print("[Perf] Prefill done: \(String(format: "%.2f", prefillTime))s")
 
-                    // Release the prefill model — only decode is needed from here.
                     self.model.releasePrefill()
 
                     // Extract the logits for the last real token.
@@ -123,7 +122,6 @@ struct InferenceEngine: Sendable {
 
                         let position = Int32(nReal + step)
 
-                        // Grow global caches if needed (doubling strategy)
                         currentKV = currentKV.grownToFit(
                             needed: Int(position) + 1,
                             maxLen: GemmaConfig.maxSeqLen
@@ -157,7 +155,6 @@ struct InferenceEngine: Sendable {
                     let tokPerSec = decodeSteps > 0 ? Double(decodeSteps) / totalDecodeTime : 0
                     print("[Perf] Done: \(decodeSteps) tokens in \(String(format: "%.1f", totalTime))s (prefill=\(String(format: "%.1f", prefillTime))s, decode=\(String(format: "%.1f", totalDecodeTime))s, sample=\(String(format: "%.2f", totalSampleTime))s) \(String(format: "%.2f", tokPerSec)) tok/s")
                 } catch {
-                    // Stream ends on error; the ChatViewModel handles the error
                     print("Inference error: \(error)")
                 }
                 continuation.finish()
@@ -166,7 +163,7 @@ struct InferenceEngine: Sendable {
     }
 
     /// Run full prefill from scratch.
-    func fullPrefill(ids: [Int32]) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+    public func fullPrefill(ids: [Int32]) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
         let nChunks = (ids.count + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
         let paddedLen = nChunks * GemmaConfig.chunkSize
 
@@ -184,10 +181,7 @@ struct InferenceEngine: Sendable {
     }
 
     /// Continue prefill from a given offset with existing KV state.
-    ///
-    /// If `fromOffset` already covers all chunks, returns nil logits (caller
-    /// must use the last logits from wherever the prior prefill came from).
-    func continuePrefill(
+    public func continuePrefill(
         ids: [Int32],
         fromOffset: Int,
         kvState: KVCacheState
@@ -228,7 +222,7 @@ struct InferenceEngine: Sendable {
     }
 
     /// Run prefill for a single chunk. Used by eager prefill.
-    func prefillSingleChunk(
+    public func prefillSingleChunk(
         chunkTokens: [Int32],
         startPosition: Int,
         kvState: KVCacheState

@@ -1,30 +1,31 @@
 /// Swift tokenizer wrapper using swift-transformers.
 ///
-/// Loads `tokenizer.json` + `tokenizer_config.json` bundled in the app
-/// to provide encode/decode and Gemma4 chat template formatting.
+/// Loads tokenizer files from a directory or auto-downloads from HuggingFace Hub.
+/// Provides encode/decode and Gemma4 chat template formatting.
 
 import Foundation
-import Hub
 import Tokenizers
 
-final class GemmaTokenizer: @unchecked Sendable {
+public final class GemmaTokenizer: @unchecked Sendable {
     private let tokenizer: any Tokenizer
 
-    init() async throws {
-        // Load from bundled Resources directory containing tokenizer.json + tokenizer_config.json
-        guard let resourceURL = Bundle.main.resourceURL else {
-            throw GemmaTokenizerError.missingResources
-        }
-        self.tokenizer = try await AutoTokenizer.from(modelFolder: resourceURL)
+    /// Load tokenizer from a local directory containing tokenizer.json + tokenizer_config.json.
+    public init(from directory: URL) async throws {
+        self.tokenizer = try await AutoTokenizer.from(modelFolder: directory)
+    }
+
+    /// Load tokenizer from a HuggingFace model ID (downloads on first use).
+    public init(pretrained modelID: String) async throws {
+        self.tokenizer = try await AutoTokenizer.from(pretrained: modelID)
     }
 
     /// Encode text to token IDs.
-    func encode(_ text: String) -> [Int] {
+    public func encode(_ text: String) -> [Int] {
         tokenizer.encode(text: text)
     }
 
     /// Decode token IDs to text.
-    func decode(_ ids: [Int]) -> String {
+    public func decode(_ ids: [Int]) -> String {
         tokenizer.decode(tokens: ids, skipSpecialTokens: true)
     }
 
@@ -32,7 +33,7 @@ final class GemmaTokenizer: @unchecked Sendable {
     ///
     /// Returns token IDs directly (no intermediate string).
     /// Uses the tokenizer's built-in chat template with `<|turn>` / `<turn|>` markers.
-    func encodeChatPrompt(
+    public func encodeChatPrompt(
         history: [ChatMessage],
         systemPrompt: String? = nil
     ) -> [Int] {
@@ -65,13 +66,13 @@ final class GemmaTokenizer: @unchecked Sendable {
     }
 }
 
-enum GemmaTokenizerError: Error, LocalizedError {
+public enum GemmaTokenizerError: Error, LocalizedError {
     case missingResources
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .missingResources:
-            "tokenizer.json or tokenizer_config.json not found in app bundle"
+            "tokenizer.json or tokenizer_config.json not found"
         }
     }
 }

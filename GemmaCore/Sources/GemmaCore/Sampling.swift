@@ -1,13 +1,12 @@
 /// Temperature + top-p (nucleus) sampling for next-token prediction.
 ///
-/// Mirrors `sample_next_token()` from Python's generate.py.
 /// Uses Accelerate for efficient operations on the 262K vocab logits.
 
 import Accelerate
 import CoreML
 import Foundation
 
-enum Sampling {
+public enum Sampling {
     /// Sample next token from logits with temperature and top-p filtering.
     ///
     /// - Parameters:
@@ -15,7 +14,7 @@ enum Sampling {
     ///   - temperature: Sampling temperature (0 = greedy)
     ///   - topP: Nucleus sampling probability threshold
     /// - Returns: Sampled token ID
-    static func sampleNextToken(
+    public static func sampleNextToken(
         logits: MLMultiArray,
         temperature: Float = 1.0,
         topP: Float = 0.9

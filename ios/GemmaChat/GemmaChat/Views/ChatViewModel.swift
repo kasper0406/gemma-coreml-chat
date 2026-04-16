@@ -5,6 +5,7 @@
 import Combine
 import CoreML
 import Foundation
+import GemmaCore
 import Observation
 import UIKit
 
@@ -65,8 +66,15 @@ final class ChatViewModel {
         appState = .loadingModel
 
         do {
-            let tok = try await GemmaTokenizer()
+            guard let resourceURL = Bundle.main.resourceURL else {
+                throw GemmaTokenizerError.missingResources
+            }
+            let tok = try await GemmaTokenizer(from: resourceURL)
             tokenizer = tok
+
+            guard let modelURL = Bundle.main.url(forResource: "gemma4-e2b", withExtension: "mlpackage") else {
+                throw CoreMLModelError.modelNotFound
+            }
 
             #if targetEnvironment(simulator)
             let units: MLComputeUnits = .cpuOnly
@@ -74,7 +82,7 @@ final class ChatViewModel {
             let units: MLComputeUnits = .all
             #endif
 
-            let coreml = try await CoreMLModel.load(computeUnits: units)
+            let coreml = try await CoreMLModel.load(from: modelURL, computeUnits: units)
             model = coreml
 
             let eng = InferenceEngine(model: coreml, temperature: temperature, topP: topP)

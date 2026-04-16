@@ -1,5 +1,6 @@
 /// Chat message bubble view.
 
+import GemmaCore
 import SwiftUI
 
 struct MessageBubble: View {

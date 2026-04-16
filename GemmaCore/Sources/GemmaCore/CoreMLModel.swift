@@ -1,7 +1,8 @@
- /// CoreML model wrapper for the multifunction Gemma4-E2B .mlpackage.
+/// CoreML model wrapper for the multifunction Gemma4-E2B .mlpackage.
 ///
 /// Loads the prefill and decode functions from a single .mlpackage using
-/// iOS 18's `functionName` parameter on `MLModelConfiguration`.
+/// `functionName` on `MLModelConfiguration`. Supports both .mlpackage
+/// (compiles and caches .mlmodelc) and pre-compiled .mlmodelc.
 
 import CoreML
 import Foundation
@@ -12,44 +13,44 @@ import Foundation
 /// doubling memory when both are loaded. To avoid this, the prefill model is
 /// loaded only when needed (via ``loadPrefill()``) and released after the
 /// prefill phase (via ``releasePrefill()``).
-final class CoreMLModel: @unchecked Sendable {
-    let decodeModel: MLModel
+public final class CoreMLModel: @unchecked Sendable {
+    public let decodeModel: MLModel
 
     /// Prefill model — loaded on demand, released after use.
-    private(set) var prefillModel: MLModel?
+    public private(set) var prefillModel: MLModel?
 
     /// Stored for on-demand prefill reloading.
     private let modelURL: URL
     private let computeUnits: MLComputeUnits
 
     /// Logits output name for each function.
-    let decodeLogitsName: String
-    let prefillLogitsName: String
+    public let decodeLogitsName: String
+    public let prefillLogitsName: String
 
     /// Token input name for each function.
-    let decodeTokenInputName: String
-    let prefillTokenInputName: String
+    public let decodeTokenInputName: String
+    public let prefillTokenInputName: String
 
     /// Position input name for each function.
-    let decodePositionInputName: String
-    let prefillPositionInputName: String
+    public let decodePositionInputName: String
+    public let prefillPositionInputName: String
 
     /// "N" phantom input name (global cache dim), nil for fixed-shape models.
-    let decodeNInputName: String?
-    let prefillNInputName: String?
+    public let decodeNInputName: String?
+    public let prefillNInputName: String?
 
     /// KV cache input/output names, in matched order.
-    let decodeKVInputNames: [String]
-    let decodeKVOutputNames: [String]
-    let prefillKVInputNames: [String]
-    let prefillKVOutputNames: [String]
+    public let decodeKVInputNames: [String]
+    public let decodeKVOutputNames: [String]
+    public let prefillKVInputNames: [String]
+    public let prefillKVOutputNames: [String]
 
     /// Global KV input names that have flexible (RangeDim) shapes.
-    let globalKVInputNames: Set<String>
+    public let globalKVInputNames: Set<String>
 
     /// Prefill input descriptions for KV cache initialization.
     /// Extracted once so the prefill model can be released between uses.
-    let prefillInputDescriptions: [String: MLFeatureDescription]
+    public let prefillInputDescriptions: [String: MLFeatureDescription]
 
     private init(
         decodeModel: MLModel,
@@ -80,46 +81,54 @@ final class CoreMLModel: @unchecked Sendable {
         self.globalKVInputNames = globalKVInputNames
     }
 
-    /// Load the multifunction model from the app bundle.
+    /// Load the multifunction model from a .mlpackage or .mlmodelc URL.
     ///
-    /// The .mlpackage is bundled as a folder reference (not compiled by Xcode)
-    /// because `coremlc` strips multifunction metadata. We compile at runtime
-    /// via `MLModel.compileModel(at:)`, cache the result, and load with `functionName`.
-    static func load(
+    /// For .mlpackage files, the model is compiled and cached as .mlmodelc
+    /// next to the source for fast subsequent loads (E5RT cache reuse).
+    /// For .mlmodelc files, loads directly without recompilation.
+    public static func load(
+        from url: URL,
         computeUnits: MLComputeUnits = .cpuAndGPU
     ) async throws -> CoreMLModel {
-        guard let url = Bundle.main.url(forResource: "gemma4-e2b", withExtension: "mlpackage") else {
-            throw CoreMLModelError.modelNotFound
+        let modelURL: URL
+
+        if url.pathExtension == "mlpackage" {
+            // Compile and cache alongside the .mlpackage
+            let cachedURL = url.deletingPathExtension().appendingPathExtension("mlmodelc")
+            modelURL = try await compileAndCache(source: url, cached: cachedURL)
+        } else {
+            // Already compiled (.mlmodelc)
+            modelURL = url
         }
 
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let cachedURL = appSupport.appendingPathComponent("gemma4-e2b.mlmodelc")
+        return try await loadCompiled(from: modelURL, computeUnits: computeUnits)
+    }
 
-        // Invalidate cache if source model is newer than cached compilation
-        if FileManager.default.fileExists(atPath: cachedURL.path) {
-            let srcDate = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? .distantPast
-            let cacheDate = (try? FileManager.default.attributesOfItem(atPath: cachedURL.path)[.modificationDate] as? Date) ?? .distantFuture
+    /// Compile .mlpackage → .mlmodelc, caching at `cached` path.
+    private static func compileAndCache(source: URL, cached: URL) async throws -> URL {
+        // Invalidate cache if source model is newer
+        if FileManager.default.fileExists(atPath: cached.path) {
+            let srcDate = (try? FileManager.default.attributesOfItem(atPath: source.path)[.modificationDate] as? Date) ?? .distantPast
+            let cacheDate = (try? FileManager.default.attributesOfItem(atPath: cached.path)[.modificationDate] as? Date) ?? .distantFuture
             if srcDate > cacheDate {
                 print("[CoreML] Source model newer than cache — recompiling")
-                try? FileManager.default.removeItem(at: cachedURL)
+                try? FileManager.default.removeItem(at: cached)
             }
         }
 
-        let modelURL: URL
-        if FileManager.default.fileExists(atPath: cachedURL.path) {
-            print("[CoreML] Using cached compiled model at \(cachedURL.path)")
-            modelURL = cachedURL
-        } else {
-            print("[CoreML] Compiling \(url.lastPathComponent)...")
-            let compiledURL = try await MLModel.compileModel(at: url)
-            print("[CoreML] Compiled to \(compiledURL.path)")
-
-            try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
-            try? FileManager.default.moveItem(at: compiledURL, to: cachedURL)
-            modelURL = FileManager.default.fileExists(atPath: cachedURL.path) ? cachedURL : compiledURL
+        if FileManager.default.fileExists(atPath: cached.path) {
+            print("[CoreML] Using cached compiled model at \(cached.path)")
+            return cached
         }
 
-        return try await load(from: modelURL, computeUnits: computeUnits)
+        print("[CoreML] Compiling \(source.lastPathComponent)...")
+        let compiledURL = try await MLModel.compileModel(at: source)
+        print("[CoreML] Compiled to \(compiledURL.path)")
+
+        // Move compiled model to cache location
+        try? FileManager.default.removeItem(at: cached)
+        try? FileManager.default.moveItem(at: compiledURL, to: cached)
+        return FileManager.default.fileExists(atPath: cached.path) ? cached : compiledURL
     }
 
     /// Load a pre-compiled multifunction .mlmodelc.
@@ -127,9 +136,9 @@ final class CoreMLModel: @unchecked Sendable {
     /// Only the decode model is loaded with full compute units.  The prefill
     /// model is loaded temporarily with `.cpuOnly` to extract I/O metadata,
     /// then released immediately.  Call ``loadPrefill()`` before ``prefill()``.
-    static func load(
+    private static func loadCompiled(
         from url: URL,
-        computeUnits: MLComputeUnits = .cpuAndGPU
+        computeUnits: MLComputeUnits
     ) async throws -> CoreMLModel {
         print("[CoreML] Loading decode function from \(url.lastPathComponent)...")
 
@@ -141,16 +150,14 @@ final class CoreMLModel: @unchecked Sendable {
         print("[CoreML] Decode loaded. Inputs: \(Array(decodeModel.modelDescription.inputDescriptionsByName.keys).sorted())")
 
         // Load prefill with cpuOnly just to extract I/O metadata.
-        // This avoids the memory cost of GPU/ANE compilation for a model
-        // we won't run predictions on until loadPrefill() is called.
         print("[CoreML] Extracting prefill I/O metadata (cpuOnly)...")
         let prefillConfig = MLModelConfiguration()
         prefillConfig.computeUnits = .cpuOnly
         prefillConfig.functionName = "prefill"
         let tempPrefill = try await MLModel.load(contentsOf: url, configuration: prefillConfig)
 
-        let decodeIO = Self.classifyIO(model: decodeModel)
-        let prefillIO = Self.classifyIO(model: tempPrefill)
+        let decodeIO = classifyIO(model: decodeModel)
+        let prefillIO = classifyIO(model: tempPrefill)
         let prefillInputDescs = tempPrefill.modelDescription.inputDescriptionsByName
 
         print("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count)")
@@ -160,7 +167,7 @@ final class CoreMLModel: @unchecked Sendable {
         }
 
         // Detect global KV inputs with flexible shapes (RangeDim).
-        let globalNames = Self.detectFlexibleGlobalKV(
+        let globalNames = detectFlexibleGlobalKV(
             model: decodeModel, kvInputNames: decodeIO.kvInputNames
         )
         if !globalNames.isEmpty {
@@ -181,7 +188,7 @@ final class CoreMLModel: @unchecked Sendable {
 
     /// Load the prefill model with target compute units.
     /// Call before using ``prefill()``.  No-op if already loaded.
-    func loadPrefill() async throws {
+    public func loadPrefill() async throws {
         guard prefillModel == nil else { return }
         print("[CoreML] Loading prefill model on demand...")
         let config = MLModelConfiguration()
@@ -193,7 +200,7 @@ final class CoreMLModel: @unchecked Sendable {
 
     /// Release the prefill model to free memory (~4-5 GB).
     /// Call after the prefill phase when only decode is needed.
-    func releasePrefill() {
+    public func releasePrefill() {
         guard prefillModel != nil else { return }
         prefillModel = nil
         print("[CoreML] Prefill model released.")
@@ -202,13 +209,7 @@ final class CoreMLModel: @unchecked Sendable {
     // MARK: - Prediction
 
     /// Run one prefill chunk.
-    /// - Parameters:
-    ///   - tokens: Int32 array of shape (1, CHUNK_SIZE)
-    ///   - seqLen: start position for this chunk
-    ///   - kvState: current KV cache state
-    ///   - globalCacheSize: current global KV cache dim (for N input), nil for fixed models
-    /// - Returns: (logits as MLMultiArray, updated KVCacheState)
-    func prefill(
+    public func prefill(
         tokens: MLMultiArray,
         seqLen: Int32,
         kvState: KVCacheState,
@@ -241,13 +242,7 @@ final class CoreMLModel: @unchecked Sendable {
     }
 
     /// Run one decode step.
-    /// - Parameters:
-    ///   - token: single token ID
-    ///   - position: absolute position in the sequence
-    ///   - kvState: current KV cache state
-    ///   - globalCacheSize: current global KV cache dim (for N input), nil for fixed models
-    /// - Returns: (logits as MLMultiArray, updated KVCacheState)
-    func decode(
+    public func decode(
         token: Int32,
         position: Int32,
         kvState: KVCacheState,
@@ -279,21 +274,17 @@ final class CoreMLModel: @unchecked Sendable {
     // MARK: - I/O Classification
 
     /// Classified I/O names for a model function.
-    private struct ClassifiedIO {
+    struct ClassifiedIO {
         let logitsOutputName: String
-        let tokenInputName: String      // "tokens" (prefill) or "token_id" (decode)
-        let positionInputName: String   // "start_position" (prefill) or "position" (decode)
-        let nInputName: String?         // "N" for dynamic-shape models, nil otherwise
-        let kvInputNames: [String]      // KV cache + ring tracker inputs, naturally sorted
-        let kvOutputNames: [String]     // KV cache + ring tracker outputs, naturally sorted
+        let tokenInputName: String
+        let positionInputName: String
+        let nInputName: String?
+        let kvInputNames: [String]
+        let kvOutputNames: [String]
     }
 
     /// Classify model I/O using name matching with positional fallback.
-    ///
-    /// Primary: if an input name also appears as a non-logits output, it's state.
-    /// Fallback (old models with _argN naming): positional split based on
-    /// state output count.
-    private static func classifyIO(model: MLModel) -> ClassifiedIO {
+    static func classifyIO(model: MLModel) -> ClassifiedIO {
         let inputDescs = model.modelDescription.inputDescriptionsByName
         let outputDescs = model.modelDescription.outputDescriptionsByName
 
@@ -309,7 +300,7 @@ final class CoreMLModel: @unchecked Sendable {
         }
         kvOutputs.sort { naturalCompare($0, $1) }
 
-        // Try name matching: input name ∈ output names (exact or with _out suffix) → state
+        // Try name matching: input name ∈ output names → state
         let stateOutputSet = Set(kvOutputs)
         var controlInputs: [String] = []
         var kvInputs: [String] = []
@@ -321,8 +312,7 @@ final class CoreMLModel: @unchecked Sendable {
             }
         }
 
-        // Fallback: if name matching found no state inputs (old _argN naming),
-        // use positional split
+        // Fallback: if name matching found no state inputs, use positional split
         if kvInputs.isEmpty && !kvOutputs.isEmpty {
             let allInputs = Array(inputDescs.keys).sorted { naturalCompare($0, $1) }
             let stateCount = kvOutputs.count
@@ -338,9 +328,7 @@ final class CoreMLModel: @unchecked Sendable {
         assert(kvInputs.count == kvOutputs.count,
                "State input count (\(kvInputs.count)) != output count (\(kvOutputs.count))")
 
-        // Identify token vs position among control inputs,
-        // and detect the optional N (global cache dim) input.
-        let (tokenName, posName, nName) = Self.identifyControlInputs(
+        let (tokenName, posName, nName) = identifyControlInputs(
             controlInputs, inputDescs: inputDescs
         )
 
@@ -362,7 +350,6 @@ final class CoreMLModel: @unchecked Sendable {
         precondition(names.count == 2 || names.count == 3,
                      "Expected 2 or 3 control inputs, got \(names.count): \(names)")
 
-        // Detect N input by name first (shape (1,) Int32, named "N")
         var nName: String? = nil
         var remaining = names
         if let idx = names.firstIndex(of: "N") {
@@ -393,7 +380,6 @@ final class CoreMLModel: @unchecked Sendable {
     }
 
     /// Detect KV inputs with flexible shapes (RangeDim) on dim 1.
-    /// These are global attention caches that can grow dynamically.
     private static func detectFlexibleGlobalKV(
         model: MLModel,
         kvInputNames: [String]
@@ -402,7 +388,6 @@ final class CoreMLModel: @unchecked Sendable {
         for name in kvInputNames {
             guard let desc = model.modelDescription.inputDescriptionsByName[name],
                   let constraint = desc.multiArrayConstraint else { continue }
-            // RangeDim → shapeConstraint.type == .range
             if constraint.shapeConstraint.type == .range {
                 flex.insert(name)
             }
@@ -410,9 +395,8 @@ final class CoreMLModel: @unchecked Sendable {
         return flex
     }
 
-    /// Natural string comparison: numeric segments are compared by value,
-    /// so "_arg2" < "_arg10".
-    private static func naturalCompare(_ a: String, _ b: String) -> Bool {
+    /// Natural string comparison: numeric segments are compared by value.
+    static func naturalCompare(_ a: String, _ b: String) -> Bool {
         let aComponents = splitNumeric(a)
         let bComponents = splitNumeric(b)
         for (ac, bc) in zip(aComponents, bComponents) {
@@ -464,7 +448,7 @@ final class CoreMLModel: @unchecked Sendable {
 // MARK: - Input Provider
 
 /// Custom MLFeatureProvider that combines token/position inputs with KV cache arrays.
-private final class CoreMLInputProvider: MLFeatureProvider {
+final class CoreMLInputProvider: MLFeatureProvider {
     let featureNames: Set<String>
     private var values: [String: MLFeatureValue]
 
@@ -497,14 +481,14 @@ private final class CoreMLInputProvider: MLFeatureProvider {
 
 extension MLMultiArray {
     /// Create a single-element Int32 MLMultiArray.
-    static func int32Scalar(_ value: Int32) -> MLMultiArray {
+    public static func int32Scalar(_ value: Int32) -> MLMultiArray {
         let array = try! MLMultiArray(shape: [1], dataType: .int32)
         array[0] = NSNumber(value: value)
         return array
     }
 
     /// Create an Int32 array of shape (1, length) from a Swift array.
-    static func int32Row(_ values: [Int32]) -> MLMultiArray {
+    public static func int32Row(_ values: [Int32]) -> MLMultiArray {
         let array = try! MLMultiArray(shape: [1, NSNumber(value: values.count)], dataType: .int32)
         let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: values.count)
         for (i, v) in values.enumerated() { ptr[i] = v }
@@ -514,14 +498,14 @@ extension MLMultiArray {
 
 // MARK: - Errors
 
-enum CoreMLModelError: Error, LocalizedError {
+public enum CoreMLModelError: Error, LocalizedError {
     case modelNotFound
     case prefillNotLoaded
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .modelNotFound:
-            "gemma4-e2b.mlpackage not found in app bundle"
+            "Model not found at the specified path"
         case .prefillNotLoaded:
             "Prefill model not loaded. Call loadPrefill() first."
         }

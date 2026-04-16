@@ -3,36 +3,32 @@
 /// Holds KV arrays keyed by model input name, matching the multifunction
 /// model's I/O contract. Uses positional matching between outputs and inputs
 /// since input names (_argN) differ from output names (cast_N/slice_update_N).
-///
-/// Uses name-based keying (matching Python's dict approach) to avoid
-/// dependency on dictionary ordering, which isn't guaranteed in Swift.
 
 import CoreML
 import Foundation
 
 /// Immutable snapshot of the KV cache state.
 /// Each prediction returns a new KVCacheState with updated arrays.
-struct KVCacheState: @unchecked Sendable {
+public struct KVCacheState: @unchecked Sendable {
     /// KV arrays keyed by their model input name.
-    /// E.g. {"flat_kv_0": array, "flat_kv_1": array, ...}
-    let arraysByName: [String: MLMultiArray]
+    public let arraysByName: [String: MLMultiArray]
 
     /// Ordered input names (declaration order from model spec).
-    let inputNames: [String]
+    public let inputNames: [String]
 
     /// Number of tokens that have been processed into this cache.
-    let processedTokens: Int
+    public let processedTokens: Int
 
     /// Names of KV inputs with flexible (RangeDim) shapes — the global caches.
-    let globalNames: Set<String>
+    public let globalNames: Set<String>
 
     /// Access arrays in input-name order (for positional compatibility).
-    var arrays: [MLMultiArray] {
+    public var arrays: [MLMultiArray] {
         inputNames.map { arraysByName[$0]! }
     }
 
     /// Current dim-1 size of global caches, or nil if none.
-    var currentGlobalCacheSize: Int? {
+    public var currentGlobalCacheSize: Int? {
         for name in globalNames {
             if let arr = arraysByName[name] {
                 return arr.shape[1].intValue
@@ -41,10 +37,22 @@ struct KVCacheState: @unchecked Sendable {
         return nil
     }
 
+    public init(
+        arraysByName: [String: MLMultiArray],
+        inputNames: [String],
+        processedTokens: Int,
+        globalNames: Set<String>
+    ) {
+        self.arraysByName = arraysByName
+        self.inputNames = inputNames
+        self.processedTokens = processedTokens
+        self.globalNames = globalNames
+    }
+
     /// Create an empty state from the model's input descriptions.
     /// Global caches are sized to `initialGlobalSize` instead of the spec shape.
     /// Float16 arrays are zero-filled; Int32 arrays are filled with -1.
-    static func empty(
+    public static func empty(
         kvInputNames: [String],
         inputDescriptions: [String: MLFeatureDescription],
         globalNames: Set<String> = [],
@@ -85,7 +93,7 @@ struct KVCacheState: @unchecked Sendable {
     ///
     /// Maps output names → input names by position, rebuilding
     /// the name-keyed dictionary for the next call.
-    static func from(
+    public static func from(
         prediction: MLFeatureProvider,
         outputNames: [String],
         inputNames: [String],
@@ -98,7 +106,7 @@ struct KVCacheState: @unchecked Sendable {
         var dict: [String: MLMultiArray] = [:]
         dict.reserveCapacity(inputNames.count)
 
-        // Probe first name to decide matching strategy (avoid full allSatisfy scan)
+        // Probe first name to decide matching strategy
         let useNameMatching = !inputNames.isEmpty
             && prediction.featureValue(for: inputNames[0])?.multiArrayValue != nil
 
@@ -125,14 +133,14 @@ struct KVCacheState: @unchecked Sendable {
     }
 
     /// Create a new KVCacheState with an updated processedTokens count.
-    func withProcessedTokens(_ count: Int) -> KVCacheState {
+    public func withProcessedTokens(_ count: Int) -> KVCacheState {
         KVCacheState(arraysByName: arraysByName, inputNames: inputNames,
                      processedTokens: count, globalNames: globalNames)
     }
 
     /// Grow global caches so dim-1 >= `needed` using a doubling strategy.
     /// Returns self unchanged if no growth is required or if there are no global caches.
-    func grownToFit(needed: Int, maxLen: Int) -> KVCacheState {
+    public func grownToFit(needed: Int, maxLen: Int) -> KVCacheState {
         guard !globalNames.isEmpty else { return self }
         guard let curSize = currentGlobalCacheSize, curSize < needed else { return self }
 

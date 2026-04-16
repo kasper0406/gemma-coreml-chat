@@ -1,5 +1,6 @@
 /// Main chat interface with message list, streaming display, and input bar.
 
+import GemmaCore
 import SwiftUI
 
 struct ChatView: View {

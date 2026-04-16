@@ -4,67 +4,62 @@
 
 Run **Google Gemma 4 E2B** locally on **Apple Silicon** via **CoreML**.
 
-This project re-implements the Gemma 4 transformer in **JAX/Flax**, exports it to a CoreML `.mlpackage` through **StableHLO**, and provides a **terminal chat UI** for interactive inference — no cloud APIs, everything runs on-device.
+This project re-implements the Gemma 4 transformer in **JAX/Flax**, exports it to a CoreML `.mlpackage` through **StableHLO**, and provides both a **Swift CLI chat** and an **iOS app** for interactive inference — no cloud APIs, everything runs on-device.
 
 ## Quickstart
 
 ```bash
-# 1. Install dependencies
+# 1. Install Python dependencies (export only)
 uv sync
 
 # 2. Export the model to CoreML (one-time, ~10-30 min)
 uv run gemma-export
 
-# 3. Chat!
-uv run gemma-chat
+# 3. Build and run the Swift CLI chat
+cd cli && swift build -c release
+.build/release/GemmaChatCLI --model ../gemma4-e2b.mlpackage
 ```
 
 > **Prerequisites:** macOS on Apple Silicon and access to `google/gemma-4-E2B-it` on [Hugging Face](https://huggingface.co/google/gemma-4-E2B-it) (accept the model license first).
 
-## How it works
+## Architecture
 
-**Step 1 — Export** (`gemma-export`, run once):
+### Phase 1 — Export (Python, run once)
 
-`weight_mapper.py` downloads the HF checkpoint, `model.py` defines the full transformer in JAX/Flax, and `export.py` traces it via `jax.jit` → StableHLO → CoreML MIL, producing a single multifunction `.mlpackage` with both **chunked prefill** and **KV-cached decode** functions.
+`uv run gemma-export` downloads HF weights, defines the full transformer in JAX/Flax, and traces it via `jax.jit` → StableHLO → CoreML MIL, producing a single multifunction `.mlpackage` with both **chunked prefill** and **KV-cached decode** functions.
 
-**Step 2 — Chat** (`gemma-chat`):
+### Phase 2 — Inference (Swift)
 
-Loads the `.mlpackage`, runs autoregressive inference with KV caching, and provides a Textual-based terminal UI with streaming tokens, conversation history, and token counts.
+All inference runs through native Swift for ~20x faster model loading vs Python coremltools:
 
-## Usage details
+- **GemmaCore/** — Shared Swift Package (SPM library) with model loading, KV cache management, tokenization, and the inference engine
+- **cli/** — Swift CLI chat app using GemmaCore
+- **ios/GemmaChat/** — iOS SwiftUI chat app using GemmaCore
 
-**Export options:**
+## Usage
+
+### Export options
 
 ```bash
-uv run gemma-export                            # multifunction .mlpackage with shared int4 weights
+uv run gemma-export                            # multifunction .mlpackage with shared int8 weights
 uv run gemma-export --decode-only              # decode only (no prefill)
 uv run gemma-export --separate                 # separate decode + prefill .mlpackage files
 ```
 
-**Chat options:**
+### Swift CLI chat
 
 ```bash
-uv run gemma-chat                             # uses gemma4-e2b.mlpackage (default)
-uv run gemma-chat --compute-units cpu-only   # faster first-load compilation for iteration
-uv run gemma-chat --model path/to/model.mlpackage
-uv run gemma-chat --backend jax               # use JAX/Flax weights directly (for comparison)
+cd cli && swift build -c release
+.build/release/GemmaChatCLI --model ../gemma4-e2b.mlpackage
 ```
 
-In the TUI: `/quit` or `/exit` to leave, `/reset` to clear history, `/help` for commands.
+In the CLI: `/quit` to exit, `/reset` to clear history, `/help` for commands. The tokenizer is auto-downloaded from HuggingFace on first use.
 
-**Compute units:**
+### iOS app
 
-By default, `uv run gemma-chat` uses `--compute-units all`, which targets CPU, GPU, and ANE for the best runtime performance. First-load compilation is much slower in that mode (~10–30 min).
+The iOS app lives in `ios/GemmaChat/` and uses the same `GemmaCore` Swift package. The Xcode build phase automatically downloads `tokenizer.json` (~31 MB) from HuggingFace on first build.
 
-For faster development iteration, use `--compute-units cpu-only`:
-
-```bash
-uv run gemma-chat --compute-units cpu-only
-```
-
-That usually compiles in seconds, but inference is slower than `all`.
-
-**Diagnostics:**
+### Diagnostics
 
 ```bash
 # A/B: full model vs KV decode (greedy)
@@ -74,11 +69,15 @@ uv run gemma-compare-inference --prompt "Hi"
 uv run gemma-parity-decode --max-tokens 8
 ```
 
-## iOS app
+## Project structure
 
-An iOS SwiftUI chat app lives in `ios/GemmaChat/`. It uses the same exported `.mlpackage` for on-device inference.
-
-**First build:** The Xcode build phase automatically downloads `tokenizer.json` (~31 MB) from HuggingFace if it isn't already present. This requires network access once; subsequent builds are offline.
+```
+GemmaCore/          Swift Package — shared inference library (model loading, KV cache, tokenizer, engine)
+cli/                Swift CLI chat app (readline-based, streaming output)
+ios/GemmaChat/      iOS SwiftUI chat app
+gemma_chat/         Python export pipeline (JAX → StableHLO → CoreML)
+benchmarks/         Swift model loading benchmarks
+```
 
 ## License
 
