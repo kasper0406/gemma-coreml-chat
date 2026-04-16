@@ -49,7 +49,7 @@ final class ChatViewModel {
     private var prefillDebounceTask: Task<Void, Never>?
 
     private func handleMemoryWarning() {
-        print("[Memory] Received memory warning")
+        Log.info("[Memory] Received memory warning")
         if isGenerating {
             cancelGeneration()
             messages.append(ChatMessage(

@@ -127,7 +127,7 @@ actor EagerPrefillManager {
             let isValid = newTokens.count >= prefillBoundary
                 && Array(newTokens.prefix(prefillBoundary)) == Array(prefillTokens.prefix(prefillBoundary))
             if !isValid {
-                print("[Perf] Prefix changed — resetting eager prefill")
+                Log.info("[Perf] Prefix changed — resetting eager prefill")
                 reset()
             }
         }
@@ -156,7 +156,7 @@ actor EagerPrefillManager {
     ) async throws -> (promptIDs: [Int32], kvState: KVCacheState, prefillOffset: Int) {
         // Wait for any in-flight prefill to complete
         if isPrefilling {
-            print("[Perf] finishPrefill: waiting for in-flight eager prefill...")
+            Log.info("[Perf] finishPrefill: waiting for in-flight eager prefill...")
         }
         while isPrefilling {
             try await Task.sleep(for: .milliseconds(10))
@@ -179,7 +179,7 @@ actor EagerPrefillManager {
 
         if isValid && completedChunks > 0 {
             // Prefill is still valid — engine only needs to process remaining chunks
-            print("[Perf] finishPrefill: reusing \(completedChunks) eager chunks (\(prefillBoundary)/\(finalTokens.count) tokens)")
+            Log.info("[Perf] finishPrefill: reusing \(completedChunks) eager chunks (\(prefillBoundary)/\(finalTokens.count) tokens)")
             status = .ready(chunks: completedChunks)
             let result = (promptIDs, kvState, prefillBoundary)
             // Release internal state — the engine now owns the KV cache
@@ -187,7 +187,7 @@ actor EagerPrefillManager {
             return result
         } else {
             // Prefill invalidated — engine does full prefill
-            print("[Perf] finishPrefill: eager prefill invalid, full re-prefill (\(finalTokens.count) tokens)")
+            Log.info("[Perf] finishPrefill: eager prefill invalid, full re-prefill (\(finalTokens.count) tokens)")
             status = .idle
             clearInternalState()
             return (
@@ -227,7 +227,7 @@ actor EagerPrefillManager {
         isPrefilling = true
         let startChunk = completedChunks
         let totalToProcess = upToChunk - startChunk
-        print("[Perf] Eager prefill: \(totalToProcess) chunks (\(startChunk)..<\(upToChunk))")
+        Log.info("[Perf] Eager prefill: \(totalToProcess) chunks (\(startChunk)..<\(upToChunk))")
         let batchStart = CFAbsoluteTimeGetCurrent()
 
         // Size/grow global caches to fit all chunks we're about to process
@@ -268,10 +268,10 @@ actor EagerPrefillManager {
 
                 let chunkTime = CFAbsoluteTimeGetCurrent() - chunkStart
                 let chunkNum = chunkIdx - startChunk + 1
-                print("[Perf] Eager chunk \(chunkNum)/\(totalToProcess) (pos=\(start)): \(String(format: "%.2f", chunkTime))s")
+                Log.info("[Perf] Eager chunk \(chunkNum)/\(totalToProcess) (pos=\(start)): \(String(format: "%.2f", chunkTime))s")
             }
             let totalTime = CFAbsoluteTimeGetCurrent() - batchStart
-            print("[Perf] Eager prefill done: \(totalToProcess) chunks in \(String(format: "%.1f", totalTime))s")
+            Log.info("[Perf] Eager prefill done: \(totalToProcess) chunks in \(String(format: "%.1f", totalTime))s")
             status = .ready(chunks: completedChunks)
         } catch {
             status = .error(error.localizedDescription)
