@@ -659,6 +659,7 @@ def export_decode_step(
 
 def _embed_tokenizer(model_id: str, mlpackage_path: Path) -> None:
     """Download tokenizer files from HuggingFace and embed them into the .mlpackage."""
+    import json
     import shutil as _shutil
     from huggingface_hub import hf_hub_download
 
@@ -671,6 +672,11 @@ def _embed_tokenizer(model_id: str, mlpackage_path: Path) -> None:
         _shutil.copy2(local, dst)
         sz = dst.stat().st_size
         print(f"  Embedded {fname} ({sz / 1e6:.1f} MB)")
+
+    # swift-transformers requires config.json with model_type to load the tokenizer
+    config_path = tok_dir / "config.json"
+    config_path.write_text(json.dumps({"model_type": "gemma"}, indent=2))
+    print(f"  Wrote config.json (model_type=gemma)")
 
     print(f"  Tokenizer stored in {tok_dir}/")
 

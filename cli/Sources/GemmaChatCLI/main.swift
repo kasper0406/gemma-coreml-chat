@@ -20,7 +20,7 @@ struct GemmaChatCLI {
         printHeader()
 
         // --- Load model ---
-        let modelURL = URL(fileURLWithPath: modelPath)
+        let modelURL = URL(fileURLWithPath: modelPath).standardizedFileURL
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             print("Error: model not found at \(modelPath)")
             return
