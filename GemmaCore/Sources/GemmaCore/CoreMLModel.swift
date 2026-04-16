@@ -134,9 +134,10 @@ public final class CoreMLModel: @unchecked Sendable {
 
     /// Load a pre-compiled multifunction .mlmodelc.
     ///
-    /// Only the decode model is loaded with full compute units.  The prefill
-    /// model is loaded temporarily with `.cpuOnly` to extract I/O metadata,
-    /// then released immediately.  Call ``loadPrefill()`` before ``prefill()``.
+    /// Both decode and prefill functions are loaded with the requested
+    /// compute units.  The prefill model is kept in memory initially but
+    /// can be released via ``releasePrefill()`` and reloaded on demand
+    /// with ``loadPrefill()``.
     private static func loadCompiled(
         from url: URL,
         computeUnits: MLComputeUnits

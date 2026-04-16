@@ -3,6 +3,8 @@
 /// Usage:
 ///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage
 ///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage --compute-units all
+///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage --verbose
+///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage --log-file /tmp/gemma.log
 ///
 /// Commands: /reset  /quit  /help
 
@@ -10,12 +12,20 @@ import CoreML
 import Foundation
 import GemmaCore
 
+/// Known CLI flags and which ones consume the next argument as a value.
+private let knownFlags: Set<String> = ["--model", "--compute-units", "--verbose", "--log-file"]
+private let flagsWithValue: Set<String> = ["--model", "--compute-units", "--log-file"]
+
 @main
 struct GemmaChatCLI {
     static func main() async {
         let args = ProcessInfo.processInfo.arguments
         let modelPath = parseArg(args, flag: "--model") ?? "./gemma4-e2b.mlpackage"
         let computeUnits = parseComputeUnits(args)
+
+        // --- Configure logging ---
+        configureLogging(args)
+        warnUnknownFlags(args)
 
         printHeader()
 
@@ -105,6 +115,7 @@ struct GemmaChatCLI {
             fflush(stdout)
 
             var responseTokens: [Int32] = []
+            let genStart = CFAbsoluteTimeGetCurrent()
             let stream = engine.generate(promptIDs: promptIDs.map { Int32($0) }, maxNewTokens: 1024)
 
             for await tokenID in stream {
@@ -122,11 +133,55 @@ struct GemmaChatCLI {
                 }
             }
 
+            let genTime = CFAbsoluteTimeGetCurrent() - genStart
+            let tokPerSec = genTime > 0 ? Double(responseTokens.count) / genTime : 0
+
             let responseText = tokenizer.decode(responseTokens.map { Int($0) })
-            print("\n")
+            print("\n[\(responseTokens.count) tokens, \(String(format: "%.1f", tokPerSec)) tok/s]\n")
 
             // Add assistant response to history
             history.append(ChatMessage(role: .assistant, content: responseText))
+        }
+    }
+
+    // MARK: - Logging
+
+    /// Configure `Log.destination` from CLI flags.
+    /// Default: suppressed. `--verbose`: stderr. `--log-file <path>`: file.
+    static func configureLogging(_ args: [String]) {
+        if let logPath = parseArg(args, flag: "--log-file") {
+            let url = URL(fileURLWithPath: logPath)
+            // Create or truncate the log file
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            if let handle = FileHandle(forWritingAtPath: url.path) {
+                handle.seekToEndOfFile()
+                Log.destination = .file(handle)
+                return
+            } else {
+                print("Warning: cannot open log file '\(logPath)', logging disabled")
+            }
+        }
+
+        if args.contains("--verbose") {
+            Log.destination = .stderr
+        } else {
+            Log.destination = .none
+        }
+    }
+
+    /// Warn about unrecognized `--flags` to catch typos.
+    static func warnUnknownFlags(_ args: [String]) {
+        var i = 1  // skip argv[0]
+        while i < args.count {
+            let arg = args[i]
+            if arg.hasPrefix("--") {
+                if knownFlags.contains(arg) {
+                    if flagsWithValue.contains(arg) { i += 1 }  // skip value
+                } else {
+                    print("Warning: unknown flag '\(arg)'")
+                }
+            }
+            i += 1
         }
     }
 
@@ -180,6 +235,8 @@ struct GemmaChatCLI {
         CLI flags:
           --model <path>           Path to .mlpackage or .mlmodelc
           --compute-units <units>  all | cpu-and-gpu (default) | cpu-only | cpu-and-ne
+          --verbose                Show diagnostic logs on stderr
+          --log-file <path>        Write diagnostic logs to a file
         
         The tokenizer is loaded from the .mlpackage (embedded during export).
         Re-export with `uv run gemma-export` if missing.
