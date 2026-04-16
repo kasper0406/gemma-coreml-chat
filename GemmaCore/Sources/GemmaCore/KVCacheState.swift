@@ -93,6 +93,7 @@ public struct KVCacheState: @unchecked Sendable {
     ///
     /// Maps output names → input names by position, rebuilding
     /// the name-keyed dictionary for the next call.
+    /// Deep-copies each array because CoreML reuses output buffers.
     public static func from(
         prediction: MLFeatureProvider,
         outputNames: [String],
@@ -112,7 +113,7 @@ public struct KVCacheState: @unchecked Sendable {
 
         if useNameMatching {
             for name in inputNames {
-                dict[name] = prediction.featureValue(for: name)!.multiArrayValue!
+                dict[name] = prediction.featureValue(for: name)!.multiArrayValue!.deepCopy()
             }
         } else {
             // Positional: output[i] → input[i]
@@ -120,7 +121,7 @@ public struct KVCacheState: @unchecked Sendable {
                 guard let value = prediction.featureValue(for: outName)?.multiArrayValue else {
                     fatalError("Missing KV output tensor: \(outName)")
                 }
-                dict[inName] = value
+                dict[inName] = value.deepCopy()
             }
         }
 
@@ -145,7 +146,7 @@ public struct KVCacheState: @unchecked Sendable {
         guard let curSize = currentGlobalCacheSize, curSize < needed else { return self }
 
         let newLen = min(max(curSize * 2, needed), maxLen)
-        print("[KV] Growing global caches: \(curSize) → \(newLen) (needed \(needed))")
+        Log.info("[KV] Growing global caches: \(curSize) → \(newLen) (needed \(needed))")
 
         var newDict = arraysByName
         for name in globalNames {

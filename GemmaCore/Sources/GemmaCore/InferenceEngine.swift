@@ -41,7 +41,7 @@ public struct InferenceEngine: Sendable {
                     )
                     let nReal = ids.count
                     let nChunks = (nReal + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
-                    print("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks, prefillOffset=\(prefillOffset)")
+                    Log.info("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks, prefillOffset=\(prefillOffset)")
 
                     try await self.model.loadPrefill()
 
@@ -78,7 +78,7 @@ public struct InferenceEngine: Sendable {
                         (logits, kvState) = try self.fullPrefill(ids: ids)
                     }
                     let prefillTime = CFAbsoluteTimeGetCurrent() - prefillStart
-                    print("[Perf] Prefill done: \(String(format: "%.2f", prefillTime))s")
+                    Log.info("[Perf] Prefill done: \(String(format: "%.2f", prefillTime))s")
 
                     self.model.releasePrefill()
 
@@ -140,11 +140,11 @@ public struct InferenceEngine: Sendable {
                         decodeSteps += 1
 
                         if step < 3 {
-                            print("[Perf] Step \(step): sample=\(String(format: "%.3f", sampleTime))s, decode=\(String(format: "%.3f", decTime))s")
+                            Log.info("[Perf] Step \(step): sample=\(String(format: "%.3f", sampleTime))s, decode=\(String(format: "%.3f", decTime))s")
                         } else if (step + 1) % 10 == 0 {
                             let avgSample = totalSampleTime / Double(step + 1)
                             let avgDecode = totalDecodeTime / Double(decodeSteps)
-                            print("[Perf] Step \(step): avg sample=\(String(format: "%.3f", avgSample))s, avg decode=\(String(format: "%.3f", avgDecode))s")
+                            Log.info("[Perf] Step \(step): avg sample=\(String(format: "%.3f", avgSample))s, avg decode=\(String(format: "%.3f", avgDecode))s")
                         }
 
                         currentLogits = decLogits
@@ -153,9 +153,9 @@ public struct InferenceEngine: Sendable {
 
                     let totalTime = CFAbsoluteTimeGetCurrent() - genStart
                     let tokPerSec = decodeSteps > 0 ? Double(decodeSteps) / totalDecodeTime : 0
-                    print("[Perf] Done: \(decodeSteps) tokens in \(String(format: "%.1f", totalTime))s (prefill=\(String(format: "%.1f", prefillTime))s, decode=\(String(format: "%.1f", totalDecodeTime))s, sample=\(String(format: "%.2f", totalSampleTime))s) \(String(format: "%.2f", tokPerSec)) tok/s")
+                    Log.info("[Perf] Done: \(decodeSteps) tokens in \(String(format: "%.1f", totalTime))s (prefill=\(String(format: "%.1f", prefillTime))s, decode=\(String(format: "%.1f", totalDecodeTime))s, sample=\(String(format: "%.2f", totalSampleTime))s) \(String(format: "%.2f", tokPerSec)) tok/s")
                 } catch {
-                    print("Inference error: \(error)")
+                    Log.info("Inference error: \(error)")
                 }
                 continuation.finish()
             }
@@ -215,7 +215,7 @@ public struct InferenceEngine: Sendable {
 
             let chunkTime = CFAbsoluteTimeGetCurrent() - chunkStart
             let chunkNum = chunkIdx - startChunk + 1
-            print("[Perf] Prefill chunk \(chunkNum)/\(chunksToProcess) (pos=\(start)): \(String(format: "%.2f", chunkTime))s")
+            Log.info("[Perf] Prefill chunk \(chunkNum)/\(chunksToProcess) (pos=\(start)): \(String(format: "%.2f", chunkTime))s")
         }
 
         return (lastLogits, currentKV)

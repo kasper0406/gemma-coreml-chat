@@ -112,19 +112,19 @@ public final class CoreMLModel: @unchecked Sendable {
             let srcDate = (try? FileManager.default.attributesOfItem(atPath: source.path)[.modificationDate] as? Date) ?? .distantPast
             let cacheDate = (try? FileManager.default.attributesOfItem(atPath: cached.path)[.modificationDate] as? Date) ?? .distantFuture
             if srcDate > cacheDate {
-                print("[CoreML] Source model newer than cache — recompiling")
+                Log.info("[CoreML] Source model newer than cache — recompiling")
                 try? FileManager.default.removeItem(at: cached)
             }
         }
 
         if FileManager.default.fileExists(atPath: cached.path) {
-            print("[CoreML] Using cached compiled model at \(cached.path)")
+            Log.info("[CoreML] Using cached compiled model at \(cached.path)")
             return cached
         }
 
-        print("[CoreML] Compiling \(source.lastPathComponent)...")
+        Log.info("[CoreML] Compiling \(source.lastPathComponent)...")
         let compiledURL = try await MLModel.compileModel(at: source)
-        print("[CoreML] Compiled to \(compiledURL.path)")
+        Log.info("[CoreML] Compiled to \(compiledURL.path)")
 
         // Move compiled model to cache location
         try? FileManager.default.removeItem(at: cached)
@@ -141,7 +141,7 @@ public final class CoreMLModel: @unchecked Sendable {
         from url: URL,
         computeUnits: MLComputeUnits
     ) async throws -> CoreMLModel {
-        print("[CoreML] Loading decode + prefill functions from \(url.lastPathComponent)...")
+        Log.info("[CoreML] Loading decode + prefill functions from \(url.lastPathComponent)...")
 
         // Load both functions in parallel
         let decodeConfig = MLModelConfiguration()
@@ -157,16 +157,16 @@ public final class CoreMLModel: @unchecked Sendable {
 
         let decodeModel = try await decodeTask
         let prefillModel = try await prefillTask
-        print("[CoreML] Both functions loaded.")
+        Log.info("[CoreML] Both functions loaded.")
 
         let decodeIO = classifyIO(model: decodeModel)
         let prefillIO = classifyIO(model: prefillModel)
         let prefillInputDescs = prefillModel.modelDescription.inputDescriptionsByName
 
-        print("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count)")
-        print("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName), token=\(prefillIO.tokenInputName), pos=\(prefillIO.positionInputName), kvIn=\(prefillIO.kvInputNames.count), kvOut=\(prefillIO.kvOutputNames.count)")
+        Log.info("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count)")
+        Log.info("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName), token=\(prefillIO.tokenInputName), pos=\(prefillIO.positionInputName), kvIn=\(prefillIO.kvInputNames.count), kvOut=\(prefillIO.kvOutputNames.count)")
         if decodeIO.nInputName != nil {
-            print("[CoreML] Dynamic context: N input detected (decode=\(decodeIO.nInputName!), prefill=\(prefillIO.nInputName ?? "none"))")
+            Log.info("[CoreML] Dynamic context: N input detected (decode=\(decodeIO.nInputName!), prefill=\(prefillIO.nInputName ?? "none"))")
         }
 
         // Detect global KV inputs with flexible shapes (RangeDim).
@@ -174,7 +174,7 @@ public final class CoreMLModel: @unchecked Sendable {
             model: decodeModel, kvInputNames: decodeIO.kvInputNames
         )
         if !globalNames.isEmpty {
-            print("[CoreML] Flexible global KV caches: \(globalNames.sorted())")
+            Log.info("[CoreML] Flexible global KV caches: \(globalNames.sorted())")
         }
 
         // Both models kept — prefill avoids recompilation when needed
@@ -194,12 +194,12 @@ public final class CoreMLModel: @unchecked Sendable {
     /// Call before using ``prefill()``.  No-op if already loaded.
     public func loadPrefill() async throws {
         guard prefillModel == nil else { return }
-        print("[CoreML] Loading prefill model on demand...")
+        Log.info("[CoreML] Loading prefill model on demand...")
         let config = MLModelConfiguration()
         config.computeUnits = computeUnits
         config.functionName = "prefill"
         prefillModel = try await MLModel.load(contentsOf: modelURL, configuration: config)
-        print("[CoreML] Prefill model loaded.")
+        Log.info("[CoreML] Prefill model loaded.")
     }
 
     /// Release the prefill model to free memory (~4-5 GB).
@@ -207,7 +207,7 @@ public final class CoreMLModel: @unchecked Sendable {
     public func releasePrefill() {
         guard prefillModel != nil else { return }
         prefillModel = nil
-        print("[CoreML] Prefill model released.")
+        Log.info("[CoreML] Prefill model released.")
     }
 
     // MARK: - Prediction
@@ -497,6 +497,25 @@ extension MLMultiArray {
         let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: values.count)
         for (i, v) in values.enumerated() { ptr[i] = v }
         return array
+    }
+
+    /// Deep-copy an MLMultiArray to a new, independent buffer.
+    ///
+    /// CoreML reuses output MLMultiArray buffers across predictions.
+    /// Without copying, passing prediction N's outputs as prediction N+1's
+    /// inputs causes silent data corruption (aliased read/write).
+    public func deepCopy() -> MLMultiArray {
+        let copy = try! MLMultiArray(shape: self.shape, dataType: self.dataType)
+        let bytesPerElement: Int
+        switch self.dataType {
+        case .float16: bytesPerElement = 2
+        case .float32: bytesPerElement = 4
+        case .float64: bytesPerElement = 8
+        case .int32:   bytesPerElement = 4
+        default:       bytesPerElement = 4
+        }
+        memcpy(copy.dataPointer, self.dataPointer, self.count * bytesPerElement)
+        return copy
     }
 }
 
