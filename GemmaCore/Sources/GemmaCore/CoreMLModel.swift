@@ -54,6 +54,7 @@ public final class CoreMLModel: @unchecked Sendable {
 
     private init(
         decodeModel: MLModel,
+        prefillModel: MLModel?,
         modelURL: URL,
         computeUnits: MLComputeUnits,
         prefillIO: ClassifiedIO,
@@ -62,7 +63,7 @@ public final class CoreMLModel: @unchecked Sendable {
         globalKVInputNames: Set<String>
     ) {
         self.decodeModel = decodeModel
-        self.prefillModel = nil
+        self.prefillModel = prefillModel
         self.modelURL = modelURL
         self.computeUnits = computeUnits
         self.prefillLogitsName = prefillIO.logitsOutputName
@@ -140,25 +141,27 @@ public final class CoreMLModel: @unchecked Sendable {
         from url: URL,
         computeUnits: MLComputeUnits
     ) async throws -> CoreMLModel {
-        print("[CoreML] Loading decode function from \(url.lastPathComponent)...")
+        print("[CoreML] Loading decode + prefill functions from \(url.lastPathComponent)...")
 
-        // Load decode function with target compute units
+        // Load both functions in parallel
         let decodeConfig = MLModelConfiguration()
         decodeConfig.computeUnits = computeUnits
         decodeConfig.functionName = "decode"
-        let decodeModel = try await MLModel.load(contentsOf: url, configuration: decodeConfig)
-        print("[CoreML] Decode loaded. Inputs: \(Array(decodeModel.modelDescription.inputDescriptionsByName.keys).sorted())")
 
-        // Load prefill with same compute units to extract I/O metadata.
-        print("[CoreML] Extracting prefill I/O metadata...")
         let prefillConfig = MLModelConfiguration()
         prefillConfig.computeUnits = computeUnits
         prefillConfig.functionName = "prefill"
-        let tempPrefill = try await MLModel.load(contentsOf: url, configuration: prefillConfig)
+
+        async let decodeTask = MLModel.load(contentsOf: url, configuration: decodeConfig)
+        async let prefillTask = MLModel.load(contentsOf: url, configuration: prefillConfig)
+
+        let decodeModel = try await decodeTask
+        let prefillModel = try await prefillTask
+        print("[CoreML] Both functions loaded.")
 
         let decodeIO = classifyIO(model: decodeModel)
-        let prefillIO = classifyIO(model: tempPrefill)
-        let prefillInputDescs = tempPrefill.modelDescription.inputDescriptionsByName
+        let prefillIO = classifyIO(model: prefillModel)
+        let prefillInputDescs = prefillModel.modelDescription.inputDescriptionsByName
 
         print("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count)")
         print("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName), token=\(prefillIO.tokenInputName), pos=\(prefillIO.positionInputName), kvIn=\(prefillIO.kvInputNames.count), kvOut=\(prefillIO.kvOutputNames.count)")
@@ -174,9 +177,10 @@ public final class CoreMLModel: @unchecked Sendable {
             print("[CoreML] Flexible global KV caches: \(globalNames.sorted())")
         }
 
-        // tempPrefill released here — only metadata is kept
+        // Both models kept — prefill avoids recompilation when needed
         return CoreMLModel(
             decodeModel: decodeModel,
+            prefillModel: prefillModel,
             modelURL: url,
             computeUnits: computeUnits,
             prefillIO: prefillIO,

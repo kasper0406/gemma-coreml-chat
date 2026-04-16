@@ -15,7 +15,6 @@ struct GemmaChatCLI {
     static func main() async {
         let args = ProcessInfo.processInfo.arguments
         let modelPath = parseArg(args, flag: "--model") ?? "./gemma4-e2b.mlpackage"
-        let tokenizerID = parseArg(args, flag: "--tokenizer") ?? "google/gemma-4-E2B-it"
         let computeUnits = parseComputeUnits(args)
 
         printHeader()
@@ -41,16 +40,23 @@ struct GemmaChatCLI {
         let loadTime = CFAbsoluteTimeGetCurrent() - loadStart
         print("Model loaded in \(String(format: "%.1f", loadTime))s")
 
-        // --- Load tokenizer ---
-        print("Loading tokenizer (\(tokenizerID))...")
+        // --- Load tokenizer (embedded in .mlpackage, or from HuggingFace) ---
+        print("Loading tokenizer...")
         let tokenizer: GemmaTokenizer
         do {
-            tokenizer = try await GemmaTokenizer(pretrained: tokenizerID)
+            tokenizer = try await GemmaTokenizer(fromModelPackage: modelURL)
+            print("Tokenizer loaded (embedded in model).\n")
         } catch {
-            print("Error loading tokenizer: \(error)")
-            return
+            print("No embedded tokenizer found, downloading from HuggingFace...")
+            do {
+                tokenizer = try await GemmaTokenizer(pretrained: "google/gemma-4-E2B-it")
+                print("Tokenizer downloaded.\n")
+            } catch {
+                print("Error loading tokenizer: \(error)")
+                print("Hint: re-export the model with `uv run gemma-export` to embed the tokenizer.")
+                return
+            }
         }
-        print("Tokenizer ready.\n")
 
         let engine = InferenceEngine(model: model, temperature: 1.0, topP: 0.9)
         var history: [ChatMessage] = []
@@ -174,7 +180,9 @@ struct GemmaChatCLI {
         CLI flags:
           --model <path>           Path to .mlpackage or .mlmodelc
           --compute-units <units>  all | cpu-and-gpu (default) | cpu-only | cpu-and-ne
-          --tokenizer <id>         HuggingFace model ID for tokenizer
+        
+        The tokenizer is loaded from the .mlpackage (embedded during export).
+        Re-export with `uv run gemma-export` if missing.
         
         """)
     }

@@ -1,6 +1,7 @@
 /// Swift tokenizer wrapper using swift-transformers.
 ///
-/// Loads tokenizer files from a directory or auto-downloads from HuggingFace Hub.
+/// Loads tokenizer files from a directory, from inside a .mlpackage, or
+/// auto-downloads from HuggingFace Hub.
 /// Provides encode/decode and Gemma4 chat template formatting.
 
 import Foundation
@@ -17,6 +18,20 @@ public final class GemmaTokenizer: @unchecked Sendable {
     /// Load tokenizer from a HuggingFace model ID (downloads on first use).
     public init(pretrained modelID: String) async throws {
         self.tokenizer = try await AutoTokenizer.from(pretrained: modelID)
+    }
+
+    /// Load tokenizer embedded inside a .mlpackage or .mlmodelc directory.
+    ///
+    /// Looks for a `Tokenizer/` subdirectory containing `tokenizer.json` and
+    /// `tokenizer_config.json` inside the model package.
+    /// The export script (`gemma-export`) embeds these automatically.
+    public init(fromModelPackage packageURL: URL) async throws {
+        let tokDir = packageURL.appendingPathComponent("Tokenizer")
+        let tokFile = tokDir.appendingPathComponent("tokenizer.json")
+        guard FileManager.default.fileExists(atPath: tokFile.path) else {
+            throw GemmaTokenizerError.missingResources
+        }
+        self.tokenizer = try await AutoTokenizer.from(modelFolder: tokDir)
     }
 
     /// Encode text to token IDs.

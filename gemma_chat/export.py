@@ -657,6 +657,24 @@ def export_decode_step(
         gc.enable()
 
 
+def _embed_tokenizer(model_id: str, mlpackage_path: Path) -> None:
+    """Download tokenizer files from HuggingFace and embed them into the .mlpackage."""
+    import shutil as _shutil
+    from huggingface_hub import hf_hub_download
+
+    tok_dir = mlpackage_path / "Tokenizer"
+    tok_dir.mkdir(exist_ok=True)
+
+    for fname in ("tokenizer.json", "tokenizer_config.json"):
+        local = hf_hub_download(repo_id=model_id, filename=fname)
+        dst = tok_dir / fname
+        _shutil.copy2(local, dst)
+        sz = dst.stat().st_size
+        print(f"  Embedded {fname} ({sz / 1e6:.1f} MB)")
+
+    print(f"  Tokenizer stored in {tok_dir}/")
+
+
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 
@@ -796,6 +814,9 @@ def main() -> None:
                 sizes.append(f"    {p.name}  ({sz / 1e9:.2f} GB)")
             print("\n  Export complete:\n" + "\n".join(sizes) + "\n")
 
+            # Embed tokenizer into decode model (the one the CLI loads)
+            _embed_tokenizer(args.model_id, out_decode)
+
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr)
             sys.exit(1)
@@ -842,6 +863,8 @@ def main() -> None:
 
             final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
             print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
+
+            _embed_tokenizer(args.model_id, output)
 
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr)
