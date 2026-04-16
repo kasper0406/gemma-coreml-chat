@@ -13,12 +13,17 @@ uv run gemma-export
 cd cli && swift build -c release
 .build/release/GemmaChatCLI --model ../gemma4-e2b.mlpackage
 
-# Diagnostics
-uv run gemma-compare-inference --prompt "Hi"   # A/B: full model vs KV decode
-uv run gemma-parity-decode --max-tokens 8       # JAX vs CoreML logit parity
+# Build the iOS app (simulator, no signing)
+xcodebuild -project ios/GemmaChat/GemmaChat.xcodeproj -scheme GemmaChat \
+    -destination 'generic/platform=iOS Simulator' \
+    -configuration Debug -skipPackagePluginValidation \
+    CODE_SIGNING_ALLOWED=NO build
+
+# Python tests (MIL passes + multifunction export)
+uv run pytest tests/
 ```
 
-There is no test suite.
+The Python test suite in `tests/` covers MIL-pass correctness (`test_softcap_fusion.py`, `test_sdpa_fusion.py`, `test_broadcast_tiles.py`) and multifunction dynamic-shape export (`test_multifunction_dynamic.py`). There is no Swift test target yet — verify Swift changes by `swift build` in `cli/` and by running the CLI against an exported `.mlpackage`.
 
 ## Architecture
 
@@ -36,9 +41,13 @@ All inference runs through native Swift via the `GemmaCore` shared library:
 
 - `GemmaCore/` — Swift Package (SPM) with model loading (`CoreMLModel`), KV cache management (`KVCacheState`), tokenization (`GemmaTokenizer`), sampling, and the inference engine (`InferenceEngine`). Caches `.mlmodelc` next to `.mlpackage` for ~20x faster loads vs Python coremltools.
 - `cli/` — Swift CLI chat app using GemmaCore. Readline-based with streaming output and `/reset`/`/quit`/`/help` commands.
-- `ios/GemmaChat/` — iOS SwiftUI chat app using GemmaCore as a local package dependency. Includes eager prefill (prefills prompt chunks as the user types).
-- `jax_generate.py` provides a JAX-only token stream using `decode_jax.py` (for diagnostics).
+- `ios/GemmaChat/` — iOS SwiftUI chat app using GemmaCore as a local package dependency. Includes eager prefill (prefills prompt chunks as the user types) and an `EagerPrefillManager` actor that reuses KV state across turns.
 - `decode_jax.py` provides a pure-JAX KV-cached decode path with `prefill()` and `decode_step()` for reference and parity testing.
+
+**Inference API shape:**
+- `InferenceEngine.generate(...)` returns `AsyncThrowingStream<Int32, Error>` — always consume with `for try await` and surface errors to the user.
+- Pass a `GenerationContext` across turns to reuse the KV cache. The engine writes post-generation `cachedTokens` + `kvState` back to it; on the next call, prefix-match the new prompt against `cachedTokens` to compute a `prefillOffset` (see `resolveKVReuse` in `cli/Sources/GemmaChatCLI/main.swift`).
+- Empty prompts throw `InferenceError.emptyPrompt`; missing KV inputs throw `CoreMLModelError.missingKVInput` — do not add force-unwraps in place of these.
 
 ## Key Conventions
 

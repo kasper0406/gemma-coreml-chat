@@ -92,9 +92,7 @@ final class ChatViewModel {
             eagerPrefill = EagerPrefillManager(
                 engine: eng,
                 tokenizer: tok,
-                model: coreml,
-                kvInputNames: coreml.prefillKVInputNames,
-                inputDescriptions: coreml.prefillInputDescriptions
+                model: coreml
             )
 
             // Listen for memory warnings (view model lives for app lifetime)
@@ -188,7 +186,7 @@ final class ChatViewModel {
                 )
 
                 var genIDs: [Int32] = []
-                for await tokenID in stream {
+                for try await tokenID in stream {
                     if Task.isCancelled { break }
 
                     if GemmaConfig.stopTokenIDs.contains(tokenID) { break }

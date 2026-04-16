@@ -28,8 +28,6 @@ dependencies = [
 [project.scripts]
 # Export prefill + decode CoreML models (run once, ~10-30 min):
 gemma-export = "gemma_chat.export:main"
-gemma-compare-inference = "gemma_chat.compare_inference:main"
-gemma-parity-decode = "gemma_chat.parity_decode:main"
 
 [dependency-groups]
 dev = [

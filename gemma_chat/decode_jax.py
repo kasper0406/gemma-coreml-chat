@@ -259,7 +259,7 @@ def _ffn_forward(layer_params: dict, x: jnp.ndarray, hidden_dim: int) -> jnp.nda
     lp = layer_params['mlp']
     gate = jnp.dot(x, lp['gate_proj']['kernel'])
     up   = jnp.dot(x, lp['up_proj']['kernel'])
-    hidden = jax.nn.gelu(gate, approximate=True) * up
+    hidden = jax.nn.gelu(gate, approximate=False) * up
     return jnp.dot(hidden, lp['down_proj']['kernel'])
 
 
@@ -268,7 +268,7 @@ def _ple_gate(layer_params: dict, x: jnp.ndarray, per_layer_input: jnp.ndarray,
     """Apply the per-layer input gate residual block."""
     gate = jax.nn.gelu(
         jnp.dot(x, layer_params['per_layer_input_gate']['kernel']),
-        approximate=True,
+        approximate=False,
     ) * per_layer_input
     proj = jnp.dot(gate, layer_params['per_layer_projection']['kernel'])
     proj = _rmsnorm_apply(proj[None, None, :], layer_params['post_per_layer_input_norm']['scale'])[0, 0]

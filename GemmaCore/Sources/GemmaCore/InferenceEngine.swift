@@ -1,9 +1,21 @@
 /// Chunked prefill + single-token decode inference engine.
 ///
-/// Returns an `AsyncStream<Int32>` of generated token IDs.
+/// Returns an `AsyncThrowingStream<Int32, Error>` of generated token IDs.
 
 import CoreML
 import Foundation
+
+/// Errors raised during inference.
+public enum InferenceError: Error, LocalizedError {
+    case emptyPrompt
+
+    public var errorDescription: String? {
+        switch self {
+        case .emptyPrompt:
+            "Cannot run inference on an empty prompt"
+        }
+    }
+}
 
 /// Captures post-generation KV state for reuse across turns.
 ///
@@ -51,8 +63,8 @@ public struct InferenceEngine: Sendable {
         existingKVState: KVCacheState? = nil,
         prefillOffset: Int = 0,
         context: GenerationContext? = nil
-    ) -> AsyncStream<Int32> {
-        AsyncStream { continuation in
+    ) -> AsyncThrowingStream<Int32, Error> {
+        AsyncThrowingStream { continuation in
             Task.detached { [self] in
                 do {
                     let genStart = CFAbsoluteTimeGetCurrent()
@@ -61,9 +73,20 @@ public struct InferenceEngine: Sendable {
                         maxSeqLen: GemmaConfig.maxSeqLen,
                         reserveForGeneration: maxNewTokens
                     )
+
+                    // Invalidate KV reuse if truncation changed the prompt —
+                    // the cached prefix no longer matches the truncated suffix.
+                    var effectiveKVState = existingKVState
+                    var effectivePrefillOffset = prefillOffset
+                    if ids.count < promptIDs.count && prefillOffset > 0 {
+                        Log.info("[KV] Prompt was truncated (\(promptIDs.count)→\(ids.count)) — invalidating KV reuse")
+                        effectiveKVState = nil
+                        effectivePrefillOffset = 0
+                    }
+
                     let nReal = ids.count
                     let nChunks = (nReal + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
-                    Log.info("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks, prefillOffset=\(prefillOffset)")
+                    Log.info("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks, prefillOffset=\(effectivePrefillOffset)")
 
                     try await self.model.loadPrefill()
 
@@ -72,10 +95,10 @@ public struct InferenceEngine: Sendable {
                     var kvState: KVCacheState
                     var logits: MLMultiArray
 
-                    if let existing = existingKVState, prefillOffset > 0 {
+                    if let existing = effectiveKVState, effectivePrefillOffset > 0 {
                         let (prefillLogits, prefillKV) = try self.continuePrefill(
                             ids: ids,
-                            fromOffset: prefillOffset,
+                            fromOffset: effectivePrefillOffset,
                             kvState: existing
                         )
                         kvState = prefillKV
@@ -122,8 +145,17 @@ public struct InferenceEngine: Sendable {
 
                     // --- Decode Loop ---
                     let maxSteps = min(maxNewTokens, GemmaConfig.maxSeqLen - nReal)
+
+                    // Pre-allocate the global KV cache to its final decode size so we don't
+                    // re-allocate every step. Each grow returns a fresh MLMultiArray; once it
+                    // is passed to a prediction, CoreML backs it with an IOSurface that isn't
+                    // released promptly. Repeated growth exhausts the IOSurface pool after
+                    // enough steps ("Failed to allocate E5 buffer object").
+                    let targetCacheSize = min(nReal + maxSteps, GemmaConfig.maxSeqLen)
+                    var currentKV = try kvState.grownToFit(
+                        needed: targetCacheSize, maxLen: GemmaConfig.maxSeqLen
+                    )
                     var currentLogits = lastLogits
-                    var currentKV = kvState
                     var totalSampleTime = 0.0
                     var totalDecodeTime = 0.0
                     var decodeSteps = 0
@@ -146,19 +178,30 @@ public struct InferenceEngine: Sendable {
 
                         let position = Int32(nReal + step)
 
-                        currentKV = currentKV.grownToFit(
+                        currentKV = try currentKV.grownToFit(
                             needed: Int(position) + 1,
                             maxLen: GemmaConfig.maxSeqLen
                         )
 
+                        // Safety: verify position fits in the global cache before decode.
+                        if let gcSize = currentKV.currentGlobalCacheSize, Int(position) >= gcSize {
+                            Log.info("[Safety] Position \(position) >= global cache size \(gcSize) — stopping generation")
+                            break
+                        }
+
                         let decStart = CFAbsoluteTimeGetCurrent()
                         let gcSize = currentKV.currentGlobalCacheSize.map { Int32($0) }
-                        let (decLogits, decKV) = try model.decode(
-                            token: nextID,
-                            position: position,
-                            kvState: currentKV,
-                            globalCacheSize: gcSize
-                        )
+                        // autoreleasepool: force prompt release of CoreML prediction
+                        // temporaries (MLFeatureProvider, internal IOSurface-backed
+                        // buffers) that are otherwise held until the task yields.
+                        let (decLogits, decKV) = try autoreleasepool {
+                            try model.decode(
+                                token: nextID,
+                                position: position,
+                                kvState: currentKV,
+                                globalCacheSize: gcSize
+                            )
+                        }
                         let decTime = CFAbsoluteTimeGetCurrent() - decStart
                         totalDecodeTime += decTime
                         decodeSteps += 1
@@ -183,10 +226,11 @@ public struct InferenceEngine: Sendable {
                     // Save state for cross-turn KV reuse
                     context?.cachedTokens = Array(ids.prefix(nReal)) + generatedIDs
                     context?.kvState = currentKV
+                    continuation.finish()
                 } catch {
                     Log.info("Inference error: \(error)")
+                    continuation.finish(throwing: error)
                 }
-                continuation.finish()
             }
         }
     }
@@ -196,15 +240,16 @@ public struct InferenceEngine: Sendable {
         let nChunks = (ids.count + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
         let paddedLen = nChunks * GemmaConfig.chunkSize
 
-        let emptyKV = KVCacheState.empty(
+        let emptyKV = try KVCacheState.empty(
             kvInputNames: model.prefillKVInputNames,
-            inputDescriptions: model.prefillInputDescriptions,
+            shapes: model.prefillKVShapes,
+            dtypes: model.prefillKVDtypes,
             globalNames: model.globalKVInputNames,
             initialGlobalSize: model.globalKVInputNames.isEmpty ? nil : paddedLen
         )
         let (logits, kv) = try continuePrefill(ids: ids, fromOffset: 0, kvState: emptyKV)
         guard let logits else {
-            fatalError("fullPrefill produced no logits — prompt is empty")
+            throw InferenceError.emptyPrompt
         }
         return (logits, kv)
     }
@@ -222,7 +267,7 @@ public struct InferenceEngine: Sendable {
                                    count: paddedLen - nReal)
 
         let startChunk = fromOffset / GemmaConfig.chunkSize
-        var currentKV = kvState.grownToFit(needed: paddedLen, maxLen: GemmaConfig.maxSeqLen)
+        var currentKV = try kvState.grownToFit(needed: paddedLen, maxLen: GemmaConfig.maxSeqLen)
         var lastLogits: MLMultiArray? = nil
         let chunksToProcess = nChunks - startChunk
 
@@ -239,7 +284,7 @@ public struct InferenceEngine: Sendable {
                 kvState: currentKV,
                 globalCacheSize: gcSize
             )
-            currentKV = newKV.withProcessedTokens(start + GemmaConfig.chunkSize)
+            currentKV = newKV
             lastLogits = logits
 
             let chunkTime = CFAbsoluteTimeGetCurrent() - chunkStart
@@ -265,7 +310,7 @@ public struct InferenceEngine: Sendable {
             kvState: kvState,
             globalCacheSize: gcSize
         )
-        return (logits, newKV.withProcessedTokens(startPosition + GemmaConfig.chunkSize))
+        return (logits, newKV)
     }
 
     // MARK: - Helpers

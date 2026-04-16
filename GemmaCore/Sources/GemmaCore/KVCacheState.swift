@@ -7,6 +7,21 @@
 import CoreML
 import Foundation
 
+/// Errors raised while building or updating a KV cache state.
+public enum KVCacheError: Error, LocalizedError {
+    case missingOutputTensor(String)
+    case missingShapeOrDtype(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingOutputTensor(let name):
+            "Missing KV output tensor: \(name)"
+        case .missingShapeOrDtype(let name):
+            "Missing shape or dtype for KV input '\(name)'"
+        }
+    }
+}
+
 /// Immutable snapshot of the KV cache state.
 /// Each prediction returns a new KVCacheState with updated arrays.
 public struct KVCacheState: @unchecked Sendable {
@@ -16,16 +31,8 @@ public struct KVCacheState: @unchecked Sendable {
     /// Ordered input names (declaration order from model spec).
     public let inputNames: [String]
 
-    /// Number of tokens that have been processed into this cache.
-    public let processedTokens: Int
-
     /// Names of KV inputs with flexible (RangeDim) shapes — the global caches.
     public let globalNames: Set<String>
-
-    /// Access arrays in input-name order (for positional compatibility).
-    public var arrays: [MLMultiArray] {
-        inputNames.map { arraysByName[$0]! }
-    }
 
     /// Current dim-1 size of global caches, or nil if none.
     public var currentGlobalCacheSize: Int? {
@@ -40,64 +47,68 @@ public struct KVCacheState: @unchecked Sendable {
     public init(
         arraysByName: [String: MLMultiArray],
         inputNames: [String],
-        processedTokens: Int,
         globalNames: Set<String>
     ) {
         self.arraysByName = arraysByName
         self.inputNames = inputNames
-        self.processedTokens = processedTokens
         self.globalNames = globalNames
     }
 
-    /// Create an empty state from the model's input descriptions.
+    /// Create an empty state from pre-extracted KV shapes/dtypes.
     /// Global caches are sized to `initialGlobalSize` instead of the spec shape.
-    /// Float16 arrays are zero-filled; Int32 arrays are filled with -1.
+    /// Float* arrays are zero-filled; Int32 arrays are filled with -1.
     public static func empty(
         kvInputNames: [String],
-        inputDescriptions: [String: MLFeatureDescription],
+        shapes: [String: [NSNumber]],
+        dtypes: [String: MLMultiArrayDataType],
         globalNames: Set<String> = [],
         initialGlobalSize: Int? = nil
-    ) -> KVCacheState {
+    ) throws -> KVCacheState {
         var dict: [String: MLMultiArray] = [:]
         for name in kvInputNames {
-            if let desc = inputDescriptions[name],
-               let constraint = desc.multiArrayConstraint
-            {
-                var shape = constraint.shape.map { $0.intValue }
-                // Override dim-1 for global caches when dynamic sizing is active
-                if let size = initialGlobalSize, globalNames.contains(name), shape.count == 4 {
-                    shape[1] = size
-                }
-                let nsShape = shape.map { NSNumber(value: $0) }
-                let dtype = constraint.dataType
-                let array = try! MLMultiArray(shape: nsShape, dataType: dtype)
-                // MLMultiArray does NOT guarantee zero initialization.
-                // KV caches must be zeroed (float16) or set to -1 (int32).
-                if dtype == .int32 {
-                    let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: array.count)
-                    for i in 0..<array.count { ptr[i] = -1 }
-                } else {
-                    let bytes: Int
-                    switch dtype {
-                    case .float16: bytes = array.count * 2
-                    case .float32: bytes = array.count * 4
-                    case .float64: bytes = array.count * 8
-                    default:       bytes = array.count * 2
-                    }
-                    memset(array.dataPointer, 0, bytes)
-                }
-                dict[name] = array
-            } else {
-                let array = try! MLMultiArray(shape: [1], dataType: .float16)
-                dict[name] = array
+            guard let specShape = shapes[name], let dtype = dtypes[name] else {
+                throw KVCacheError.missingOutputTensor(name)
             }
+            var shape = specShape.map { $0.intValue }
+            // Override dim-1 for global caches when dynamic sizing is active
+            if let size = initialGlobalSize, globalNames.contains(name), shape.count == 4 {
+                shape[1] = size
+            }
+            let nsShape = shape.map { NSNumber(value: $0) }
+            dict[name] = try allocateZeroedKV(shape: nsShape, dtype: dtype)
         }
         return KVCacheState(
             arraysByName: dict,
             inputNames: kvInputNames,
-            processedTokens: 0,
             globalNames: globalNames
         )
+    }
+
+    /// Allocate an MLMultiArray and initialize it for KV-cache use.
+    /// MLMultiArray does NOT guarantee zero initialization, so we explicitly
+    /// zero float arrays and fill int32 arrays with -1 (the "empty slot" sentinel).
+    static func allocateZeroedKV(
+        shape: [NSNumber], dtype: MLMultiArrayDataType
+    ) throws -> MLMultiArray {
+        let array = try MLMultiArray(shape: shape, dataType: dtype)
+        if dtype == .int32 {
+            let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: array.count)
+            for i in 0..<array.count { ptr[i] = -1 }
+        } else {
+            memset(array.dataPointer, 0, array.count * bytesPerElement(of: dtype))
+        }
+        return array
+    }
+
+    /// Bytes per element for the dtypes this package uses.
+    static func bytesPerElement(of dtype: MLMultiArrayDataType) -> Int {
+        switch dtype {
+        case .float16: return 2
+        case .float32: return 4
+        case .float64: return 8
+        case .int32:   return 4
+        default:       return 2
+        }
     }
 
     /// Extract updated KV state from a prediction result.
@@ -109,9 +120,8 @@ public struct KVCacheState: @unchecked Sendable {
         prediction: MLFeatureProvider,
         outputNames: [String],
         inputNames: [String],
-        processedTokens: Int = 0,
         globalNames: Set<String> = []
-    ) -> KVCacheState {
+    ) throws -> KVCacheState {
         precondition(outputNames.count == inputNames.count,
                      "KV output count (\(outputNames.count)) != input count (\(inputNames.count))")
 
@@ -124,35 +134,31 @@ public struct KVCacheState: @unchecked Sendable {
 
         if useNameMatching {
             for name in inputNames {
-                dict[name] = prediction.featureValue(for: name)!.multiArrayValue!.deepCopy()
+                guard let value = prediction.featureValue(for: name)?.multiArrayValue else {
+                    throw KVCacheError.missingOutputTensor(name)
+                }
+                dict[name] = try value.deepCopy()
             }
         } else {
             // Positional: output[i] → input[i]
             for (outName, inName) in zip(outputNames, inputNames) {
                 guard let value = prediction.featureValue(for: outName)?.multiArrayValue else {
-                    fatalError("Missing KV output tensor: \(outName)")
+                    throw KVCacheError.missingOutputTensor(outName)
                 }
-                dict[inName] = value.deepCopy()
+                dict[inName] = try value.deepCopy()
             }
         }
 
         return KVCacheState(
             arraysByName: dict,
             inputNames: inputNames,
-            processedTokens: processedTokens,
             globalNames: globalNames
         )
     }
 
-    /// Create a new KVCacheState with an updated processedTokens count.
-    public func withProcessedTokens(_ count: Int) -> KVCacheState {
-        KVCacheState(arraysByName: arraysByName, inputNames: inputNames,
-                     processedTokens: count, globalNames: globalNames)
-    }
-
     /// Grow global caches so dim-1 >= `needed` using a doubling strategy.
     /// Returns self unchanged if no growth is required or if there are no global caches.
-    public func grownToFit(needed: Int, maxLen: Int) -> KVCacheState {
+    public func grownToFit(needed: Int, maxLen: Int) throws -> KVCacheState {
         guard !globalNames.isEmpty else { return self }
         guard let curSize = currentGlobalCacheSize, curSize < needed else { return self }
 
@@ -167,14 +173,9 @@ public struct KVCacheState: @unchecked Sendable {
 
             let newShape = [oldShape[0], newLen, oldShape[2], oldShape[3]]
             let nsShape = newShape.map { NSNumber(value: $0) }
-            let grown = try! MLMultiArray(shape: nsShape, dataType: old.dataType)
-
-            // Zero the entire buffer first (MLMultiArray doesn't guarantee zero init),
-            // then copy old data into the front.
-            let bytesPerElement = old.dataType == .float32 ? 4 : 2
-            memset(grown.dataPointer, 0, grown.count * bytesPerElement)
-            let oldBytes = old.count * bytesPerElement
-            memcpy(grown.dataPointer, old.dataPointer, oldBytes)
+            let grown = try Self.allocateZeroedKV(shape: nsShape, dtype: old.dataType)
+            memcpy(grown.dataPointer, old.dataPointer,
+                   old.count * Self.bytesPerElement(of: old.dataType))
 
             newDict[name] = grown
         }
@@ -182,7 +183,6 @@ public struct KVCacheState: @unchecked Sendable {
         return KVCacheState(
             arraysByName: newDict,
             inputNames: inputNames,
-            processedTokens: processedTokens,
             globalNames: globalNames
         )
     }

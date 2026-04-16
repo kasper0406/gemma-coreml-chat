@@ -22,12 +22,6 @@ actor EagerPrefillManager {
     private let engine: InferenceEngine
     private let tokenizer: GemmaTokenizer
     private let model: CoreMLModel
-    /// Ordered state input names, their shapes, and their dtypes.
-    private let kvInputNames: [String]
-    private let kvShapes: [String: [NSNumber]]
-    private let kvDtypes: [String: MLMultiArrayDataType]
-    /// Names of global KV inputs with flexible shapes.
-    private let globalKVNames: Set<String>
 
     /// Tokens that have been prefilled so far.
     private var prefillTokens: [Int] = []
@@ -43,57 +37,22 @@ actor EagerPrefillManager {
     /// Current status for UI display.
     private(set) var status: PrefillStatus = .idle
 
-    init(engine: InferenceEngine, tokenizer: GemmaTokenizer,
-         model: CoreMLModel,
-         kvInputNames: [String],
-         inputDescriptions: [String: MLFeatureDescription])
-    {
+    init(engine: InferenceEngine, tokenizer: GemmaTokenizer, model: CoreMLModel) {
         self.engine = engine
         self.tokenizer = tokenizer
         self.model = model
-        self.kvInputNames = kvInputNames
-        self.globalKVNames = model.globalKVInputNames
-        // Pre-extract shapes and dtypes so we don't store non-Sendable MLFeatureDescription
-        var shapes: [String: [NSNumber]] = [:]
-        var dtypes: [String: MLMultiArrayDataType] = [:]
-        for name in kvInputNames {
-            if let desc = inputDescriptions[name],
-               let constraint = desc.multiArrayConstraint
-            {
-                shapes[name] = constraint.shape
-                dtypes[name] = constraint.dataType
-            }
-        }
-        self.kvShapes = shapes
-        self.kvDtypes = dtypes
-        self.kvState = Self.makeEmptyKV(
-            names: kvInputNames, shapes: shapes, dtypes: dtypes,
-            globalNames: model.globalKVInputNames, initialGlobalSize: nil
-        )
+        // Initial empty state is a tiny allocation (no global size override) — safe to force.
+        self.kvState = try! Self.emptyKV(model: model, initialGlobalSize: nil)
     }
 
-    private static func makeEmptyKV(
-        names: [String], shapes: [String: [NSNumber]], dtypes: [String: MLMultiArrayDataType],
-        globalNames: Set<String>, initialGlobalSize: Int?
-    ) -> KVCacheState {
-        var dict: [String: MLMultiArray] = [:]
-        for name in names {
-            var shape = (shapes[name] ?? [1]).map { $0.intValue }
-            let dtype = dtypes[name] ?? .float16
-            // Override dim-1 for global caches
-            if let size = initialGlobalSize, globalNames.contains(name), shape.count == 4 {
-                shape[1] = size
-            }
-            let nsShape = shape.map { NSNumber(value: $0) }
-            let array = try! MLMultiArray(shape: nsShape, dataType: dtype)
-            if dtype == .int32 {
-                let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: array.count)
-                for i in 0..<array.count { ptr[i] = -1 }
-            }
-            dict[name] = array
-        }
-        return KVCacheState(arraysByName: dict, inputNames: names, processedTokens: 0,
-                            globalNames: globalNames)
+    private static func emptyKV(model: CoreMLModel, initialGlobalSize: Int?) throws -> KVCacheState {
+        try KVCacheState.empty(
+            kvInputNames: model.prefillKVInputNames,
+            shapes: model.prefillKVShapes,
+            dtypes: model.prefillKVDtypes,
+            globalNames: model.globalKVInputNames,
+            initialGlobalSize: initialGlobalSize
+        )
     }
 
     /// Called when the user's input text changes.
@@ -125,7 +84,7 @@ actor EagerPrefillManager {
         let prefillBoundary = completedChunks * GemmaConfig.chunkSize
         if prefillBoundary > 0 {
             let isValid = newTokens.count >= prefillBoundary
-                && Array(newTokens.prefix(prefillBoundary)) == Array(prefillTokens.prefix(prefillBoundary))
+                && newTokens.prefix(prefillBoundary).elementsEqual(prefillTokens.prefix(prefillBoundary))
             if !isValid {
                 Log.info("[Perf] Prefix changed — resetting eager prefill")
                 reset()
@@ -175,7 +134,7 @@ actor EagerPrefillManager {
         let prefillBoundary = completedChunks * GemmaConfig.chunkSize
         let isValid = prefillBoundary > 0
             && finalTokens.count >= prefillBoundary
-            && Array(finalTokens.prefix(prefillBoundary)) == Array(prefillTokens.prefix(prefillBoundary))
+            && finalTokens.prefix(prefillBoundary).elementsEqual(prefillTokens.prefix(prefillBoundary))
 
         if isValid && completedChunks > 0 {
             // Prefill is still valid — engine only needs to process remaining chunks
@@ -192,10 +151,7 @@ actor EagerPrefillManager {
             clearInternalState()
             return (
                 promptIDs,
-                Self.makeEmptyKV(
-                    names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes,
-                    globalNames: globalKVNames, initialGlobalSize: nil
-                ),
+                try Self.emptyKV(model: model, initialGlobalSize: nil),
                 0
             )
         }
@@ -231,10 +187,8 @@ actor EagerPrefillManager {
     private func clearInternalState() {
         prefillTokens = []
         completedChunks = 0
-        kvState = Self.makeEmptyKV(
-            names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes,
-            globalNames: globalKVNames, initialGlobalSize: nil
-        )
+        // Tiny allocation (no global size override) — safe to force.
+        kvState = try! Self.emptyKV(model: model, initialGlobalSize: nil)
         lastLogits = nil
         isPrefilling = false
     }
@@ -250,20 +204,16 @@ actor EagerPrefillManager {
         Log.info("[Perf] Eager prefill: \(totalToProcess) chunks (\(startChunk)..<\(upToChunk))")
         let batchStart = CFAbsoluteTimeGetCurrent()
 
-        // Size/grow global caches to fit all chunks we're about to process
-        if !globalKVNames.isEmpty {
-            let neededSize = upToChunk * GemmaConfig.chunkSize
-            if startChunk == 0 {
-                kvState = Self.makeEmptyKV(
-                    names: kvInputNames, shapes: kvShapes, dtypes: kvDtypes,
-                    globalNames: globalKVNames, initialGlobalSize: neededSize
-                )
-            } else {
-                kvState = kvState.grownToFit(needed: neededSize, maxLen: GemmaConfig.maxSeqLen)
-            }
-        }
-
         do {
+            // Size/grow global caches to fit all chunks we're about to process
+            if !model.globalKVInputNames.isEmpty {
+                let neededSize = upToChunk * GemmaConfig.chunkSize
+                if startChunk == 0 {
+                    kvState = try Self.emptyKV(model: model, initialGlobalSize: neededSize)
+                } else {
+                    kvState = try kvState.grownToFit(needed: neededSize, maxLen: GemmaConfig.maxSeqLen)
+                }
+            }
             // Ensure prefill model is loaded before first use
             try await model.loadPrefill()
 

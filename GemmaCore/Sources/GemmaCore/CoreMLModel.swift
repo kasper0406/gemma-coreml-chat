@@ -48,9 +48,11 @@ public final class CoreMLModel: @unchecked Sendable {
     /// Global KV input names that have flexible (RangeDim) shapes.
     public let globalKVInputNames: Set<String>
 
-    /// Prefill input descriptions for KV cache initialization.
-    /// Extracted once so the prefill model can be released between uses.
-    public let prefillInputDescriptions: [String: MLFeatureDescription]
+    /// Shapes of each prefill KV input, extracted once so the prefill model
+    /// can be released without losing the metadata needed to re-seed KV caches.
+    public let prefillKVShapes: [String: [NSNumber]]
+    /// Dtypes of each prefill KV input (companion to `prefillKVShapes`).
+    public let prefillKVDtypes: [String: MLMultiArrayDataType]
 
     private init(
         decodeModel: MLModel,
@@ -58,7 +60,8 @@ public final class CoreMLModel: @unchecked Sendable {
         modelURL: URL,
         computeUnits: MLComputeUnits,
         prefillIO: ClassifiedIO,
-        prefillInputDescriptions: [String: MLFeatureDescription],
+        prefillKVShapes: [String: [NSNumber]],
+        prefillKVDtypes: [String: MLMultiArrayDataType],
         decodeIO: ClassifiedIO,
         globalKVInputNames: Set<String>
     ) {
@@ -78,7 +81,8 @@ public final class CoreMLModel: @unchecked Sendable {
         self.prefillKVOutputNames = prefillIO.kvOutputNames
         self.decodeKVInputNames = decodeIO.kvInputNames
         self.decodeKVOutputNames = decodeIO.kvOutputNames
-        self.prefillInputDescriptions = prefillInputDescriptions
+        self.prefillKVShapes = prefillKVShapes
+        self.prefillKVDtypes = prefillKVDtypes
         self.globalKVInputNames = globalKVInputNames
     }
 
@@ -163,6 +167,13 @@ public final class CoreMLModel: @unchecked Sendable {
         let decodeIO = classifyIO(model: decodeModel)
         let prefillIO = classifyIO(model: prefillModel)
         let prefillInputDescs = prefillModel.modelDescription.inputDescriptionsByName
+        var prefillKVShapes: [String: [NSNumber]] = [:]
+        var prefillKVDtypes: [String: MLMultiArrayDataType] = [:]
+        for name in prefillIO.kvInputNames {
+            guard let c = prefillInputDescs[name]?.multiArrayConstraint else { continue }
+            prefillKVShapes[name] = c.shape
+            prefillKVDtypes[name] = c.dataType
+        }
 
         Log.info("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count)")
         Log.info("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName), token=\(prefillIO.tokenInputName), pos=\(prefillIO.positionInputName), kvIn=\(prefillIO.kvInputNames.count), kvOut=\(prefillIO.kvOutputNames.count)")
@@ -185,7 +196,8 @@ public final class CoreMLModel: @unchecked Sendable {
             modelURL: url,
             computeUnits: computeUnits,
             prefillIO: prefillIO,
-            prefillInputDescriptions: prefillInputDescs,
+            prefillKVShapes: prefillKVShapes,
+            prefillKVDtypes: prefillKVDtypes,
             decodeIO: decodeIO,
             globalKVInputNames: globalNames
         )
@@ -237,7 +249,7 @@ public final class CoreMLModel: @unchecked Sendable {
         )
         let result = try prefillModel.prediction(from: provider)
         let logits = result.featureValue(for: prefillLogitsName)!.multiArrayValue!
-        let newKV = KVCacheState.from(
+        let newKV = try KVCacheState.from(
             prediction: result,
             outputNames: prefillKVOutputNames,
             inputNames: prefillKVInputNames,
@@ -267,7 +279,7 @@ public final class CoreMLModel: @unchecked Sendable {
         )
         let result = try decodeModel.prediction(from: provider)
         let logits = result.featureValue(for: decodeLogitsName)!.multiArrayValue!
-        let newKV = KVCacheState.from(
+        let newKV = try KVCacheState.from(
             prediction: result,
             outputNames: decodeKVOutputNames,
             inputNames: decodeKVInputNames,
@@ -469,7 +481,7 @@ final class CoreMLInputProvider: MLFeatureProvider {
         }
         for name in kvNames {
             guard let array = kvState.arraysByName[name] else {
-                fatalError("KV cache missing array for input '\(name)'")
+                throw CoreMLModelError.missingKVInput(name)
             }
             values[name] = MLFeatureValue(multiArray: array)
         }
@@ -505,17 +517,10 @@ extension MLMultiArray {
     /// CoreML reuses output MLMultiArray buffers across predictions.
     /// Without copying, passing prediction N's outputs as prediction N+1's
     /// inputs causes silent data corruption (aliased read/write).
-    public func deepCopy() -> MLMultiArray {
-        let copy = try! MLMultiArray(shape: self.shape, dataType: self.dataType)
-        let bytesPerElement: Int
-        switch self.dataType {
-        case .float16: bytesPerElement = 2
-        case .float32: bytesPerElement = 4
-        case .float64: bytesPerElement = 8
-        case .int32:   bytesPerElement = 4
-        default:       bytesPerElement = 4
-        }
-        memcpy(copy.dataPointer, self.dataPointer, self.count * bytesPerElement)
+    public func deepCopy() throws -> MLMultiArray {
+        let copy = try MLMultiArray(shape: self.shape, dataType: self.dataType)
+        memcpy(copy.dataPointer, self.dataPointer,
+               self.count * KVCacheState.bytesPerElement(of: self.dataType))
         return copy
     }
 }
@@ -525,6 +530,7 @@ extension MLMultiArray {
 public enum CoreMLModelError: Error, LocalizedError {
     case modelNotFound
     case prefillNotLoaded
+    case missingKVInput(String)
 
     public var errorDescription: String? {
         switch self {
@@ -532,6 +538,8 @@ public enum CoreMLModelError: Error, LocalizedError {
             "Model not found at the specified path"
         case .prefillNotLoaded:
             "Prefill model not loaded. Call loadPrefill() first."
+        case .missingKVInput(let name):
+            "KV cache is missing the array for input '\(name)'"
         }
     }
 }

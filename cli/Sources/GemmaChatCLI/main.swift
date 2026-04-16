@@ -131,19 +131,24 @@ struct GemmaChatCLI {
                 context: genContext
             )
 
-            for await tokenID in stream {
-                if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
-                responseTokens.append(tokenID)
-                let text = tokenizer.decode(responseTokens.map { Int($0) })
-                // Print incremental text by computing delta
-                let prevText = responseTokens.count > 1
-                    ? tokenizer.decode(responseTokens.dropLast().map { Int($0) })
-                    : ""
-                let delta = String(text.dropFirst(prevText.count))
-                if !delta.isEmpty {
-                    print(delta, terminator: "")
-                    fflush(stdout)
+            do {
+                for try await tokenID in stream {
+                    if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
+                    responseTokens.append(tokenID)
+                    let text = tokenizer.decode(responseTokens.map { Int($0) })
+                    // Print incremental text by computing delta
+                    let prevText = responseTokens.count > 1
+                        ? tokenizer.decode(responseTokens.dropLast().map { Int($0) })
+                        : ""
+                    let delta = String(text.dropFirst(prevText.count))
+                    if !delta.isEmpty {
+                        print(delta, terminator: "")
+                        fflush(stdout)
+                    }
                 }
+            } catch {
+                print("\n[error] \(error.localizedDescription)\n")
+                continue
             }
 
             let genTime = CFAbsoluteTimeGetCurrent() - genStart
