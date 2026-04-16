@@ -47,6 +47,7 @@ final class ChatViewModel {
     private var eagerPrefill: EagerPrefillManager?
     private var generateTask: Task<Void, Never>?
     private var prefillDebounceTask: Task<Void, Never>?
+    private let genContext = GenerationContext()
 
     private func handleMemoryWarning() {
         Log.info("[Memory] Received memory warning")
@@ -145,6 +146,7 @@ final class ChatViewModel {
         isGenerating = false
         generateTask?.cancel()
         generateTask = nil
+        genContext.reset()
         Task { await eagerPrefill?.reset() }
     }
 
@@ -181,7 +183,8 @@ final class ChatViewModel {
                     promptIDs: promptIDs,
                     maxNewTokens: maxNewTokens,
                     existingKVState: prefillOffset > 0 ? kvState : nil,
-                    prefillOffset: prefillOffset
+                    prefillOffset: prefillOffset,
+                    context: genContext
                 )
 
                 var genIDs: [Int32] = []
@@ -202,8 +205,8 @@ final class ChatViewModel {
                 messages.append(ChatMessage(role: .assistant, content: reply))
                 streamingText = ""
 
-                // Reset eager prefill for next turn
-                await eagerPrefill.reset()
+                // Seed eager prefill with post-generation KV state for next turn
+                await eagerPrefill.seedFromGeneration(genContext)
 
             } catch {
                 messages.append(ChatMessage(

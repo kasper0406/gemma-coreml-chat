@@ -207,6 +207,26 @@ actor EagerPrefillManager {
         status = .idle
     }
 
+    /// Seed the manager with KV state from a completed generation.
+    ///
+    /// After `generate()` finishes, call this instead of `reset()` so that the
+    /// next turn's eager prefill (and `finishPrefill`) can skip tokens that are
+    /// already in the KV cache.
+    func seedFromGeneration(_ context: GenerationContext) {
+        let cached = context.cachedTokens
+        guard let kv = context.kvState, !cached.isEmpty else {
+            reset()
+            return
+        }
+        prefillTokens = cached.map { Int($0) }
+        completedChunks = cached.count / GemmaConfig.chunkSize
+        kvState = kv
+        lastLogits = nil
+        isPrefilling = false
+        status = completedChunks > 0 ? .ready(chunks: completedChunks) : .idle
+        Log.info("[KV] Seeded eager prefill with \(cached.count) tokens (\(completedChunks) complete chunks)")
+    }
+
     /// Release KV cache and logits memory without changing status.
     private func clearInternalState() {
         prefillTokens = []
