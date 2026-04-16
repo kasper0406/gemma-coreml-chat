@@ -84,6 +84,7 @@ public struct InferenceEngine: Sendable {
 
                     // Extract the logits for the last real token.
                     let vocabSize = GemmaConfig.vocabSize
+
                     let lastLogits: MLMultiArray
                     if logits.shape.count > 1 && logits.shape[0].intValue > 1 {
                         let lastChunkLen = nReal - (nChunks - 1) * GemmaConfig.chunkSize

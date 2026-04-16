@@ -31,6 +31,9 @@ public enum GemmaConfig {
     /// All token IDs that should stop generation.
     public static let stopTokenIDs: Set<Int32> = [eosTokenID, eotTokenID]
 
+    /// BOS (beginning-of-sequence) token ID.
+    public static let bosTokenID: Int = 2
+
     /// Pad token ID.
     public static let padTokenID: Int32 = 0
 }

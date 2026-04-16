@@ -71,9 +71,20 @@ public struct KVCacheState: @unchecked Sendable {
                 let nsShape = shape.map { NSNumber(value: $0) }
                 let dtype = constraint.dataType
                 let array = try! MLMultiArray(shape: nsShape, dataType: dtype)
+                // MLMultiArray does NOT guarantee zero initialization.
+                // KV caches must be zeroed (float16) or set to -1 (int32).
                 if dtype == .int32 {
                     let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: array.count)
                     for i in 0..<array.count { ptr[i] = -1 }
+                } else {
+                    let bytes: Int
+                    switch dtype {
+                    case .float16: bytes = array.count * 2
+                    case .float32: bytes = array.count * 4
+                    case .float64: bytes = array.count * 8
+                    default:       bytes = array.count * 2
+                    }
+                    memset(array.dataPointer, 0, bytes)
                 }
                 dict[name] = array
             } else {
@@ -158,8 +169,11 @@ public struct KVCacheState: @unchecked Sendable {
             let nsShape = newShape.map { NSNumber(value: $0) }
             let grown = try! MLMultiArray(shape: nsShape, dataType: old.dataType)
 
-            // Copy old data into the front of the grown array
-            let oldBytes = old.count * MemoryLayout<Float16>.stride
+            // Zero the entire buffer first (MLMultiArray doesn't guarantee zero init),
+            // then copy old data into the front.
+            let bytesPerElement = old.dataType == .float32 ? 4 : 2
+            memset(grown.dataPointer, 0, grown.count * bytesPerElement)
+            let oldBytes = old.count * bytesPerElement
             memcpy(grown.dataPointer, old.dataPointer, oldBytes)
 
             newDict[name] = grown

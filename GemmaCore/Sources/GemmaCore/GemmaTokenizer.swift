@@ -60,12 +60,18 @@ public final class GemmaTokenizer: @unchecked Sendable {
             let role = msg.role == .assistant ? "assistant" : "user"
             messages.append(["role": role, "content": msg.content])
         }
+        var ids: [Int]
         do {
-            return try tokenizer.applyChatTemplate(messages: messages)
+            ids = try tokenizer.applyChatTemplate(messages: messages)
         } catch {
             // Fallback: manually construct template and encode
-            return encode(manualChatTemplate(messages: messages))
+            ids = encode(manualChatTemplate(messages: messages))
         }
+        // Ensure BOS token is present — swift-transformers may not add it
+        if ids.first != GemmaConfig.bosTokenID {
+            ids.insert(GemmaConfig.bosTokenID, at: 0)
+        }
+        return ids
     }
 
     /// Manual fallback template for Gemma4 if applyChatTemplate fails.
