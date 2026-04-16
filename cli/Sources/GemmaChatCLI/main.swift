@@ -2,9 +2,11 @@
 ///
 /// Usage:
 ///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage
+///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage --compute-units all
 ///
 /// Commands: /reset  /quit  /help
 
+import CoreML
 import Foundation
 import GemmaCore
 
@@ -14,6 +16,7 @@ struct GemmaChatCLI {
         let args = ProcessInfo.processInfo.arguments
         let modelPath = parseArg(args, flag: "--model") ?? "./gemma4-e2b.mlpackage"
         let tokenizerID = parseArg(args, flag: "--tokenizer") ?? "google/gemma-4-E2B-it"
+        let computeUnits = parseComputeUnits(args)
 
         printHeader()
 
@@ -24,12 +27,12 @@ struct GemmaChatCLI {
             return
         }
 
-        print("Loading model from \(modelPath)...")
+        print("Loading model from \(modelPath) (compute: \(computeUnitsLabel(computeUnits)))...")
         let loadStart = CFAbsoluteTimeGetCurrent()
 
         let model: CoreMLModel
         do {
-            model = try await CoreMLModel.load(from: modelURL)
+            model = try await CoreMLModel.load(from: modelURL, computeUnits: computeUnits)
         } catch {
             print("Error loading model: \(error)")
             return
@@ -128,6 +131,31 @@ struct GemmaChatCLI {
         return args[idx + 1]
     }
 
+    static func parseComputeUnits(_ args: [String]) -> MLComputeUnits {
+        guard let value = parseArg(args, flag: "--compute-units") else {
+            return .cpuAndGPU
+        }
+        switch value.lowercased() {
+        case "all": return .all
+        case "cpu-only", "cpu": return .cpuOnly
+        case "cpu-and-gpu", "cpu-gpu": return .cpuAndGPU
+        case "cpu-and-ne", "cpu-ane": return .cpuAndNeuralEngine
+        default:
+            print("Warning: unknown compute units '\(value)', using cpu-and-gpu")
+            return .cpuAndGPU
+        }
+    }
+
+    static func computeUnitsLabel(_ units: MLComputeUnits) -> String {
+        switch units {
+        case .all: "all"
+        case .cpuOnly: "cpu-only"
+        case .cpuAndGPU: "cpu-and-gpu"
+        case .cpuAndNeuralEngine: "cpu-and-ne"
+        @unknown default: "unknown"
+        }
+    }
+
     static func printHeader() {
         print("""
         ╔══════════════════════════════════╗
@@ -142,6 +170,11 @@ struct GemmaChatCLI {
           /reset  — Clear conversation history
           /quit   — Exit
           /help   — Show this message
+
+        CLI flags:
+          --model <path>           Path to .mlpackage or .mlmodelc
+          --compute-units <units>  all | cpu-and-gpu (default) | cpu-only | cpu-and-ne
+          --tokenizer <id>         HuggingFace model ID for tokenizer
         
         """)
     }

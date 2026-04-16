@@ -149,10 +149,10 @@ public final class CoreMLModel: @unchecked Sendable {
         let decodeModel = try await MLModel.load(contentsOf: url, configuration: decodeConfig)
         print("[CoreML] Decode loaded. Inputs: \(Array(decodeModel.modelDescription.inputDescriptionsByName.keys).sorted())")
 
-        // Load prefill with cpuOnly just to extract I/O metadata.
-        print("[CoreML] Extracting prefill I/O metadata (cpuOnly)...")
+        // Load prefill with same compute units to extract I/O metadata.
+        print("[CoreML] Extracting prefill I/O metadata...")
         let prefillConfig = MLModelConfiguration()
-        prefillConfig.computeUnits = .cpuOnly
+        prefillConfig.computeUnits = computeUnits
         prefillConfig.functionName = "prefill"
         let tempPrefill = try await MLModel.load(contentsOf: url, configuration: prefillConfig)
 
