@@ -791,29 +791,11 @@ def main() -> None:
     # Internal: run a single phase (used by subprocess isolation).
     parser.add_argument("--_phase", help=argparse.SUPPRESS)
     parser.add_argument("--_phase-output", help=argparse.SUPPRESS)
-    # Internal: run materialize as a subprocess (memory isolation).
-    parser.add_argument("--_materialize-src", help=argparse.SUPPRESS)
-    parser.add_argument("--_materialize-dst", help=argparse.SUPPRESS)
-    parser.add_argument("--_materialize-sizes", help=argparse.SUPPRESS)
-    parser.add_argument("--_materialize-prefix", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     # If invoked as a subprocess for a single phase, run it and exit.
     if args._phase:
         _run_phase(args._phase, args, Path(args._phase_output))
-        return
-
-    # If invoked as a subprocess for materialization, run it and exit.
-    if args._materialize_src:
-        from gemma_chat.materialize import _materialize_single_function
-        sizes = [int(x) for x in args._materialize_sizes.split(",")]
-        _materialize_single_function(
-            Path(args._materialize_src),
-            Path(args._materialize_dst),
-            sizes,
-            source_function_name="main",
-            target_prefix=args._materialize_prefix,
-        )
         return
 
     if args.materialize and args.separate:
@@ -860,26 +842,25 @@ def main() -> None:
             print(f"\n!!! {phase} export failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(result.returncode)
 
-    def _subprocess_materialize(
-        src: Path, dst: Path, sizes: list[int], target_prefix: str,
-    ) -> None:
-        """Materialize `src` into `dst` in an isolated subprocess (memory safety)."""
-        cmd = [sys.executable, "-m", "gemma_chat.export"]
-        cmd += ["--_materialize-src", str(src)]
-        cmd += ["--_materialize-dst", str(dst)]
-        cmd += ["--_materialize-sizes", ",".join(str(s) for s in sizes)]
-        cmd += ["--_materialize-prefix", target_prefix]
+    def _subprocess_materialize(src: Path, dst: Path, sizes: list[int]) -> None:
+        """Materialize `src` → `dst` in a lean subprocess.
+
+        Target is ``gemma_chat.materialize`` (not ``gemma_chat.export``) so the
+        child doesn't import JAX/flax at startup — the pymil load + materialize
+        pass + final save need every spare GB, especially with a combined
+        (prefill + decode) multifunction source.
+        """
+        cmd = [sys.executable, "-m", "gemma_chat.materialize"]
+        cmd += ["--input", str(src)]
+        cmd += ["--output", str(dst)]
+        cmd += ["--sizes", ",".join(str(s) for s in sizes)]
         print(
-            f"\n  [materialize] {src.name} → {len(sizes)} functions "
-            f"({target_prefix}_{min(sizes)} … {target_prefix}_{max(sizes)}) …",
+            f"\n  [materialize] {src.name} → {len(sizes)} sizes per source function …",
             flush=True,
         )
         result = subprocess.run(cmd, env={**_os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
         if result.returncode != 0:
-            print(
-                f"\n!!! materialize {src} failed (exit {result.returncode})",
-                file=sys.stderr,
-            )
+            print(f"\n!!! materialize failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(result.returncode)
 
     if args.separate:
@@ -946,65 +927,43 @@ def main() -> None:
 
             from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
 
+            # ── Combine prefill + decode into a dynamic-shape multifunction ──
+            # Runs in the parent: each source is a single-function package
+            # with ~2.6 GB of weights, so the merge's peak memory is bounded.
+            # This intermediate feeds either the final output (non-materialize)
+            # or the materialize subprocess.
+            print("=" * 60)
+            print("Merging into multifunction .mlpackage (weight deduplication) ...")
+            print("=" * 60)
+            desc = MultiFunctionDescriptor()
+            if not args.decode_only:
+                desc.add_function(str(tmp_prefill), src_function_name="main",
+                                  target_function_name="prefill")
+            desc.add_function(str(tmp_decode), src_function_name="main",
+                              target_function_name="decode")
+            desc.default_function_name = "decode"
+
             if materialize_sizes:
-                # ── Materialize each phase into per-size functions ──
+                tmp_combined = tmp_dir / "combined.mlpackage"
+                save_multifunction(desc, str(tmp_combined))
+
+                # Materialize the combined multifunction. Loading it once into
+                # pymil and running materialize_symbolic_shape_program per
+                # source function keeps peak RAM at the weight-set size, vs
+                # the old per-phase-then-merge flow which multiplied weights
+                # by ``phases × sizes_per_phase`` and blew past 40 GB commit.
                 print("=" * 60)
                 print("Materializing dynamic shapes to per-size concrete functions …")
                 print("=" * 60)
-                tmp_prefill_mat = tmp_dir / "prefill_mat.mlpackage"
-                tmp_decode_mat = tmp_dir / "decode_mat.mlpackage"
-                if not args.decode_only:
-                    _subprocess_materialize(
-                        tmp_prefill, tmp_prefill_mat, materialize_sizes, "prefill",
-                    )
-                _subprocess_materialize(
-                    tmp_decode, tmp_decode_mat, materialize_sizes, "decode",
-                )
+                _subprocess_materialize(tmp_combined, output, materialize_sizes)
 
-                print("=" * 60)
-                print("Merging materialized functions into multifunction .mlpackage …")
-                print("=" * 60)
-                desc = MultiFunctionDescriptor()
-                if not args.decode_only:
-                    for s in materialize_sizes:
-                        desc.add_function(
-                            str(tmp_prefill_mat),
-                            src_function_name=f"prefill_{s}",
-                            target_function_name=f"prefill_{s}",
-                        )
-                for s in materialize_sizes:
-                    desc.add_function(
-                        str(tmp_decode_mat),
-                        src_function_name=f"decode_{s}",
-                        target_function_name=f"decode_{s}",
-                    )
-                # Pick the smallest decode size as default — least work for a
-                # freshly-loaded inference stack to spin up.
-                desc.default_function_name = f"decode_{min(materialize_sizes)}"
-
-                if output.exists():
-                    shutil.rmtree(output)
-                save_multifunction(desc, str(output))
-
+                n_phases = 1 if args.decode_only else 2
                 final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
                 print(
                     f"\n  Final model: {output} ({final_size / 1e9:.2f} GB, "
-                    f"{len(materialize_sizes) * (1 if args.decode_only else 2)} functions)\n"
+                    f"{len(materialize_sizes) * n_phases} functions)\n"
                 )
             else:
-                # ── Default path: single prefill + single decode, dynamic shapes ──
-                print("=" * 60)
-                print("Merging into multifunction .mlpackage (weight deduplication) ...")
-                print("=" * 60)
-
-                desc = MultiFunctionDescriptor()
-                if not args.decode_only:
-                    desc.add_function(str(tmp_prefill), src_function_name="main",
-                                      target_function_name="prefill")
-                desc.add_function(str(tmp_decode), src_function_name="main",
-                                  target_function_name="decode")
-                desc.default_function_name = "decode"
-
                 if output.exists():
                     shutil.rmtree(output)
                 save_multifunction(desc, str(output))

@@ -27,8 +27,8 @@ Usage
 uv run gemma-materialize --input gemma4-e2b.mlpackage --output gemma4-e2b-mat.mlpackage
 ```
 
-Defaults to sizes [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
-16384, 32768, 65536], matching the runtime doubling growth strategy.
+Defaults to sizes [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
+matching the runtime doubling growth strategy.
 """
 
 from __future__ import annotations
@@ -36,18 +36,17 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 from typing import Sequence
 
 import coremltools as ct
 
 
-# Default: powers of 2 from 64 to MAX_SEQ_LEN (65536).
-# Starting at 64 avoids compiling tiny functions that would never be used
+# Default: powers of 2 from 512 to MAX_SEQ_LEN (65536).
+# Starting at 512 avoids compiling tiny functions that would never be used
 # in practice (model compile time dominates at small sizes).
 DEFAULT_SIZES: tuple[int, ...] = tuple(
-    2 ** k for k in range(6, 17)   # 64, 128, 256, ..., 65536
+    2 ** k for k in range(9, 17)   # 512, 1024, 2048, ..., 65536
 )
 
 
@@ -187,6 +186,124 @@ def _source_function_names(spec) -> list[str]:
     return names if names else ["main"]
 
 
+def _clear_weight_ids(prog) -> None:
+    """Drop any ``weight_id`` attrs on const ops so the dedup pass can reassign
+    them. ``const_deduplication._deduplicate_const_across_functions`` hard-errors
+    if any const already has one set, and the milproto loader may partially
+    rehydrate them depending on coremltools version."""
+    for fn in prog.functions.values():
+        for op in fn.operations:
+            if op.op_type == "const" and getattr(op, "weight_id", None) is not None:
+                op.weight_id = None
+
+
+def _materialize_multifunction_source(
+    source_path: Path,
+    dest_path: Path,
+    sizes: Sequence[int],
+    source_function_names: Sequence[str],
+) -> None:
+    """Materialize every function of a (multi)function source into concrete
+    per-size clones, loading the source pymil program **once**.
+
+    For each ``src_fn`` in ``source_function_names``, produces
+    ``{src_fn}_{size}`` target functions by running the
+    ``materialize_symbolic_shape_program`` pass in-place on the same program.
+    The original dynamic-shape source functions are dropped before save (the
+    whole point of materializing is to shed RangeDim ops for ANE).
+
+    Avoids the memory blow-up of the old "materialize each phase → then
+    ``save_multifunction`` merge" flow: that merge loads each per-phase
+    multifunction package back into pymil, and rehydration undoes on-disk
+    weight sharing — each function gets freshly materialized numpy arrays,
+    scaling RAM with ``phases × sizes_per_phase`` instead of the weight set.
+    """
+    from coremltools.converters.mil.converter import mil_convert as _mil_convert
+    from coremltools.converters.mil.frontend.milproto import load as _milproto_to_pymil
+    from coremltools.converters.mil.mil.passes.defs.cleanup.const_deduplication import (
+        const_deduplication,
+    )
+    from coremltools.converters.mil.mil.passes.defs.symbol_transform import (
+        materialize_symbolic_shape_program,
+    )
+
+    src_model = ct.models.MLModel(str(source_path), skip_model_load=True)
+    spec = src_model._spec
+
+    prog = (
+        src_model._mil_program
+        if src_model._mil_program is not None
+        else _milproto_to_pymil.load(
+            spec, spec.specificationVersion, src_model.weights_dir,
+        )
+    )
+
+    # Re-establish cross-function const dedup on the loaded program. The
+    # milproto loader doesn't preserve on-disk ``weight_id`` sharing (those
+    # are a save-time construct), so prefill and decode come back with
+    # independent const ops even where the bytes are identical. Running the
+    # dedup pass NOW — before materialize clones those ops — assigns matching
+    # weight_ids by content hash, and the materialize pass propagates them to
+    # every concrete-shape clone. The final save then blob-shares across all
+    # {prefill,decode}_{size} functions, keeping the on-device artifact the
+    # size of one weight set instead of two.
+    _clear_weight_ids(prog)
+    const_deduplication()._deduplicate_const_across_functions(prog)
+
+    src_specs: list[tuple[str, list]] = []
+    for src_fn in source_function_names:
+        flexibles = _flexible_dim_inputs(spec, src_fn)
+        if not flexibles:
+            raise RuntimeError(
+                f"Source function {src_fn!r} has no flexible-dim inputs; "
+                "nothing to materialize."
+            )
+        src_specs.append((src_fn, flexibles))
+
+    for src_fn, flexibles in src_specs:
+        mat_map: dict[str, dict[str, tuple[int, ...]]] = {}
+        for size in sizes:
+            per_fn: dict[str, tuple[int, ...]] = {}
+            for name, shape_tmpl, sym_dim in flexibles:
+                concrete = list(shape_tmpl)
+                concrete[sym_dim] = size
+                per_fn[name] = tuple(concrete)
+            mat_map[f"{src_fn}_{size}"] = per_fn
+
+        pass_obj = materialize_symbolic_shape_program()
+        pass_obj.source_function_name = src_fn
+        pass_obj.function_name_to_materialization_map = mat_map
+        pass_obj.apply(prog)
+
+    for src_fn, _ in src_specs:
+        if src_fn in prog.functions:
+            del prog.functions[src_fn]
+
+    # Smallest decode (if present) as default — least work on load; matches
+    # gemma-export's convention.
+    if f"decode_{min(sizes)}" in prog.functions:
+        prog.default_function_name = f"decode_{min(sizes)}"
+    else:
+        first_src = source_function_names[0]
+        prog.default_function_name = f"{first_src}_{min(sizes)}"
+    prog.export_as_multifunction = True
+    prog.skip_all_passes = True
+
+    specification_version = max(spec.specificationVersion, ct.target.iOS18)
+    out = _mil_convert(
+        prog,
+        convert_from="milinternal",
+        convert_to="mlprogram",
+        specification_version=specification_version,
+        compute_units=ct.ComputeUnit.CPU_ONLY,
+        skip_model_load=True,
+    )
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if dest_path.exists():
+        shutil.rmtree(dest_path)
+    out.save(str(dest_path))
+
+
 def materialize_mlpackage(
     source_path: Path,
     dest_path: Path,
@@ -194,50 +311,27 @@ def materialize_mlpackage(
 ) -> None:
     """Materialize a dynamic-shape .mlpackage into a concrete multifunction.
 
-    If the source has one function (e.g. from ``gemma-export --separate``),
-    the output has ``size_{N}`` functions.  If the source is multifunction
-    (prefill + decode), the output has ``{fname}_{N}`` functions for each
-    source function ``fname`` and each ``N`` in `sizes`.
+    For a single-function (``main``-only) source, the output contains
+    ``main_{N}`` functions. For a named-function or multifunction source
+    (e.g. prefill + decode), the output contains ``{fname}_{N}`` functions
+    for each source function ``fname`` and each ``N`` in ``sizes``.
     """
-    # Peek at spec to learn which functions exist.
     peek = ct.models.MLModel(str(source_path), skip_model_load=True)
+    has_named_functions = len(peek._spec.description.functions) > 0
     fn_names = _source_function_names(peek._spec)
     del peek
 
-    with tempfile.TemporaryDirectory(prefix="gemma-mat-") as tmp:
-        partials: list[tuple[str, Path]] = []
-        for fname in fn_names:
-            part = Path(tmp) / f"{fname}_mat.mlpackage"
-            _materialize_single_function(
-                source_path, part, sizes,
-                source_function_name=fname,
-                target_prefix=fname,
-            )
-            partials.append((fname, part))
-
-        if len(partials) == 1 and len(sizes) == 1:
-            # Trivial: one materialized package, just move it.
-            if dest_path.exists():
-                shutil.rmtree(dest_path)
-            shutil.move(str(partials[0][1]), str(dest_path))
-            return
-
-        # Merge: one combined multifunction with ``{fname}_{size}`` functions.
-        desc = ct.utils.MultiFunctionDescriptor()
-        for fname, part in partials:
-            for size in sizes:
-                desc.add_function(
-                    str(part),
-                    src_function_name=f"{fname}_{size}",
-                    target_function_name=f"{fname}_{size}",
-                )
-        # Pick the largest size of the first source function as default.
-        first_fname = partials[0][0]
-        desc.default_function_name = f"{first_fname}_{max(sizes)}"
-
-        if dest_path.exists():
-            shutil.rmtree(dest_path)
-        ct.utils.save_multifunction(desc, str(dest_path))
+    if not has_named_functions:
+        # Old-style single-function source.
+        _materialize_single_function(
+            source_path, dest_path, sizes,
+            source_function_name="main",
+            target_prefix=fn_names[0],
+        )
+    else:
+        _materialize_multifunction_source(
+            source_path, dest_path, sizes, fn_names,
+        )
 
 
 def _parse_sizes(s: str) -> list[int]:
@@ -275,7 +369,7 @@ def main() -> None:
         "--sizes", type=_parse_sizes, default=list(DEFAULT_SIZES),
         help=(
             "Comma-separated list of concrete cache sizes (default: "
-            "powers of 2 from 8 to 65536)"
+            "powers of 2 from 512 to 65536)"
         ),
     )
     args = p.parse_args()
