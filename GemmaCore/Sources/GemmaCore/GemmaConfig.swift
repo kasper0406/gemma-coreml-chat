@@ -5,32 +5,35 @@
 
 import Foundation
 
-enum GemmaConfig {
+public enum GemmaConfig {
     /// Upper bound for global KV caches.  Models exported with RangeDim
     /// can dynamically grow up to this limit.
-    static let maxSeqLen = 65_536
+    public static let maxSeqLen = 65_536
 
     /// Sliding window size for LOCAL_SLIDING layers (ring-buffer length).
-    static let slidingWindowSize = 512
+    public static let slidingWindowSize = 512
 
     /// Tokens per chunked-prefill call.
-    static let chunkSize = 8
+    public static let chunkSize = 8
 
     /// Vocabulary size (Gemma4-E2B).
-    static let vocabSize = 262_144
+    public static let vocabSize = 262_144
 
     /// Number of KV arrays: 15 layers × (k + v) + 1 sliding_pos_ring.
-    static let numStateArrays = 31
+    public static let numStateArrays = 31
 
     /// EOS token ID for Gemma4.
-    static let eosTokenID: Int32 = 1
+    public static let eosTokenID: Int32 = 1
 
     /// End-of-turn token ID (``<turn|>``).
-    static let eotTokenID: Int32 = 106
+    public static let eotTokenID: Int32 = 106
 
     /// All token IDs that should stop generation.
-    static let stopTokenIDs: Set<Int32> = [eosTokenID, eotTokenID]
+    public static let stopTokenIDs: Set<Int32> = [eosTokenID, eotTokenID]
+
+    /// BOS (beginning-of-sequence) token ID.
+    public static let bosTokenID: Int = 2
 
     /// Pad token ID.
-    static let padTokenID: Int32 = 0
+    public static let padTokenID: Int32 = 0
 }

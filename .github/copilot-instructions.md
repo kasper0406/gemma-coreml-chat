@@ -3,40 +3,51 @@
 ## Commands
 
 ```bash
-# Install dependencies (uses uv)
+# Install Python dependencies (export only)
 uv sync
 
 # Export Gemma4-E2B to CoreML — one-time, takes 10–30 min
 uv run gemma-export
 
-# Run the chat TUI (requires .mlpackage to exist)
-uv run gemma-chat
+# Build the Swift CLI chat (requires .mlpackage to exist)
+cd cli && swift build -c release
+.build/release/GemmaChatCLI --model ../gemma4-e2b.mlpackage
 
-# Diagnostics
-uv run gemma-compare-inference --prompt "Hi"   # A/B: full model vs KV decode
-uv run gemma-parity-decode --max-tokens 8       # JAX vs CoreML logit parity
+# Build the iOS app (simulator, no signing)
+xcodebuild -project ios/GemmaChat/GemmaChat.xcodeproj -scheme GemmaChat \
+    -destination 'generic/platform=iOS Simulator' \
+    -configuration Debug -skipPackagePluginValidation \
+    CODE_SIGNING_ALLOWED=NO build
+
+# Python tests (MIL passes + multifunction export)
+uv run pytest tests/
 ```
 
-There is no test suite.
+The Python test suite in `tests/` covers MIL-pass correctness (`test_softcap_fusion.py`, `test_sdpa_fusion.py`, `test_broadcast_tiles.py`) and multifunction dynamic-shape export (`test_multifunction_dynamic.py`). There is no Swift test target yet — verify Swift changes by `swift build` in `cli/` and by running the CLI against an exported `.mlpackage`.
 
 ## Architecture
 
 This is a two-phase pipeline for running `google/gemma-4-E2B-it` locally on Apple Silicon via CoreML:
 
-**Phase 1 — Export (`gemma-export`, run once):**
+**Phase 1 — Export (`gemma-export`, Python, run once):**
 1. `weight_mapper.py` downloads HuggingFace safetensors and maps them to a nested Flax param dict (transposing all Linear kernels from `[out, in]` to `[in, out]`).
 2. `model.py` defines the full Gemma4 transformer in JAX/Flax (`Gemma4Transformer`).
 3. `decode_coreml.py` provides JAX-traceable `chunk_prefill_step` and `decode_step` functions that operate on a flat KV cache (30 arrays for 15 non-shared layers × k + v). These are designed for lowering to StableHLO.
 4. `cache_spec.py` defines the KV-cache layout: 15 caches (12 sliding ring-buffers + 3 global) for the 35-layer model. Layers 15–34 are KV-shared and read from layers 13 (sliding) and 14 (global).
 5. `export.py` traces both functions with `jax.jit(...).lower(...).compiler_ir('stablehlo')`, converts each to CoreML MIL via `stablehlo-coreml`, then merges them into a single multifunction `.mlpackage` using `MultiFunctionDescriptor` with shared (int8-quantized) weights.
 
-**Phase 2 — Chat (`gemma-chat`, runtime):**
-- `generate.py` loads the multifunction `.mlpackage` (prefill + decode functions) and runs KV-cached autoregressive inference. Chunked prefill processes the prompt in `CHUNK_SIZE=8` token chunks, then single-token decode generates new tokens with temperature + top-p sampling. Also provides a legacy full-sequence `generate()` path.
-- `chat.py` parses CLI args (backend, model path, decode-only, etc.), loads models, and delegates to `tui_app.py`.
-- `tui_app.py` provides the Textual-based terminal UI with streaming tokens, conversation history, token counts, and `/reset`/`/quit`/`/help` commands.
-- `jax_generate.py` provides a JAX-only token stream using `decode_jax.py` (for `--backend jax`).
+**Phase 2 — Inference (Swift):**
+All inference runs through native Swift via the `GemmaCore` shared library:
+
+- `GemmaCore/` — Swift Package (SPM) with model loading (`CoreMLModel`), KV cache management (`KVCacheState`), tokenization (`GemmaTokenizer`), sampling, and the inference engine (`InferenceEngine`). Caches `.mlmodelc` next to `.mlpackage` for ~20x faster loads vs Python coremltools.
+- `cli/` — Swift CLI chat app using GemmaCore. Readline-based with streaming output and `/reset`/`/quit`/`/help` commands.
+- `ios/GemmaChat/` — iOS SwiftUI chat app using GemmaCore as a local package dependency. Includes eager prefill (prefills prompt chunks as the user types) and an `EagerPrefillManager` actor that reuses KV state across turns.
 - `decode_jax.py` provides a pure-JAX KV-cached decode path with `prefill()` and `decode_step()` for reference and parity testing.
 
+**Inference API shape:**
+- `InferenceEngine.generate(...)` returns `AsyncThrowingStream<Int32, Error>` — always consume with `for try await` and surface errors to the user.
+- Pass a `GenerationContext` across turns to reuse the KV cache. The engine writes post-generation `cachedTokens` + `kvState` back to it; on the next call, prefix-match the new prompt against `cachedTokens` to compute a `prefillOffset` (see `resolveKVReuse` in `cli/Sources/GemmaChatCLI/main.swift`).
+- Empty prompts throw `InferenceError.emptyPrompt`; missing KV inputs throw `CoreMLModelError.missingKVInput` — do not add force-unwraps in place of these.
 
 ## Key Conventions
 
@@ -52,8 +63,9 @@ This is a two-phase pipeline for running `google/gemma-4-E2B-it` locally on Appl
 - Always use a **fresh** pipeline object from `build_ct_convert_pass_pipeline()` before `remove_passes()` — do not mutate stablehlo-coreml’s module-level `DEFAULT_HLO_PIPELINE` in place.
 - **Multifunction export:** Both chunk_prefill and decode are exported as separate `.mlpackage` files, then merged via `MultiFunctionDescriptor` with `const_deduplication` so int8 weight blobs are shared. The default function is `"decode"`.
 
-**CoreML model loading in `generate.py`:**
-- `load_coreml_model()` defaults to `ComputeUnit.ALL` (CPU + GPU + ANE). ANE compilation is slow (~10–30 min on first load) but gives the best runtime performance. For faster compilation during development, pass `ct.ComputeUnit.CPU_ONLY`.
+**CoreML model loading (`GemmaCore/Sources/GemmaCore/CoreMLModel.swift`):**
+- `CoreMLModel.load(from:)` accepts a `.mlpackage` or `.mlmodelc` URL. For `.mlpackage`, compiles and caches `.mlmodelc` alongside it at a stable path so E5RT cache is reused (~3s loads vs ~65s in Python).
+- Defaults to `MLComputeUnits.cpuAndGPU`. ANE compilation (`MLComputeUnits.all`) is slow (~10–30 min on first load) but gives the best runtime performance.
 - Multifunction models require passing `function_name="decode"` or `function_name="prefill"` when loading.
 
 **PLE (Per-Layer Input Embeddings):**

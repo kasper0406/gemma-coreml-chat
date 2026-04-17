@@ -7,9 +7,8 @@ options:
   createIntermediateGroups: true
 
 packages:
-  swift-transformers:
-    url: https://github.com/huggingface/swift-transformers
-    from: "0.1.12"
+  GemmaCore:
+    path: ../../GemmaCore
 
 targets:
   GemmaChat:
@@ -41,8 +40,8 @@ targets:
           fi
         basedOnDependencyAnalysis: false
     dependencies:
-      - package: swift-transformers
-        product: Transformers
+      - package: GemmaCore
+        product: GemmaCore
 
 schemes:
   GemmaChat:

@@ -5,6 +5,7 @@
 import Combine
 import CoreML
 import Foundation
+import GemmaCore
 import Observation
 import UIKit
 
@@ -46,9 +47,10 @@ final class ChatViewModel {
     private var eagerPrefill: EagerPrefillManager?
     private var generateTask: Task<Void, Never>?
     private var prefillDebounceTask: Task<Void, Never>?
+    private let genContext = GenerationContext()
 
     private func handleMemoryWarning() {
-        print("[Memory] Received memory warning")
+        Log.info("[Memory] Received memory warning")
         if isGenerating {
             cancelGeneration()
             messages.append(ChatMessage(
@@ -65,8 +67,15 @@ final class ChatViewModel {
         appState = .loadingModel
 
         do {
-            let tok = try await GemmaTokenizer()
+            guard let resourceURL = Bundle.main.resourceURL else {
+                throw GemmaTokenizerError.missingResources
+            }
+            let tok = try await GemmaTokenizer(from: resourceURL)
             tokenizer = tok
+
+            guard let modelURL = Bundle.main.url(forResource: "gemma4-e2b", withExtension: "mlpackage") else {
+                throw CoreMLModelError.modelNotFound
+            }
 
             #if targetEnvironment(simulator)
             let units: MLComputeUnits = .cpuOnly
@@ -74,7 +83,7 @@ final class ChatViewModel {
             let units: MLComputeUnits = .all
             #endif
 
-            let coreml = try await CoreMLModel.load(computeUnits: units)
+            let coreml = try await CoreMLModel.load(from: modelURL, computeUnits: units)
             model = coreml
 
             let eng = InferenceEngine(model: coreml, temperature: temperature, topP: topP)
@@ -83,9 +92,7 @@ final class ChatViewModel {
             eagerPrefill = EagerPrefillManager(
                 engine: eng,
                 tokenizer: tok,
-                model: coreml,
-                kvInputNames: coreml.prefillKVInputNames,
-                inputDescriptions: coreml.prefillInputDescriptions
+                model: coreml
             )
 
             // Listen for memory warnings (view model lives for app lifetime)
@@ -137,6 +144,7 @@ final class ChatViewModel {
         isGenerating = false
         generateTask?.cancel()
         generateTask = nil
+        genContext.reset()
         Task { await eagerPrefill?.reset() }
     }
 
@@ -173,11 +181,12 @@ final class ChatViewModel {
                     promptIDs: promptIDs,
                     maxNewTokens: maxNewTokens,
                     existingKVState: prefillOffset > 0 ? kvState : nil,
-                    prefillOffset: prefillOffset
+                    prefillOffset: prefillOffset,
+                    context: genContext
                 )
 
                 var genIDs: [Int32] = []
-                for await tokenID in stream {
+                for try await tokenID in stream {
                     if Task.isCancelled { break }
 
                     if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
@@ -194,8 +203,8 @@ final class ChatViewModel {
                 messages.append(ChatMessage(role: .assistant, content: reply))
                 streamingText = ""
 
-                // Reset eager prefill for next turn
-                await eagerPrefill.reset()
+                // Seed eager prefill with post-generation KV state for next turn
+                await eagerPrefill.seedFromGeneration(genContext)
 
             } catch {
                 messages.append(ChatMessage(

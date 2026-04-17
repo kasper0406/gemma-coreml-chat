@@ -7,40 +7,27 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		0D38ADFB71D788D22DAC13A0 /* Sampling.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9206056C512B4DCEEFE732B9 /* Sampling.swift */; };
 		0EF5F0A7D09591A844EC8DF4 /* GemmaChatApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B207F2CD85633210FFEA839E /* GemmaChatApp.swift */; };
-		0F3B986759B5EA5648896819 /* GemmaTokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C9C76ACFC785CB033D9EF63 /* GemmaTokenizer.swift */; };
-		132907DAF33CF3D94834600C /* CoreMLModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE4027786B0488160649B6F /* CoreMLModel.swift */; };
 		143A5182C11E6A95E6D9967F /* tokenizer.json in Resources */ = {isa = PBXBuildFile; fileRef = DDF3991E8FA675F13C45EA33 /* tokenizer.json */; };
-		270D9ABF1FCCC6706138668F /* GemmaConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03CA86D053E179B0CA9EAAE2 /* GemmaConfig.swift */; };
 		35C03FF0BCC7DEF24DB101F0 /* MessageBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = 60D0BEA6428CC562BE8B8A7E /* MessageBubble.swift */; };
-		482677552DBA145345B4FD33 /* ChatMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5CB91BD73CC63ECF23B7262 /* ChatMessage.swift */; };
 		5A948A4CBA704F08D9416C5E /* EagerPrefillManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 301C1490FBACE054E8287E43 /* EagerPrefillManager.swift */; };
 		5DEFE9B80827603380AE4639 /* gemma4-e2b.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 9F6A5021B26F8BEE5664BF4E /* gemma4-e2b.mlpackage */; };
 		6F60A6A0878DAFCFE884FE9F /* config.json in Resources */ = {isa = PBXBuildFile; fileRef = E9FB0E31BD81B9397D163213 /* config.json */; };
-		7B057D2F74679227B2CF17E9 /* KVCacheState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 081C9D09BFB72F618F63DD36 /* KVCacheState.swift */; };
-		94C38FC1EEB03F785CD1D55F /* InferenceEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E4DE3D585F9805AF3A78641 /* InferenceEngine.swift */; };
 		9FAB898F1BE20CAE7B34DC8D /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 212C9030150A4483E72711EE /* ChatView.swift */; };
-		CCBFCB69EE6EBA9944C6F95B /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = DBE99217AA42A8768A68756F /* Transformers */; };
+		CCBFCB69EE6EBA9944C6F95B /* GemmaCore in Frameworks */ = {isa = PBXBuildFile; productRef = 3943E9633C5E5DC78D7DD793 /* GemmaCore */; };
 		D55164855146D4118CDFC7E3 /* ChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFC71D0F71CB221FE0AE597C /* ChatViewModel.swift */; };
 		F3135014CE0F7AF95CCA47BF /* tokenizer_config.json in Resources */ = {isa = PBXBuildFile; fileRef = EE51E05D34E00FA9573429E4 /* tokenizer_config.json */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		03CA86D053E179B0CA9EAAE2 /* GemmaConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GemmaConfig.swift; sourceTree = "<group>"; };
-		081C9D09BFB72F618F63DD36 /* KVCacheState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KVCacheState.swift; sourceTree = "<group>"; };
 		212C9030150A4483E72711EE /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		301C1490FBACE054E8287E43 /* EagerPrefillManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EagerPrefillManager.swift; sourceTree = "<group>"; };
 		60D0BEA6428CC562BE8B8A7E /* MessageBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBubble.swift; sourceTree = "<group>"; };
-		6E4DE3D585F9805AF3A78641 /* InferenceEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceEngine.swift; sourceTree = "<group>"; };
-		9206056C512B4DCEEFE732B9 /* Sampling.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sampling.swift; sourceTree = "<group>"; };
 		99D203A78BE71B7A78428056 /* GemmaChat.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = GemmaChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		9C9C76ACFC785CB033D9EF63 /* GemmaTokenizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GemmaTokenizer.swift; sourceTree = "<group>"; };
 		9F6A5021B26F8BEE5664BF4E /* gemma4-e2b.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "gemma4-e2b.mlpackage"; path = "../../gemma4-e2b.mlpackage"; sourceTree = SOURCE_ROOT; };
-		A5CB91BD73CC63ECF23B7262 /* ChatMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
 		B207F2CD85633210FFEA839E /* GemmaChatApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GemmaChatApp.swift; sourceTree = "<group>"; };
+		C75FD9DD815328C0269010E2 /* GemmaCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = GemmaCore; path = ../../GemmaCore; sourceTree = SOURCE_ROOT; };
 		CFC71D0F71CB221FE0AE597C /* ChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatViewModel.swift; sourceTree = "<group>"; };
-		DDE4027786B0488160649B6F /* CoreMLModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreMLModel.swift; sourceTree = "<group>"; };
 		DDF3991E8FA675F13C45EA33 /* tokenizer.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = tokenizer.json; sourceTree = "<group>"; };
 		E9FB0E31BD81B9397D163213 /* config.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = config.json; sourceTree = "<group>"; };
 		EE51E05D34E00FA9573429E4 /* tokenizer_config.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = tokenizer_config.json; sourceTree = "<group>"; };
@@ -51,7 +38,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				CCBFCB69EE6EBA9944C6F95B /* Transformers in Frameworks */,
+				CCBFCB69EE6EBA9944C6F95B /* GemmaCore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -76,11 +63,20 @@
 			path = Resources;
 			sourceTree = "<group>";
 		};
+		3CB45C5E9CD92460391041A2 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				C75FD9DD815328C0269010E2 /* GemmaCore */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
 		3DA8B755C3483AE934AFD4A9 = {
 			isa = PBXGroup;
 			children = (
 				E05382E43C1AF15465767EFA /* gemma-coreml-chat */,
 				5C4C56DC43A4AF0066B869FA /* GemmaChat */,
+				3CB45C5E9CD92460391041A2 /* Packages */,
 				20B97DB073748D8AA78F3D84 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -108,25 +104,10 @@
 			children = (
 				B207F2CD85633210FFEA839E /* GemmaChatApp.swift */,
 				5BA0EB253FD8155D71EEC695 /* EagerPrefill */,
-				ABF8B89D803C2762ACD6DBDF /* Model */,
 				2ACAAD9D575640D6ED1579C1 /* Resources */,
 				5177EED4F2A34AF0A2FE9651 /* Views */,
 			);
 			path = GemmaChat;
-			sourceTree = "<group>";
-		};
-		ABF8B89D803C2762ACD6DBDF /* Model */ = {
-			isa = PBXGroup;
-			children = (
-				A5CB91BD73CC63ECF23B7262 /* ChatMessage.swift */,
-				DDE4027786B0488160649B6F /* CoreMLModel.swift */,
-				03CA86D053E179B0CA9EAAE2 /* GemmaConfig.swift */,
-				9C9C76ACFC785CB033D9EF63 /* GemmaTokenizer.swift */,
-				6E4DE3D585F9805AF3A78641 /* InferenceEngine.swift */,
-				081C9D09BFB72F618F63DD36 /* KVCacheState.swift */,
-				9206056C512B4DCEEFE732B9 /* Sampling.swift */,
-			);
-			path = Model;
 			sourceTree = "<group>";
 		};
 		E05382E43C1AF15465767EFA /* gemma-coreml-chat */ = {
@@ -145,6 +126,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 04184034176D3B68C329A079 /* Build configuration list for PBXNativeTarget "GemmaChat" */;
 			buildPhases = (
+				FA9149FFD4597FA7B3A8F3A4 /* Download Tokenizer */,
 				40BC2699CBA4970D3CF2A9FA /* Sources */,
 				BE276FA614DCE73BBF7AFAAD /* Resources */,
 				87FD223E9328E882B51ECE9A /* Frameworks */,
@@ -155,7 +137,7 @@
 			);
 			name = GemmaChat;
 			packageProductDependencies = (
-				DBE99217AA42A8768A68756F /* Transformers */,
+				3943E9633C5E5DC78D7DD793 /* GemmaCore */,
 			);
 			productName = GemmaChat;
 			productReference = 99D203A78BE71B7A78428056 /* GemmaChat.app */;
@@ -182,7 +164,7 @@
 			mainGroup = 3DA8B755C3483AE934AFD4A9;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				39696FEF65248C1EBD344EA8 /* XCRemoteSwiftPackageReference "swift-transformers" */,
+				18880F64583D5DCBD002575B /* XCLocalSwiftPackageReference "../../GemmaCore" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 20B97DB073748D8AA78F3D84 /* Products */;
@@ -208,23 +190,38 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		FA9149FFD4597FA7B3A8F3A4 /* Download Tokenizer */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Download Tokenizer";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "TOKENIZER_PATH=\"${SRCROOT}/GemmaChat/Resources/tokenizer.json\"\nif [ ! -f \"$TOKENIZER_PATH\" ]; then\n  echo \"Downloading tokenizer.json from HuggingFace...\"\n  curl -fSL \"https://huggingface.co/google/gemma-4-E2B-it/resolve/main/tokenizer.json\" \\\n    -o \"$TOKENIZER_PATH\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		40BC2699CBA4970D3CF2A9FA /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				482677552DBA145345B4FD33 /* ChatMessage.swift in Sources */,
 				9FAB898F1BE20CAE7B34DC8D /* ChatView.swift in Sources */,
 				D55164855146D4118CDFC7E3 /* ChatViewModel.swift in Sources */,
-				132907DAF33CF3D94834600C /* CoreMLModel.swift in Sources */,
 				5A948A4CBA704F08D9416C5E /* EagerPrefillManager.swift in Sources */,
 				0EF5F0A7D09591A844EC8DF4 /* GemmaChatApp.swift in Sources */,
-				270D9ABF1FCCC6706138668F /* GemmaConfig.swift in Sources */,
-				0F3B986759B5EA5648896819 /* GemmaTokenizer.swift in Sources */,
-				94C38FC1EEB03F785CD1D55F /* InferenceEngine.swift in Sources */,
-				7B057D2F74679227B2CF17E9 /* KVCacheState.swift in Sources */,
 				35C03FF0BCC7DEF24DB101F0 /* MessageBubble.swift in Sources */,
-				0D38ADFB71D788D22DAC13A0 /* Sampling.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -417,22 +414,17 @@
 		};
 /* End XCConfigurationList section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-		39696FEF65248C1EBD344EA8 /* XCRemoteSwiftPackageReference "swift-transformers" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/huggingface/swift-transformers";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 0.1.12;
-			};
+/* Begin XCLocalSwiftPackageReference section */
+		18880F64583D5DCBD002575B /* XCLocalSwiftPackageReference "../../GemmaCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../GemmaCore;
 		};
-/* End XCRemoteSwiftPackageReference section */
+/* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		DBE99217AA42A8768A68756F /* Transformers */ = {
+		3943E9633C5E5DC78D7DD793 /* GemmaCore */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 39696FEF65248C1EBD344EA8 /* XCRemoteSwiftPackageReference "swift-transformers" */;
-			productName = Transformers;
+			productName = GemmaCore;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
