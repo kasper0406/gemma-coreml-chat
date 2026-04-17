@@ -156,13 +156,19 @@ public struct KVCacheState: @unchecked Sendable {
         )
     }
 
-    /// Grow global caches so dim-1 >= `needed` using a doubling strategy.
+    /// Grow global caches so dim-1 >= `needed` using a power-of-2 strategy.
     /// Returns self unchanged if no growth is required or if there are no global caches.
+    ///
+    /// Always rounds up to the next power of 2 for alignment and
+    /// materialized-model compatibility.
     public func grownToFit(needed: Int, maxLen: Int) throws -> KVCacheState {
         guard !globalNames.isEmpty else { return self }
         guard let curSize = currentGlobalCacheSize, curSize < needed else { return self }
 
-        let newLen = min(max(curSize * 2, needed), maxLen)
+        // Next power of 2 >= needed, clamped to maxLen.
+        var newLen = 1
+        while newLen < needed { newLen *= 2 }
+        newLen = min(newLen, maxLen)
         Log.info("[KV] Growing global caches: \(curSize) → \(newLen) (needed \(needed))")
 
         var newDict = arraysByName

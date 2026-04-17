@@ -43,9 +43,11 @@ from typing import Sequence
 import coremltools as ct
 
 
-# Default: powers of 2 from CHUNK_SIZE (8) to MAX_SEQ_LEN (65536).
+# Default: powers of 2 from 64 to MAX_SEQ_LEN (65536).
+# Starting at 64 avoids compiling tiny functions that would never be used
+# in practice (model compile time dominates at small sizes).
 DEFAULT_SIZES: tuple[int, ...] = tuple(
-    2 ** k for k in range(3, 17)   # 8, 16, 32, ..., 65536
+    2 ** k for k in range(6, 17)   # 64, 128, 256, ..., 65536
 )
 
 
