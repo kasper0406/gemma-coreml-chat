@@ -1,13 +1,16 @@
 """Export Gemma4-E2B chunk_prefill + decode_step as a CoreML .mlpackage.
 
 By default, both functions are merged into a single multifunction .mlpackage
-with shared (int4-quantized) weights and RangeDim on global KV caches for
-dynamic context window sizing up to 60k tokens.
+with shared (int4-quantized) weights, and the global KV caches are
+materialized into one concrete-shape function per size so the model runs on
+ANE / CPU as well as GPU.  Pass --no-materialize to keep RangeDim shapes
+(GPU-only) for a single dynamic-shape function pair.
 
 Usage:
     uv run gemma-export
     uv run gemma-export --output gemma4-e2b.mlpackage
-    uv run gemma-export --skip-warmup   # save RAM on constrained machines
+    uv run gemma-export --no-materialize  # GPU-only, dynamic-shape export
+    uv run gemma-export --skip-warmup     # save RAM on constrained machines
 """
 
 from __future__ import annotations
@@ -725,8 +728,10 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Export Gemma4-E2B prefill + decode as a CoreML .mlpackage "
-            "with dynamic shapes (RangeDim) for global KV caches."
+            "Export Gemma4-E2B prefill + decode as a CoreML .mlpackage.  "
+            "By default the global KV caches are materialized to concrete "
+            "per-size functions for ANE/CPU compatibility; pass "
+            "--no-materialize for a GPU-only dynamic-shape (RangeDim) export."
         )
     )
     parser.add_argument(
@@ -771,13 +776,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--materialize",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Replace the dynamic-shape (RangeDim) global KV caches with one "
             "concrete-shape function per size.  Produces an ANE-compatible "
             "multifunction .mlpackage with `{prefill,decode}_{size}` functions "
             "that share deduplicated weights.  Defaults to powers of 2 from "
-            "CHUNK_SIZE to --max-seq-len; override with --materialize-sizes."
+            "CHUNK_SIZE to --max-seq-len; override with --materialize-sizes.  "
+            "Enabled by default because the ANE and CPU backends hit runtime "
+            "issues with RangeDim shapes; pass --no-materialize for a "
+            "GPU-only dynamic-shape export."
         ),
     )
     parser.add_argument(

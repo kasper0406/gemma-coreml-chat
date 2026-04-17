@@ -59,11 +59,18 @@ public final class CoreMLModel: @unchecked Sendable {
     /// Compute units used for all function loads.
     private let computeUnits: MLComputeUnits
 
+    /// `MLModel` isn't `Sendable`, so we can't use `Task<MLModel, Error>`
+    /// directly. Wrap it in an @unchecked-Sendable box: CoreML's own loading
+    /// is already thread-safe, and we never mutate the model instance.
+    private struct SendableMLModel: @unchecked Sendable {
+        let model: MLModel
+    }
+
     /// Per-function state: either fully loaded, or a pending load Task that
     /// concurrent callers can join rather than re-issuing the load.
     private enum LoadState {
         case loaded(MLModel)
-        case loading(Task<MLModel, Error>)
+        case loading(Task<SendableMLModel, Error>)
     }
 
     /// Function state keyed by function name (e.g. "decode" or "decode_512").
@@ -241,8 +248,8 @@ public final class CoreMLModel: @unchecked Sendable {
     ) async throws -> CoreMLModel {
         let candidateSizes = (6...16).map { 1 << $0 }  // 64, 128, ..., 65536
 
-        let probeResults: [(size: Int, model: MLModel?)] = await withTaskGroup(
-            of: (Int, MLModel?).self
+        let probeResults: [(size: Int, model: SendableMLModel?)] = await withTaskGroup(
+            of: (Int, SendableMLModel?).self
         ) { group in
             for s in candidateSizes {
                 group.addTask {
@@ -250,16 +257,16 @@ public final class CoreMLModel: @unchecked Sendable {
                     config.computeUnits = computeUnits
                     config.functionName = "decode_\(s)"
                     let model = try? await MLModel.load(contentsOf: url, configuration: config)
-                    return (s, model)
+                    return (s, model.map { SendableMLModel(model: $0) })
                 }
             }
-            var out: [(size: Int, model: MLModel?)] = []
+            var out: [(size: Int, model: SendableMLModel?)] = []
             for await r in group { out.append(r) }
             return out
         }
 
         let loadedDecodes = probeResults
-            .compactMap { r in r.model.map { (size: r.size, model: $0) } }
+            .compactMap { r in r.model.map { (size: r.size, model: $0.model) } }
             .sorted { $0.size < $1.size }
         guard !loadedDecodes.isEmpty else {
             throw CoreMLModelError.modelNotFound
@@ -399,44 +406,68 @@ public final class CoreMLModel: @unchecked Sendable {
         }
     }
 
-    /// Load a single function by name. Concurrent callers for the same name
-    /// share one in-flight Task instead of issuing duplicate loads.
-    @discardableResult
-    private func loadIfNeeded(name: String) async throws -> MLModel {
+    /// Result of checking the cache for `name`: an already-loaded model, or a
+    /// load Task (either newly started by us or one a concurrent caller had
+    /// already kicked off).
+    private enum CacheLookup {
+        case existing(MLModel)
+        case pending(Task<SendableMLModel, Error>)
+    }
+
+    /// Atomically look up `name`; if absent, start a new load Task and record
+    /// it. All `NSLock` traffic is confined to this sync method so callers in
+    /// async contexts never touch the lock directly.
+    private func lookupOrStart(name: String) -> CacheLookup {
         cacheLock.lock()
+        defer { cacheLock.unlock() }
         if let state = functions[name] {
             switch state {
-            case .loaded(let m):
-                cacheLock.unlock()
-                return m
-            case .loading(let task):
-                cacheLock.unlock()
-                return try await task.value
+            case .loaded(let m): return .existing(m)
+            case .loading(let task): return .pending(task)
             }
         }
         let url = modelURL
         let units = computeUnits
-        let task: Task<MLModel, Error> = Task {
+        let task: Task<SendableMLModel, Error> = Task {
             let config = MLModelConfiguration()
             config.computeUnits = units
             config.functionName = name
-            return try await MLModel.load(contentsOf: url, configuration: config)
+            let model = try await MLModel.load(contentsOf: url, configuration: config)
+            return SendableMLModel(model: model)
         }
         functions[name] = .loading(task)
-        cacheLock.unlock()
+        return .pending(task)
+    }
 
-        do {
-            let model = try await task.value
-            cacheLock.lock()
-            functions[name] = .loaded(model)
-            cacheLock.unlock()
-            Log.info("[CoreML] Function '\(name)' loaded.")
+    private func markLoaded(name: String, model: MLModel) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        functions[name] = .loaded(model)
+    }
+
+    private func clearPending(name: String) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        if case .loading = functions[name] { functions.removeValue(forKey: name) }
+    }
+
+    /// Load a single function by name. Concurrent callers for the same name
+    /// share one in-flight Task instead of issuing duplicate loads.
+    @discardableResult
+    private func loadIfNeeded(name: String) async throws -> MLModel {
+        switch lookupOrStart(name: name) {
+        case .existing(let model):
             return model
-        } catch {
-            cacheLock.lock()
-            if case .loading = functions[name] { functions.removeValue(forKey: name) }
-            cacheLock.unlock()
-            throw error
+        case .pending(let task):
+            do {
+                let model = try await task.value.model
+                markLoaded(name: name, model: model)
+                Log.info("[CoreML] Function '\(name)' loaded.")
+                return model
+            } catch {
+                clearPending(name: name)
+                throw error
+            }
         }
     }
 

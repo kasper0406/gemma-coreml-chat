@@ -22,6 +22,7 @@ uv sync
 
 # 2. Export the model to CoreML (one-time, ~10-30 min, ~8 GB disk)
 uv run gemma-export
+# (add --no-materialize for a GPU-only, dynamic-shape export — see below)
 
 # 3. Build and run the Swift CLI chat
 cd cli && swift build -c release
@@ -35,6 +36,8 @@ The first CLI launch compiles `.mlpackage` → `.mlmodelc` next to the source (c
 ### Phase 1 — Export (Python, run once)
 
 `uv run gemma-export` downloads HF weights, defines the full transformer in JAX/Flax, and traces it via `jax.jit` → StableHLO → CoreML MIL, producing a single multifunction `.mlpackage` with both **chunked prefill** and **KV-cached decode** functions (and the embedded tokenizer).
+
+**Materialized by default (`--materialize`).** The exporter materializes the global KV caches into one concrete-shape function pair per cache size (powers of 2 up to `--max-seq-len`), sharing deduplicated weights across functions. This is the default because the **ANE and CPU** CoreML backends have runtime issues with dynamic (`RangeDim`) shapes — they either fail to load or fall back silently to GPU. If you only care about the **GPU** backend, pass `--no-materialize` to skip materialization and emit a single dynamic-shape function pair instead.
 
 ### Phase 2 — Inference (Swift)
 
