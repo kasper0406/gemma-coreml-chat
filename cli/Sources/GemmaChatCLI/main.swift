@@ -50,6 +50,21 @@ struct GemmaChatCLI {
         let loadTime = CFAbsoluteTimeGetCurrent() - loadStart
         print("Model loaded in \(String(format: "%.1f", loadTime))s")
 
+        // --- First-run warm-up ---
+        // If the ANE / E5RT cache has never been populated for this model +
+        // compute units, compile all function pairs up front rather than
+        // stalling mid-chat when the user crosses a context-size boundary.
+        if !model.isWarmed {
+            print("First launch: compiling all functions for this device (this may take a few minutes)...")
+            let warmStart = CFAbsoluteTimeGetCurrent()
+            await model.warmSynchronously { done, total in
+                print("\r  \(done)/\(total) functions ready", terminator: "")
+                fflush(stdout)
+            }
+            let warmTime = CFAbsoluteTimeGetCurrent() - warmStart
+            print("\nWarm-up complete in \(String(format: "%.1f", warmTime))s")
+        }
+
         // --- Load tokenizer (embedded in .mlpackage, or from HuggingFace) ---
         print("Loading tokenizer...")
         let tokenizer: GemmaTokenizer

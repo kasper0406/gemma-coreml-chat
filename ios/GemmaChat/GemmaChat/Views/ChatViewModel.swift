@@ -12,6 +12,7 @@ import UIKit
 /// App-wide loading state.
 enum AppState: Equatable {
     case loadingModel
+    case warmingUp(completed: Int, total: Int)
     case ready
     case error(String)
 }
@@ -85,6 +86,19 @@ final class ChatViewModel {
 
             let coreml = try await CoreMLModel.load(from: modelURL, computeUnits: units)
             model = coreml
+
+            // First-run warm-up: if the ANE / E5RT cache has never been
+            // populated for this model + compute units, compile all function
+            // pairs up front with a progress UI rather than letting the user
+            // hit multi-minute stalls partway through a chat.
+            if !coreml.isWarmed {
+                appState = .warmingUp(completed: 0, total: 1)
+                await coreml.warmSynchronously { [weak self] done, total in
+                    Task { @MainActor in
+                        self?.appState = .warmingUp(completed: done, total: total)
+                    }
+                }
+            }
 
             let eng = InferenceEngine(model: coreml, temperature: temperature, topP: topP)
             engine = eng
