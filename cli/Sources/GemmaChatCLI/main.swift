@@ -179,16 +179,24 @@ struct GemmaChatCLI {
             return (nil, 0)
         }
 
-        // Verify token-by-token prefix match
+        // Find the longest common prefix. BPE round-trips (decode → re-encode
+        // via chat template) can change tokens at turn boundaries, so we
+        // fall back to a partial match rather than throwing out the cache.
+        var matchLen = 0
         for i in 0..<cached.count {
-            if cached[i] != promptIDs[i] {
-                Log.info("[KV] Prefix mismatch at position \(i) — full prefill")
-                return (nil, 0)
-            }
+            if cached[i] != promptIDs[i] { break }
+            matchLen = i + 1
         }
-
-        Log.info("[KV] Reusing \(cached.count)/\(promptIDs.count) tokens from cache")
-        return (kv, cached.count)
+        guard matchLen > 0 else {
+            Log.info("[KV] Prefix mismatch at position 0 — full prefill (cached[0]=\(cached[0]) prompt[0]=\(promptIDs[0]))")
+            return (nil, 0)
+        }
+        if matchLen < cached.count {
+            Log.info("[KV] Partial prefix match: reusing \(matchLen)/\(promptIDs.count) tokens (cache had \(cached.count); first mismatch at \(matchLen): cached=\(cached[matchLen]) prompt=\(promptIDs[matchLen]))")
+        } else {
+            Log.info("[KV] Reusing \(matchLen)/\(promptIDs.count) tokens from cache")
+        }
+        return (kv, matchLen)
     }
 
     // MARK: - Logging

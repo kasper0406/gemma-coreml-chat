@@ -57,7 +57,13 @@ public final class GemmaTokenizer: @unchecked Sendable {
             messages.append(["role": "system", "content": sys])
         }
         for msg in history {
-            let role = msg.role == .assistant ? "assistant" : "user"
+            // Gemma's chat template hardcodes `<|turn>model\n` for the generation
+            // prompt (turn 1) but renders assistant messages as `<|turn>{role}\n`.
+            // The template's role mapping (`assistant` → `model`) is not evaluated
+            // by swift-transformers' Jinja, so we pre-map here to keep the rendered
+            // prefix stable across turns — otherwise KV reuse breaks at the role
+            // token (turn 1 sees `model`, turn 2 sees `assistant`).
+            let role = msg.role == .assistant ? "model" : "user"
             messages.append(["role": role, "content": msg.content])
         }
         var ids: [Int]
