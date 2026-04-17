@@ -706,6 +706,19 @@ def _run_phase(phase: str, args: argparse.Namespace, output_path: Path) -> None:
         raise ValueError(f"Unknown phase: {phase}")
 
 
+def _parse_materialize_sizes(s: str | None) -> list[int]:
+    """Parse a comma-separated list of sizes, or default to powers of 2."""
+    from gemma_chat.materialize import DEFAULT_SIZES
+    if s is None:
+        return list(DEFAULT_SIZES)
+    out = [int(tok) for tok in s.split(",") if tok.strip()]
+    if not out:
+        raise argparse.ArgumentTypeError("--materialize-sizes: empty list")
+    if any(v <= 0 for v in out):
+        raise argparse.ArgumentTypeError("--materialize-sizes: values must be positive")
+    return sorted(set(out))
+
+
 def main() -> None:
     import shutil
     import tempfile
@@ -756,15 +769,75 @@ def main() -> None:
             "instead of a single multifunction model."
         ),
     )
+    parser.add_argument(
+        "--materialize",
+        action="store_true",
+        help=(
+            "Replace the dynamic-shape (RangeDim) global KV caches with one "
+            "concrete-shape function per size.  Produces an ANE-compatible "
+            "multifunction .mlpackage with `{prefill,decode}_{size}` functions "
+            "that share deduplicated weights.  Defaults to powers of 2 from "
+            "CHUNK_SIZE to --max-seq-len; override with --materialize-sizes."
+        ),
+    )
+    parser.add_argument(
+        "--materialize-sizes",
+        default=None,
+        help=(
+            "Comma-separated concrete cache sizes when --materialize is set "
+            "(default: powers of 2 from 8 up to --max-seq-len)"
+        ),
+    )
     # Internal: run a single phase (used by subprocess isolation).
     parser.add_argument("--_phase", help=argparse.SUPPRESS)
     parser.add_argument("--_phase-output", help=argparse.SUPPRESS)
+    # Internal: run materialize as a subprocess (memory isolation).
+    parser.add_argument("--_materialize-src", help=argparse.SUPPRESS)
+    parser.add_argument("--_materialize-dst", help=argparse.SUPPRESS)
+    parser.add_argument("--_materialize-sizes", help=argparse.SUPPRESS)
+    parser.add_argument("--_materialize-prefix", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     # If invoked as a subprocess for a single phase, run it and exit.
     if args._phase:
         _run_phase(args._phase, args, Path(args._phase_output))
         return
+
+    # If invoked as a subprocess for materialization, run it and exit.
+    if args._materialize_src:
+        from gemma_chat.materialize import _materialize_single_function
+        sizes = [int(x) for x in args._materialize_sizes.split(",")]
+        _materialize_single_function(
+            Path(args._materialize_src),
+            Path(args._materialize_dst),
+            sizes,
+            source_function_name="main",
+            target_prefix=args._materialize_prefix,
+        )
+        return
+
+    if args.materialize and args.separate:
+        parser.error("--materialize cannot be combined with --separate")
+
+    materialize_sizes: list[int] = []
+    if args.materialize:
+        materialize_sizes = _parse_materialize_sizes(args.materialize_sizes)
+        # Cap sizes to --max-seq-len.
+        over = [s for s in materialize_sizes if s > args.max_seq_len]
+        if over:
+            print(
+                f"  [materialize] dropping sizes > --max-seq-len ({args.max_seq_len}): {over}",
+                flush=True,
+            )
+            materialize_sizes = [s for s in materialize_sizes if s <= args.max_seq_len]
+        if not materialize_sizes:
+            parser.error(
+                "--materialize: no valid sizes after clamping to --max-seq-len"
+            )
+        print(
+            f"\nMaterialize plan: one function per size in {materialize_sizes}",
+            flush=True,
+        )
 
     output = Path(args.output)
 
@@ -785,6 +858,28 @@ def main() -> None:
         result = subprocess.run(cmd, env={**_os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
         if result.returncode != 0:
             print(f"\n!!! {phase} export failed (exit {result.returncode})", file=sys.stderr)
+            sys.exit(result.returncode)
+
+    def _subprocess_materialize(
+        src: Path, dst: Path, sizes: list[int], target_prefix: str,
+    ) -> None:
+        """Materialize `src` into `dst` in an isolated subprocess (memory safety)."""
+        cmd = [sys.executable, "-m", "gemma_chat.export"]
+        cmd += ["--_materialize-src", str(src)]
+        cmd += ["--_materialize-dst", str(dst)]
+        cmd += ["--_materialize-sizes", ",".join(str(s) for s in sizes)]
+        cmd += ["--_materialize-prefix", target_prefix]
+        print(
+            f"\n  [materialize] {src.name} → {len(sizes)} functions "
+            f"({target_prefix}_{min(sizes)} … {target_prefix}_{max(sizes)}) …",
+            flush=True,
+        )
+        result = subprocess.run(cmd, env={**_os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        if result.returncode != 0:
+            print(
+                f"\n!!! materialize {src} failed (exit {result.returncode})",
+                file=sys.stderr,
+            )
             sys.exit(result.returncode)
 
     if args.separate:
@@ -851,24 +946,71 @@ def main() -> None:
 
             from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
 
-            print("=" * 60)
-            print("Merging into multifunction .mlpackage (weight deduplication) ...")
-            print("=" * 60)
+            if materialize_sizes:
+                # ── Materialize each phase into per-size functions ──
+                print("=" * 60)
+                print("Materializing dynamic shapes to per-size concrete functions …")
+                print("=" * 60)
+                tmp_prefill_mat = tmp_dir / "prefill_mat.mlpackage"
+                tmp_decode_mat = tmp_dir / "decode_mat.mlpackage"
+                if not args.decode_only:
+                    _subprocess_materialize(
+                        tmp_prefill, tmp_prefill_mat, materialize_sizes, "prefill",
+                    )
+                _subprocess_materialize(
+                    tmp_decode, tmp_decode_mat, materialize_sizes, "decode",
+                )
 
-            desc = MultiFunctionDescriptor()
-            if not args.decode_only:
-                desc.add_function(str(tmp_prefill), src_function_name="main",
-                                  target_function_name="prefill")
-            desc.add_function(str(tmp_decode), src_function_name="main",
-                              target_function_name="decode")
-            desc.default_function_name = "decode"
+                print("=" * 60)
+                print("Merging materialized functions into multifunction .mlpackage …")
+                print("=" * 60)
+                desc = MultiFunctionDescriptor()
+                if not args.decode_only:
+                    for s in materialize_sizes:
+                        desc.add_function(
+                            str(tmp_prefill_mat),
+                            src_function_name=f"prefill_{s}",
+                            target_function_name=f"prefill_{s}",
+                        )
+                for s in materialize_sizes:
+                    desc.add_function(
+                        str(tmp_decode_mat),
+                        src_function_name=f"decode_{s}",
+                        target_function_name=f"decode_{s}",
+                    )
+                # Pick the smallest decode size as default — least work for a
+                # freshly-loaded inference stack to spin up.
+                desc.default_function_name = f"decode_{min(materialize_sizes)}"
 
-            if output.exists():
-                shutil.rmtree(output)
-            save_multifunction(desc, str(output))
+                if output.exists():
+                    shutil.rmtree(output)
+                save_multifunction(desc, str(output))
 
-            final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
-            print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
+                final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
+                print(
+                    f"\n  Final model: {output} ({final_size / 1e9:.2f} GB, "
+                    f"{len(materialize_sizes) * (1 if args.decode_only else 2)} functions)\n"
+                )
+            else:
+                # ── Default path: single prefill + single decode, dynamic shapes ──
+                print("=" * 60)
+                print("Merging into multifunction .mlpackage (weight deduplication) ...")
+                print("=" * 60)
+
+                desc = MultiFunctionDescriptor()
+                if not args.decode_only:
+                    desc.add_function(str(tmp_prefill), src_function_name="main",
+                                      target_function_name="prefill")
+                desc.add_function(str(tmp_decode), src_function_name="main",
+                                  target_function_name="decode")
+                desc.default_function_name = "decode"
+
+                if output.exists():
+                    shutil.rmtree(output)
+                save_multifunction(desc, str(output))
+
+                final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
+                print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
 
             _embed_tokenizer(args.model_id, output)
 

@@ -28,6 +28,9 @@ dependencies = [
 [project.scripts]
 # Export prefill + decode CoreML models (run once, ~10-30 min):
 gemma-export = "gemma_chat.export:main"
+# Materialize a dynamic-shape .mlpackage into a concrete multifunction one
+# (ANE-compatible; one function per power-of-2 cache size):
+gemma-materialize = "gemma_chat.materialize:main"
 
 [dependency-groups]
 dev = [
