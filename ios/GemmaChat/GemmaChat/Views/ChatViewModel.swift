@@ -81,7 +81,7 @@ final class ChatViewModel {
             #if targetEnvironment(simulator)
             let units: MLComputeUnits = .cpuOnly
             #else
-            let units: MLComputeUnits = .all
+            let units: MLComputeUnits = .cpuAndGPU
             #endif
 
             let coreml = try await CoreMLModel.load(from: modelURL, computeUnits: units)
