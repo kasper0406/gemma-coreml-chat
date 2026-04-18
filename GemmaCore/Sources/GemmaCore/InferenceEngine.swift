@@ -70,7 +70,7 @@ public struct InferenceEngine: Sendable {
                     let genStart = CFAbsoluteTimeGetCurrent()
                     let ids = truncatePromptIDs(
                         promptIDs,
-                        maxSeqLen: GemmaConfig.maxSeqLen,
+                        maxSeqLen: model.effectiveMaxSeqLen,
                         reserveForGeneration: maxNewTokens
                     )
 
@@ -141,16 +141,16 @@ public struct InferenceEngine: Sendable {
                     }
 
                     // --- Decode Loop ---
-                    let maxSteps = min(maxNewTokens, GemmaConfig.maxSeqLen - nReal)
+                    let maxSteps = min(maxNewTokens, model.effectiveMaxSeqLen - nReal)
 
                     // Pre-allocate the global KV cache to its final decode size so we don't
                     // re-allocate every step. Each grow returns a fresh MLMultiArray; once it
                     // is passed to a prediction, CoreML backs it with an IOSurface that isn't
                     // released promptly. Repeated growth exhausts the IOSurface pool after
                     // enough steps ("Failed to allocate E5 buffer object").
-                    let targetCacheSize = min(nReal + maxSteps, GemmaConfig.maxSeqLen)
+                    let targetCacheSize = min(nReal + maxSteps, model.effectiveMaxSeqLen)
                     var currentKV = try kvState.grownToFit(
-                        needed: targetCacheSize, maxLen: GemmaConfig.maxSeqLen
+                        needed: targetCacheSize, maxLen: model.effectiveMaxSeqLen
                     )
 
                     // Pre-load the decode function for the target cache size.
@@ -182,7 +182,7 @@ public struct InferenceEngine: Sendable {
 
                         currentKV = try currentKV.grownToFit(
                             needed: Int(position) + 1,
-                            maxLen: GemmaConfig.maxSeqLen
+                            maxLen: model.effectiveMaxSeqLen
                         )
 
                         // Safety: verify position fits in the global cache before decode.
@@ -283,7 +283,7 @@ public struct InferenceEngine: Sendable {
                                    count: paddedLen - nReal)
 
         let startChunk = fromOffset / GemmaConfig.chunkSize
-        var currentKV = try kvState.grownToFit(needed: paddedLen, maxLen: GemmaConfig.maxSeqLen)
+        var currentKV = try kvState.grownToFit(needed: paddedLen, maxLen: model.effectiveMaxSeqLen)
 
         // Ensure the function for the (possibly grown) cache size is loaded.
         if let gcSize = currentKV.currentGlobalCacheSize {

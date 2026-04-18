@@ -213,7 +213,7 @@ actor EagerPrefillManager {
                 if startChunk == 0 {
                     kvState = try Self.emptyKV(model: model, initialGlobalSize: roundedSize)
                 } else {
-                    kvState = try kvState.grownToFit(needed: roundedSize, maxLen: GemmaConfig.maxSeqLen)
+                    kvState = try kvState.grownToFit(needed: roundedSize, maxLen: model.effectiveMaxSeqLen)
                 }
                 try await model.ensureLoaded(forGlobalCacheSize: roundedSize)
             }

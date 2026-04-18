@@ -49,7 +49,22 @@ public final class CoreMLModel: @unchecked Sendable {
     public let prefillKVDtypes: [String: MLMultiArrayDataType]
 
     /// Available materialized sizes (sorted ascending), or nil for standard models.
+    /// If the caller passed `maxContextSize`, this is the filtered list.
     public let materializedSizes: [Int]?
+
+    /// Largest sequence length this model can actually handle. For standard
+    /// (RangeDim) models, `GemmaConfig.maxSeqLen`. For materialized models,
+    /// the largest retained size — either all sizes from the manifest or the
+    /// caller-imposed `maxContextSize` cap. The engine uses this instead of
+    /// `GemmaConfig.maxSeqLen` so KV growth never exceeds a size we actually
+    /// loaded a function for.
+    public let effectiveMaxSeqLen: Int
+
+    /// True when only decode functions are loaded. `prefill()` calls fall back
+    /// to running `decode()` per-token internally — slower (no chunked prefill
+    /// kernel), but halves resident-MLModel count, which is the difference
+    /// between fitting and OOM on tight devices like iPhone 12 Pro.
+    public let isDecodeOnly: Bool
 
     /// URL of the compiled .mlmodelc (for lazy function loading).
     private let modelURL: URL
@@ -85,6 +100,8 @@ public final class CoreMLModel: @unchecked Sendable {
         decodeIO: ClassifiedIO,
         globalKVInputNames: Set<String>,
         materializedSizes: [Int]?,
+        effectiveMaxSeqLen: Int,
+        isDecodeOnly: Bool,
         modelURL: URL,
         sourceURL: URL,
         computeUnits: MLComputeUnits,
@@ -106,6 +123,8 @@ public final class CoreMLModel: @unchecked Sendable {
         self.prefillKVDtypes = prefillKVDtypes
         self.globalKVInputNames = globalKVInputNames
         self.materializedSizes = materializedSizes
+        self.effectiveMaxSeqLen = effectiveMaxSeqLen
+        self.isDecodeOnly = isDecodeOnly
         self.modelURL = modelURL
         self.sourceURL = sourceURL
         self.computeUnits = computeUnits
@@ -120,22 +139,63 @@ public final class CoreMLModel: @unchecked Sendable {
     /// For .mlpackage files, the model is compiled and cached as .mlmodelc
     /// next to the source for fast subsequent loads (E5RT cache reuse).
     /// For .mlmodelc files, loads directly without recompilation.
+    ///
+    /// - Parameter maxContextSize: For materialized models, only retain function
+    ///   pairs ≤ this size. Loading fewer functions is critical on memory-
+    ///   constrained devices like iPhone, where loading all 16 pairs OOMs.
+    ///   Ignored for standard models.
+    /// - Parameter decodeOnly: For materialized models, skip loading prefill
+    ///   functions entirely. `prefill()` falls back to per-token `decode()`
+    ///   internally — slower but halves resident MLModel count, which is the
+    ///   only way the model fits on iPhone 12 Pro / 6 GB devices.
     public static func load(
         from url: URL,
-        computeUnits: MLComputeUnits = .cpuAndGPU
+        computeUnits: MLComputeUnits = .cpuAndGPU,
+        maxContextSize: Int? = nil,
+        decodeOnly: Bool = false
     ) async throws -> CoreMLModel {
         let compiledURL: URL
 
         if url.pathExtension == "mlpackage" {
-            // Compile and cache alongside the .mlpackage
-            let cachedURL = url.deletingPathExtension().appendingPathExtension("mlmodelc")
+            let cachedURL = try defaultCacheURL(for: url)
             compiledURL = try await compileAndCache(source: url, cached: cachedURL)
         } else {
             // Already compiled (.mlmodelc)
             compiledURL = url
         }
 
-        return try await loadCompiled(from: compiledURL, sourceURL: url, computeUnits: computeUnits)
+        return try await loadCompiled(
+            from: compiledURL,
+            sourceURL: url,
+            computeUnits: computeUnits,
+            maxContextSize: maxContextSize,
+            decodeOnly: decodeOnly
+        )
+    }
+
+    /// Pick where to persist the compiled `.mlmodelc`.
+    ///
+    /// Prefers the directory next to the source (convenient for desktop use
+    /// where the source lives in a writable project folder). Falls back to
+    /// Application Support when the source parent isn't writable — which is
+    /// exactly the iOS case, since the app bundle is read-only. Without this
+    /// fallback, `MLModel.compileModel` returns a `/tmp`-rooted bundle that
+    /// our move-to-cache step can't land anywhere persistent, so the caller
+    /// ends up loading from a path that later fails to mmap.
+    private static func defaultCacheURL(for source: URL) throws -> URL {
+        let nextTo = source.deletingPathExtension().appendingPathExtension("mlmodelc")
+        let parent = nextTo.deletingLastPathComponent()
+        if FileManager.default.isWritableFile(atPath: parent.path) {
+            return nextTo
+        }
+        let appSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true
+        )
+        let dir = appSupport.appendingPathComponent("GemmaCore/compiled", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let base = source.deletingPathExtension().lastPathComponent
+        return dir.appendingPathComponent("\(base).mlmodelc")
     }
 
     /// Compile .mlpackage → .mlmodelc, caching at `cached` path.
@@ -165,7 +225,15 @@ public final class CoreMLModel: @unchecked Sendable {
         Log.info("[CoreML] Compiled to \(compiledURL.path)")
 
         try? FileManager.default.removeItem(at: cached)
-        try? FileManager.default.moveItem(at: compiledURL, to: cached)
+        do {
+            try FileManager.default.moveItem(at: compiledURL, to: cached)
+        } catch {
+            // On iOS this previously hit: cached was in the read-only bundle,
+            // move silently failed, loading then blew up on mmap from /tmp.
+            // `defaultCacheURL` now chooses Application Support on iOS, so
+            // this path should stay dry — but log loudly if it fires again.
+            Log.info("[CoreML] Failed to move compiled model to \(cached.path): \(error) — using temp at \(compiledURL.path)")
+        }
         let finalURL = FileManager.default.fileExists(atPath: cached.path) ? cached : compiledURL
         if finalURL == cached, let hash = currentHash {
             try? hash.write(to: sidecar, atomically: true, encoding: .utf8)
@@ -190,17 +258,28 @@ public final class CoreMLModel: @unchecked Sendable {
     private static func loadCompiled(
         from url: URL,
         sourceURL: URL,
-        computeUnits: MLComputeUnits
+        computeUnits: MLComputeUnits,
+        maxContextSize: Int?,
+        decodeOnly: Bool
     ) async throws -> CoreMLModel {
-        Log.info("[CoreML] Loading decode + prefill functions from \(url.lastPathComponent)...")
+        Log.info("[CoreML] Loading decode\(decodeOnly ? "" : " + prefill") functions from \(url.lastPathComponent)...")
 
-        // Try standard model first
-        do {
-            return try await loadStandard(from: url, sourceURL: sourceURL, computeUnits: computeUnits)
-        } catch {
-            Log.info("[CoreML] Standard function load failed (\(error.localizedDescription)), trying materialized...")
+        // Try standard model first (only when prefill is wanted; standard
+        // models don't have a meaningful decode-only fallback path).
+        if !decodeOnly {
+            do {
+                return try await loadStandard(from: url, sourceURL: sourceURL, computeUnits: computeUnits)
+            } catch {
+                Log.info("[CoreML] Standard function load failed (\(error.localizedDescription)), trying materialized...")
+            }
         }
-        return try await loadMaterialized(from: url, sourceURL: sourceURL, computeUnits: computeUnits)
+        return try await loadMaterialized(
+            from: url,
+            sourceURL: sourceURL,
+            computeUnits: computeUnits,
+            maxContextSize: maxContextSize,
+            decodeOnly: decodeOnly
+        )
     }
 
     /// Load a standard two-function model (decode + prefill).
@@ -245,6 +324,8 @@ public final class CoreMLModel: @unchecked Sendable {
             decodeIO: decodeIO,
             globalKVInputNames: globalNames,
             materializedSizes: nil,
+            effectiveMaxSeqLen: GemmaConfig.maxSeqLen,
+            isDecodeOnly: false,
             modelURL: url,
             sourceURL: sourceURL,
             computeUnits: computeUnits,
@@ -254,59 +335,43 @@ public final class CoreMLModel: @unchecked Sendable {
 
     /// Load a materialized model with concrete function names.
     ///
-    /// Enumerates available sizes from the compiled model.mil manifest (cheap)
-    /// and loads only the three functions needed to bootstrap inference:
-    /// `decode_{smallest}`, `decode_{second}`, `prefill_{smallest}`. The two
-    /// decode models are needed to discriminate global caches (dim-1 scales
-    /// with cache size) from sliding caches (dim-1 fixed at window size) —
-    /// without two sizes we can't distinguish them when the window size
-    /// coincides with the smallest materialized size.
+    /// Strategy tuned for memory-constrained devices (iPhone OOMs on parallel
+    /// loads of 2–3 concurrent `MLModel` instances):
+    ///   1. Enumerate sizes from `model.mil` (text parse, no MLModel.load).
+    ///   2. Classify globals vs. slidings by comparing decode function
+    ///      signatures in `model.mil` text — also no MLModel.load. This
+    ///      replaces the prior "probe-load decode_{second}" classifier which
+    ///      was the memory spike that killed the iPhone path.
+    ///   3. Load decode_{smallest} and prefill_{smallest} SERIALLY. Peak
+    ///      live MLModel count is 1 during bootstrap.
+    ///   4. Background-preload remaining retained sizes via `preloadAllSizes()`.
     ///
-    /// Remaining function pairs load in the background via `preloadAllSizes()`.
-    /// If mil enumeration fails, falls back to probing a power-of-2 range and
-    /// keeping whatever decodes succeed.
+    /// If .mil enumeration fails, falls back to a parallel probe (desktop-only
+    /// safety net).
     private static func loadMaterialized(
         from url: URL,
         sourceURL: URL,
-        computeUnits: MLComputeUnits
+        computeUnits: MLComputeUnits,
+        maxContextSize: Int?,
+        decodeOnly: Bool
     ) async throws -> CoreMLModel {
-        let probeDecodes: [(size: Int, model: MLModel)]
         let sizes: [Int]
-        let prefillModel: MLModel
-        let prefillName: String
+        let milGlobals: Set<String>?
 
         if let discovered = enumerateMaterializedSizes(compiledURL: url), !discovered.isEmpty {
             sizes = discovered
             Log.info("[CoreML] Materialized sizes (from manifest): \(sizes)")
-
-            let smallest = sizes[0]
-            prefillName = "prefill_\(smallest)"
-            let secondSize: Int? = sizes.count >= 2 ? sizes[1] : nil
-
-            async let decode1Task = Self.loadFunction(
-                url: url, computeUnits: computeUnits, function: "decode_\(smallest)"
-            )
-            async let prefillTask = Self.loadFunction(
-                url: url, computeUnits: computeUnits, function: prefillName
-            )
-            async let decode2Task: MLModel? = {
-                guard let s = secondSize else { return nil }
-                return try? await Self.loadFunction(
-                    url: url, computeUnits: computeUnits, function: "decode_\(s)"
+            if sizes.count >= 2 {
+                milGlobals = detectGlobalsFromMil(
+                    compiledURL: url, sizeA: sizes[0], sizeB: sizes[1]
                 )
-            }()
-
-            let decode1 = try await decode1Task
-            let prefill = try await prefillTask
-            let decode2 = await decode2Task
-            prefillModel = prefill
-
-            var probes: [(size: Int, model: MLModel)] = [(smallest, decode1)]
-            if let s = secondSize, let m = decode2 {
-                probes.append((s, m))
+                if let g = milGlobals {
+                    Log.info("[CoreML] Global KV caches (from .mil, \(g.count)): \(g.sorted())")
+                }
+            } else {
+                milGlobals = []
+                Log.info("[CoreML] Only one materialized size; no classification needed")
             }
-            probeDecodes = probes
-            Log.info("[CoreML] Loaded initial pair: decode_\(smallest), \(prefillName)\(secondSize.map { " (+ decode_\($0) for classification)" } ?? "")")
         } else {
             Log.info("[CoreML] Manifest enumeration unavailable; falling back to parallel probe")
             let candidateSizes = (6...16).map { 1 << $0 }  // 64..65536
@@ -331,56 +396,85 @@ public final class CoreMLModel: @unchecked Sendable {
                 .sorted { $0.size < $1.size }
             guard !loaded.isEmpty else { throw CoreMLModelError.modelNotFound }
             sizes = loaded.map { $0.size }
-            probeDecodes = loaded
+            // Fallback classifier: use the probed MLModels since we already have them.
+            let decodeIO0 = classifyIO(model: loaded[0].model)
+            if loaded.count >= 2 {
+                milGlobals = detectGlobalsByShape(
+                    modelA: loaded[0].model,
+                    modelB: loaded[1].model,
+                    kvInputNames: decodeIO0.kvInputNames
+                )
+            } else {
+                milGlobals = []
+            }
+        }
 
-            prefillName = "prefill_\(sizes[0])"
+        // Restrict retained sizes to `maxContextSize` before any heavy load,
+        // so the bootstrap only pulls functions we'll actually keep.
+        let retainedSizes: [Int]
+        if let cap = maxContextSize {
+            let under = sizes.filter { $0 <= cap }
+            retainedSizes = under.isEmpty ? [sizes[0]] : under
+            if retainedSizes != sizes {
+                Log.info("[CoreML] Restricting to sizes \(retainedSizes) (maxContextSize=\(cap))")
+            }
+        } else {
+            retainedSizes = sizes
+        }
+
+        let bootSize = retainedSizes[0]
+        let prefillName = "prefill_\(bootSize)"
+
+        // Serial loads keep peak live-MLModel count at 1 during bootstrap.
+        let decodeModel = try await Self.loadFunction(
+            url: url, computeUnits: computeUnits, function: "decode_\(bootSize)"
+        )
+        let prefillModel: MLModel?
+        if decodeOnly {
+            prefillModel = nil
+            Log.info("[CoreML] Loaded decode_\(bootSize) (decode-only; prefill skipped)")
+        } else {
             prefillModel = try await Self.loadFunction(
                 url: url, computeUnits: computeUnits, function: prefillName
             )
-            Log.info("[CoreML] Materialized model with sizes: \(sizes) (probed)")
+            Log.info("[CoreML] Loaded decode_\(bootSize) + \(prefillName) (serial)")
         }
 
-        let decodeModel = probeDecodes[0].model
         let decodeIO = classifyIO(model: decodeModel)
-        let prefillIO = classifyIO(model: prefillModel)
+        // In decode-only mode, prefill metadata is borrowed from decode: the
+        // KV cache layout (input names, shapes, dtypes) is identical between
+        // the two functions, and the per-token loop in `decodeOnlyPrefill`
+        // doesn't use prefill's own token/position input names.
+        let prefillIO = prefillModel.map { classifyIO(model: $0) } ?? decodeIO
+        let prefillSourceModel = prefillModel ?? decodeModel
         let (prefillKVShapes, prefillKVDtypes) = extractKVMetadata(
-            model: prefillModel, kvInputNames: prefillIO.kvInputNames
+            model: prefillSourceModel, kvInputNames: prefillIO.kvInputNames
         )
         logIOSummary(decodeIO: decodeIO, prefillIO: prefillIO)
 
-        // Globals are the KV caches whose dim-1 scales with the materialized size;
-        // sliding caches keep a fixed dim-1 (= sliding window). Distinguishing them
-        // requires comparing two different sizes — the old "dim-1 == smallest"
-        // heuristic misclassifies sliding caches whenever the window equals the
-        // smallest materialized size (e.g. window=512 and sizes start at 512).
-        let globalNames: Set<String>
-        if probeDecodes.count >= 2 {
-            globalNames = detectGlobalsByShape(
-                modelA: probeDecodes[0].model,
-                modelB: probeDecodes[1].model,
-                kvInputNames: decodeIO.kvInputNames
-            )
-            Log.info("[CoreML] Materialized global KV caches (\(globalNames.count)): \(globalNames.sorted())")
-        } else {
-            // Only one size available — growth is a no-op anyway since the cache
-            // never exceeds the sole materialized size.
-            globalNames = []
-            Log.info("[CoreML] Only one materialized size; skipping global detection")
+        // If .mil-based classification failed (e.g. signature parse miss),
+        // fall back to shape probing across the ONE model we have; this
+        // degrades to `{}` for a single size, which is functionally fine
+        // because growth is a no-op when the cache equals the sole size.
+        let globalNames = milGlobals ?? []
+
+        var initialFunctions: [String: MLModel] = [
+            "decode_\(bootSize)": decodeModel
+        ]
+        if let p = prefillModel {
+            initialFunctions[prefillName] = p
         }
 
-        var initialFunctions: [String: MLModel] = [:]
-        for (size, model) in probeDecodes {
-            initialFunctions["decode_\(size)"] = model
-        }
-        initialFunctions[prefillName] = prefillModel
-
+        let effectiveMax = retainedSizes.last ?? sizes.last ?? GemmaConfig.maxSeqLen
         let instance = CoreMLModel(
             prefillIO: prefillIO,
             prefillKVShapes: prefillKVShapes,
             prefillKVDtypes: prefillKVDtypes,
             decodeIO: decodeIO,
             globalKVInputNames: globalNames,
-            materializedSizes: sizes,
+            materializedSizes: retainedSizes,
+            effectiveMaxSeqLen: effectiveMax,
+            isDecodeOnly: decodeOnly,
             modelURL: url,
             sourceURL: sourceURL,
             computeUnits: computeUnits,
@@ -388,6 +482,67 @@ public final class CoreMLModel: @unchecked Sendable {
         )
         instance.preloadAllSizes()
         return instance
+    }
+
+    /// Identify global KV inputs by parsing two decode function signatures out
+    /// of `model.mil` and comparing each parameter's dim-1. A parameter whose
+    /// dim-1 scales with the materialized size is a global cache; one that
+    /// stays fixed (= sliding window) is a sliding cache. Pure text parse —
+    /// avoids an `MLModel.load` just to read shapes, which is the peak-memory
+    /// hotspot on iPhone.
+    ///
+    /// Returns nil on any parse failure so the caller can decide how to
+    /// degrade (fallback probe load, or an empty-globals assumption).
+    static func detectGlobalsFromMil(
+        compiledURL: URL, sizeA: Int, sizeB: Int
+    ) -> Set<String>? {
+        let milURL = compiledURL.appendingPathComponent("model.mil")
+        guard let text = try? String(contentsOf: milURL, encoding: .utf8) else {
+            return nil
+        }
+        guard let dimsA = parseDecodeDim1(text: text, size: sizeA),
+              let dimsB = parseDecodeDim1(text: text, size: sizeB) else {
+            return nil
+        }
+        var globals = Set<String>()
+        for (name, a) in dimsA {
+            if let b = dimsB[name], a != b {
+                globals.insert(name)
+            }
+        }
+        return globals
+    }
+
+    /// Return `[param-name: dim-1]` for every tensor parameter of `decode_<size>`
+    /// in the supplied `.mil` text, or nil if the function or its signature
+    /// can't be found.
+    private static func parseDecodeDim1(text: String, size: Int) -> [String: Int]? {
+        let sigPattern = #"func\s+decode_\#(size)\b[^(]*\(([^)]*)\)"#
+        guard let sigRe = try? NSRegularExpression(pattern: sigPattern) else { return nil }
+        let full = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let m = sigRe.firstMatch(in: text, range: full),
+              m.numberOfRanges >= 2,
+              let r = Range(m.range(at: 1), in: text) else {
+            return nil
+        }
+        let sig = String(text[r])
+
+        // Each param is `tensor<dtype, [d0, d1, ...]> name`.
+        let paramPattern = #"tensor<[^,]+,\s*\[([^\]]+)\]>\s*([A-Za-z_][A-Za-z0-9_]*)"#
+        guard let paramRe = try? NSRegularExpression(pattern: paramPattern) else { return nil }
+        var result: [String: Int] = [:]
+        let sigRange = NSRange(sig.startIndex..<sig.endIndex, in: sig)
+        paramRe.enumerateMatches(in: sig, range: sigRange) { match, _, _ in
+            guard let m = match, m.numberOfRanges >= 3,
+                  let shapeRange = Range(m.range(at: 1), in: sig),
+                  let nameRange = Range(m.range(at: 2), in: sig) else { return }
+            let dims = sig[shapeRange].split(separator: ",").compactMap {
+                Int($0.trimmingCharacters(in: .whitespaces))
+            }
+            guard dims.count >= 2 else { return }
+            result[String(sig[nameRange])] = dims[1]
+        }
+        return result.isEmpty ? nil : result
     }
 
     /// Load a single function by name (used at bootstrap).
@@ -481,9 +636,15 @@ public final class CoreMLModel: @unchecked Sendable {
     }
 
     /// Resolve the function name for a given prefix and cache size.
+    /// For materialized models, always picks a concrete `{prefix}_{size}` —
+    /// even when the caller passes no cache-size hint — because `prefix`
+    /// alone (e.g. `"decode"`) isn't an exported function.
     private func functionName(prefix: String, cacheSize: Int?) -> String {
-        if let cacheSize, let size = materializedSize(forCacheSize: cacheSize) {
-            return "\(prefix)_\(size)"
+        if let sizes = materializedSizes {
+            if let cacheSize, let size = materializedSize(forCacheSize: cacheSize) {
+                return "\(prefix)_\(size)"
+            }
+            return "\(prefix)_\(sizes[0])"
         }
         return prefix
     }
@@ -510,7 +671,9 @@ public final class CoreMLModel: @unchecked Sendable {
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask { _ = try await self.loadIfNeeded(name: decodeName) }
-            group.addTask { _ = try await self.loadIfNeeded(name: prefillName) }
+            if !self.isDecodeOnly {
+                group.addTask { _ = try await self.loadIfNeeded(name: prefillName) }
+            }
             try await group.waitForAll()
         }
     }
@@ -585,7 +748,9 @@ public final class CoreMLModel: @unchecked Sendable {
     /// in-flight tasks rather than issuing duplicate loads.
     public func preloadAllSizes(concurrency: Int = 2) {
         guard let sizes = materializedSizes else { return }
-        let names = sizes.flatMap { ["decode_\($0)", "prefill_\($0)"] }
+        let names = sizes.flatMap {
+            isDecodeOnly ? ["decode_\($0)"] : ["decode_\($0)", "prefill_\($0)"]
+        }
         Task.detached { [self] in
             let start = CFAbsoluteTimeGetCurrent()
             let allOK = await self.drainLoads(names: names, concurrency: concurrency, progress: nil)
@@ -609,7 +774,9 @@ public final class CoreMLModel: @unchecked Sendable {
             markWarmed()
             return
         }
-        let names = sizes.flatMap { ["decode_\($0)", "prefill_\($0)"] }
+        let names = sizes.flatMap {
+            isDecodeOnly ? ["decode_\($0)"] : ["decode_\($0)", "prefill_\($0)"]
+        }
         let allOK = await drainLoads(names: names, concurrency: concurrency, progress: progress)
         if allOK { markWarmed() }
     }
@@ -725,6 +892,12 @@ public final class CoreMLModel: @unchecked Sendable {
         kvState: KVCacheState,
         globalCacheSize: Int32? = nil
     ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+        if isDecodeOnly {
+            return try decodeOnlyPrefill(
+                tokens: tokens, seqLen: seqLen,
+                kvState: kvState, globalCacheSize: globalCacheSize
+            )
+        }
         let activeModel = getFunction(
             functionName(prefix: "prefill", cacheSize: globalCacheSize.map { Int($0) })
         )
@@ -750,6 +923,61 @@ public final class CoreMLModel: @unchecked Sendable {
             globalNames: kvState.globalNames
         )
         return (logits, newKV)
+    }
+
+    /// Per-token prefill via repeated `decode()` calls — the fallback used
+    /// when only decode functions are loaded. Synthesizes a chunk-shaped
+    /// `[chunkSize, vocabSize]` logits buffer by stacking each step's
+    /// logits[0:vocabSize] row, so the engine's downstream
+    /// `extractLogitsAt(position:)` math works unchanged.
+    ///
+    /// Slower than a real prefill function (no fused chunk kernel), but
+    /// keeps the resident MLModel count at 1 instead of 2 — the only way
+    /// to fit on iPhone 12 Pro / 6 GB.
+    private func decodeOnlyPrefill(
+        tokens: MLMultiArray,
+        seqLen: Int32,
+        kvState: KVCacheState,
+        globalCacheSize: Int32?
+    ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+        let chunkSize = tokens.count
+        let vocabSize = GemmaConfig.vocabSize
+        let result = try MLMultiArray(
+            shape: [NSNumber(value: chunkSize), NSNumber(value: vocabSize)],
+            dataType: .float32
+        )
+        let resultPtr = result.dataPointer.bindMemory(
+            to: Float32.self, capacity: chunkSize * vocabSize
+        )
+        let tokensPtr = tokens.dataPointer.bindMemory(to: Int32.self, capacity: chunkSize)
+
+        var currentKV = kvState
+        for i in 0..<chunkSize {
+            // autoreleasepool: without this, Metal-backed prediction temporaries
+            // (IOSurface buffers, intermediate MLMultiArrays) accumulate across
+            // the 8 inner decodes — small per call, large enough cumulatively to
+            // OOM on iPhone 12 Pro the moment the user starts typing.
+            currentKV = try autoreleasepool {
+                let (stepLogits, newKV) = try decode(
+                    token: tokensPtr[i],
+                    position: seqLen + Int32(i),
+                    kvState: currentKV,
+                    globalCacheSize: globalCacheSize
+                )
+                // Each decode's logits buffer holds the next-token distribution
+                // in its first `vocabSize` floats; copy those into row `i`.
+                let stepPtr = stepLogits.dataPointer.bindMemory(
+                    to: Float32.self, capacity: vocabSize
+                )
+                memcpy(
+                    resultPtr.advanced(by: i * vocabSize),
+                    stepPtr,
+                    vocabSize * MemoryLayout<Float32>.size
+                )
+                return newKV
+            }
+        }
+        return (result, currentKV)
     }
 
     /// Run one decode step.
