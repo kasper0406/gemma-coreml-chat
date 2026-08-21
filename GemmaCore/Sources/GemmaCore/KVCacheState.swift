@@ -1,8 +1,18 @@
 /// KV cache state for Gemma4-E2B CoreML inference.
 ///
-/// Holds KV arrays keyed by model input name, matching the multifunction
-/// model's I/O contract. Uses positional matching between outputs and inputs
-/// since input names (_argN) differ from output names (cast_N/slice_update_N).
+/// Split in two, matching how the model declares its caches:
+///
+/// - The 12 **sliding-window** caches are CoreML *state*. They never cross the
+///   model boundary: `MLState` owns the buffers, the model updates them in
+///   place, and all we carry is the handle. Nothing to copy per step.
+/// - The 3 **global** caches (symbolic dim 1) and the int32 `sliding_pos_ring`
+///   are ordinary inputs/outputs, held here as `MLMultiArray`s keyed by input
+///   name and deep-copied out of every prediction (CoreML reuses output
+///   buffers).
+///
+/// A conversation reset means a *fresh* `MLState` as well as fresh arrays —
+/// reusing the state while resetting `sliding_pos_ring` would leave stale K/V
+/// in ring slots that later positions mark valid again.
 
 import CoreML
 import Foundation
@@ -64,9 +74,10 @@ public struct KVCacheSizePolicy: Sendable {
 }
 
 /// Immutable snapshot of the KV cache state.
-/// Each prediction returns a new KVCacheState with updated arrays.
+/// Each prediction returns a new KVCacheState with updated arrays; the sliding
+/// caches inside `slidingCaches` are mutated in place by the prediction itself.
 public struct KVCacheState: @unchecked Sendable {
-    /// KV arrays keyed by their model input name.
+    /// Global KV caches and `sliding_pos_ring`, keyed by model input name.
     public let arraysByName: [String: MLMultiArray]
 
     /// Ordered input names (declaration order from model spec).
@@ -74,6 +85,14 @@ public struct KVCacheState: @unchecked Sendable {
 
     /// Names of KV inputs with flexible (RangeDim) shapes — the global caches.
     public let globalNames: Set<String>
+
+    /// CoreML state buffers holding the sliding-window KV caches.
+    ///
+    /// Shared across every function of the model — one `MLState` made on any
+    /// loaded instance is accepted by `decode_512`, `prefill_1024`, … and they
+    /// all see the same buffers, keyed by state name. Predictions using the
+    /// same state must be serialized, which the engine's loops already are.
+    public let slidingCaches: MLState
 
     /// Current dim-1 size of global caches, or nil if none.
     public var currentGlobalCacheSize: Int? {
@@ -88,22 +107,30 @@ public struct KVCacheState: @unchecked Sendable {
     public init(
         arraysByName: [String: MLMultiArray],
         inputNames: [String],
-        globalNames: Set<String>
+        globalNames: Set<String>,
+        slidingCaches: MLState
     ) {
         self.arraysByName = arraysByName
         self.inputNames = inputNames
         self.globalNames = globalNames
+        self.slidingCaches = slidingCaches
     }
 
     /// Create an empty state from pre-extracted KV shapes/dtypes.
     /// Global caches are sized to `initialGlobalSize` instead of the spec shape.
     /// Float* arrays are zero-filled; Int32 arrays are filled with -1.
+    ///
+    /// `slidingCaches` must be a **fresh** `MLState` (`CoreMLModel.makeState()`)
+    /// unless the caller deliberately wants to keep the sliding caches — CoreML
+    /// zero-fills a newly made state. Prefer ``CoreMLModel/makeEmptyKVState(initialGlobalSize:)``,
+    /// which pairs the two correctly.
     public static func empty(
         kvInputNames: [String],
         shapes: [String: [NSNumber]],
         dtypes: [String: MLMultiArrayDataType],
         globalNames: Set<String> = [],
-        initialGlobalSize: Int? = nil
+        initialGlobalSize: Int? = nil,
+        slidingCaches: MLState
     ) throws -> KVCacheState {
         var dict: [String: MLMultiArray] = [:]
         for name in kvInputNames {
@@ -121,7 +148,8 @@ public struct KVCacheState: @unchecked Sendable {
         return KVCacheState(
             arraysByName: dict,
             inputNames: kvInputNames,
-            globalNames: globalNames
+            globalNames: globalNames,
+            slidingCaches: slidingCaches
         )
     }
 
@@ -157,11 +185,16 @@ public struct KVCacheState: @unchecked Sendable {
     /// Maps output names → input names by position, rebuilding
     /// the name-keyed dictionary for the next call.
     /// Deep-copies each array because CoreML reuses output buffers.
-    public static func from(
+    ///
+    /// Only the global caches and the position ring appear here; the sliding
+    /// caches were updated inside `slidingCaches`, which is carried forward
+    /// unchanged (it is a handle, not a snapshot).
+    static func from(
         prediction: MLFeatureProvider,
         outputNames: [String],
         inputNames: [String],
-        globalNames: Set<String> = []
+        globalNames: Set<String> = [],
+        slidingCaches: MLState
     ) throws -> KVCacheState {
         precondition(outputNames.count == inputNames.count,
                      "KV output count (\(outputNames.count)) != input count (\(inputNames.count))")
@@ -193,7 +226,8 @@ public struct KVCacheState: @unchecked Sendable {
         return KVCacheState(
             arraysByName: dict,
             inputNames: inputNames,
-            globalNames: globalNames
+            globalNames: globalNames,
+            slidingCaches: slidingCaches
         )
     }
 
@@ -204,6 +238,9 @@ public struct KVCacheState: @unchecked Sendable {
     /// The size MUST come from the policy: the resolved `{decode,prefill}_N`
     /// function and the cache have to agree on dim-1, and only the model knows
     /// which `N` were exported.
+    ///
+    /// Sliding caches are unaffected: their length is the sliding window, not
+    /// the context length, so the `MLState` is carried straight through.
     public func grownToFit(needed: Int, policy: KVCacheSizePolicy) throws -> KVCacheState {
         guard !globalNames.isEmpty else { return self }
         guard let curSize = currentGlobalCacheSize, curSize < needed else { return self }
@@ -230,7 +267,8 @@ public struct KVCacheState: @unchecked Sendable {
         return KVCacheState(
             arraysByName: newDict,
             inputNames: inputNames,
-            globalNames: globalNames
+            globalNames: globalNames,
+            slidingCaches: slidingCaches
         )
     }
 }

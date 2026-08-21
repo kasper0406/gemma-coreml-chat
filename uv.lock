@@ -455,7 +455,7 @@ requires-dist = [
     { name = "jax", specifier = "==0.9.1" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "numpy", specifier = "~=2.0" },
-    { name = "stablehlo-coreml", specifier = ">=0.1.1" },
+    { name = "stablehlo-coreml", specifier = ">=0.1.5" },
     { name = "transformers", specifier = ">=4.50" },
 ]
 
@@ -1756,16 +1756,16 @@ wheels = [
 
 [[package]]
 name = "stablehlo-coreml"
-version = "0.1.1"
+version = "0.1.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "coremltools", marker = "python_full_version < '3.14'" },
+    { name = "coremltools" },
     { name = "jax" },
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/87/8f/d27ea96b00cbf4377efea093e5c002a2d927567410a60f5ab3c5521dfb80/stablehlo_coreml-0.1.1.tar.gz", hash = "sha256:f74e2aca385ac62278909d2b70e74675b7646d1bba13af7ee08cb29aac5a128d", size = 53443 }
+sdist = { url = "https://files.pythonhosted.org/packages/2f/8b/9707c685f42d846de399b39dfa100447c36e99904fade1cb2e06d5ce8564/stablehlo_coreml-0.1.5.tar.gz", hash = "sha256:41a16d533df83e991d7c6b9df8370b6a27a9204c72f3dfa35ca597aa2588b253", size = 111524 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c4/b2/828f56ae1a098085b0be034c470b445cbfbf190dbae241792862998e6104/stablehlo_coreml-0.1.1-py3-none-any.whl", hash = "sha256:f080275860ea50ee3818dd676111dc7d6295862597b311398f5cb113da440cb7", size = 34912 },
+    { url = "https://files.pythonhosted.org/packages/c8/5b/af2839babeee6aae4960fa9ec28037ba93ff5c212b3caeb03922773d6381/stablehlo_coreml-0.1.5-py3-none-any.whl", hash = "sha256:2079e5ccfb319fe8e695ccd65b7d0b6c8d9e402bff5184a8418f218cf738416f", size = 74028 },
 ]
 
 [[package]]
