@@ -108,7 +108,7 @@ func now() -> Double { CFAbsoluteTimeGetCurrent() }
 func syntheticPrompt(length: Int, seed: Int) -> [Int32] {
     var out = [Int32](); out.reserveCapacity(length)
     // Gemma vocab is 262144; stay in a simple mid range of "safe" IDs.
-    var rng = UInt64(bitPattern: Int64(0x9E37_79B9_7F4A_7C15 &+ UInt64(bitPattern: Int64(seed))))
+    var rng: UInt64 = 0x9E37_79B9_7F4A_7C15 &+ UInt64(bitPattern: Int64(seed))
     for _ in 0..<length {
         rng = rng &* 6364136223846793005 &+ 1442695040888963407
         // Keep IDs well away from 0 (padding) and special tokens.
@@ -159,11 +159,26 @@ struct GemmaBenchMain {
             exit(2)
         }
 
+        // A bench run's context length is fixed and known up front, so cap the
+        // materialized function pairs at the largest cache this run can touch
+        // (prompt + decode + one sampled token, plus warmup slack). Without the
+        // cap every exported size stays resident, which on a 16 GB machine
+        // swaps hard enough to distort the timings we're here to measure.
+        let warmupSlack = args.warmup ? 32 : 0
+        let maxCacheNeeded = args.contextLength + args.decodeTokens + 1 + warmupSlack
+        var maxContext = 64
+        while maxContext < maxCacheNeeded { maxContext *= 2 }
+        maxContext = min(maxContext, GemmaConfig.maxSeqLen)
+
         // --- Load (compile + load from .mlmodelc cache) ---
         let loadStart = now()
         let model: CoreMLModel
         do {
-            model = try await CoreMLModel.load(from: modelURL, computeUnits: units)
+            model = try await CoreMLModel.load(
+                from: modelURL,
+                computeUnits: units,
+                maxContextSize: maxContext
+            )
         } catch {
             FileHandle.standardError.write(Data("error: load failed: \(error)\n".utf8))
             exit(3)
