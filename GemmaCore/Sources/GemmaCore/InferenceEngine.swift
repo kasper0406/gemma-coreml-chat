@@ -70,7 +70,7 @@ public struct InferenceEngine: Sendable {
                     let genStart = CFAbsoluteTimeGetCurrent()
                     let ids = truncatePromptIDs(
                         promptIDs,
-                        maxSeqLen: GemmaConfig.maxSeqLen,
+                        maxSeqLen: model.effectiveMaxSeqLen,
                         reserveForGeneration: maxNewTokens
                     )
 
@@ -94,7 +94,7 @@ public struct InferenceEngine: Sendable {
                     var logits: MLMultiArray
 
                     if let existing = effectiveKVState, effectivePrefillOffset > 0 {
-                        let (prefillLogits, prefillKV) = try self.continuePrefill(
+                        let (prefillLogits, prefillKV) = try await self.continuePrefill(
                             ids: ids,
                             fromOffset: effectivePrefillOffset,
                             kvState: existing
@@ -108,6 +108,7 @@ public struct InferenceEngine: Sendable {
                             // Run a single decode step with the last token to get logits.
                             let lastToken = ids[nReal - 1]
                             let gcSize = kvState.currentGlobalCacheSize.map { Int32($0) }
+                            if let gcSize { try await model.ensureLoaded(forGlobalCacheSize: Int(gcSize)) }
                             let (decLogits, decKV) = try model.decode(
                                 token: lastToken,
                                 position: Int32(nReal - 1),
@@ -118,7 +119,7 @@ public struct InferenceEngine: Sendable {
                             kvState = decKV
                         }
                     } else {
-                        (logits, kvState) = try self.fullPrefill(ids: ids)
+                        (logits, kvState) = try await self.fullPrefill(ids: ids)
                     }
                     let prefillTime = CFAbsoluteTimeGetCurrent() - prefillStart
                     Log.info("[Perf] Prefill done: \(String(format: "%.2f", prefillTime))s")
@@ -140,17 +141,22 @@ public struct InferenceEngine: Sendable {
                     }
 
                     // --- Decode Loop ---
-                    let maxSteps = min(maxNewTokens, GemmaConfig.maxSeqLen - nReal)
+                    let maxSteps = min(maxNewTokens, model.effectiveMaxSeqLen - nReal)
 
                     // Pre-allocate the global KV cache to its final decode size so we don't
                     // re-allocate every step. Each grow returns a fresh MLMultiArray; once it
                     // is passed to a prediction, CoreML backs it with an IOSurface that isn't
                     // released promptly. Repeated growth exhausts the IOSurface pool after
                     // enough steps ("Failed to allocate E5 buffer object").
-                    let targetCacheSize = min(nReal + maxSteps, GemmaConfig.maxSeqLen)
+                    let targetCacheSize = min(nReal + maxSteps, model.effectiveMaxSeqLen)
                     var currentKV = try kvState.grownToFit(
-                        needed: targetCacheSize, maxLen: GemmaConfig.maxSeqLen
+                        needed: targetCacheSize, policy: model.cacheSizePolicy
                     )
+
+                    // Pre-load the decode function for the target cache size.
+                    if let gcSize = currentKV.currentGlobalCacheSize {
+                        try await model.ensureLoaded(forGlobalCacheSize: gcSize)
+                    }
                     var currentLogits = lastLogits
                     var totalSampleTime = 0.0
                     var totalDecodeTime = 0.0
@@ -176,7 +182,7 @@ public struct InferenceEngine: Sendable {
 
                         currentKV = try currentKV.grownToFit(
                             needed: Int(position) + 1,
-                            maxLen: GemmaConfig.maxSeqLen
+                            policy: model.cacheSizePolicy
                         )
 
                         // Safety: verify position fits in the global cache before decode.
@@ -232,18 +238,27 @@ public struct InferenceEngine: Sendable {
     }
 
     /// Run full prefill from scratch.
-    public func fullPrefill(ids: [Int32]) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+    public func fullPrefill(ids: [Int32]) async throws -> (logits: MLMultiArray, kvState: KVCacheState) {
         let nChunks = (ids.count + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
         let paddedLen = nChunks * GemmaConfig.chunkSize
+
+        // One bucketing policy for everyone — see `KVCacheSizePolicy`.
+        let globalSize: Int? = model.globalKVInputNames.isEmpty
+            ? nil
+            : model.cacheSizePolicy.size(forNeeded: paddedLen)
+
+        if let globalSize {
+            try await model.ensureLoaded(forGlobalCacheSize: globalSize)
+        }
 
         let emptyKV = try KVCacheState.empty(
             kvInputNames: model.prefillKVInputNames,
             shapes: model.prefillKVShapes,
             dtypes: model.prefillKVDtypes,
             globalNames: model.globalKVInputNames,
-            initialGlobalSize: model.globalKVInputNames.isEmpty ? nil : paddedLen
+            initialGlobalSize: globalSize
         )
-        let (logits, kv) = try continuePrefill(ids: ids, fromOffset: 0, kvState: emptyKV)
+        let (logits, kv) = try await continuePrefill(ids: ids, fromOffset: 0, kvState: emptyKV)
         guard let logits else {
             throw InferenceError.emptyPrompt
         }
@@ -255,7 +270,7 @@ public struct InferenceEngine: Sendable {
         ids: [Int32],
         fromOffset: Int,
         kvState: KVCacheState
-    ) throws -> (logits: MLMultiArray?, kvState: KVCacheState) {
+    ) async throws -> (logits: MLMultiArray?, kvState: KVCacheState) {
         let nReal = ids.count
         let nChunks = (nReal + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
         let paddedLen = nChunks * GemmaConfig.chunkSize
@@ -263,13 +278,28 @@ public struct InferenceEngine: Sendable {
                                    count: paddedLen - nReal)
 
         let startChunk = fromOffset / GemmaConfig.chunkSize
-        var currentKV = try kvState.grownToFit(needed: paddedLen, maxLen: GemmaConfig.maxSeqLen)
+        var currentKV = try kvState.grownToFit(needed: paddedLen, policy: model.cacheSizePolicy)
+
+        // Ensure the function for the (possibly grown) cache size is loaded.
+        if let gcSize = currentKV.currentGlobalCacheSize {
+            try await model.ensureLoaded(forGlobalCacheSize: gcSize)
+        }
+
         var lastLogits: MLMultiArray? = nil
         let chunksToProcess = nChunks - startChunk
 
         for chunkIdx in startChunk..<nChunks {
             let chunkStart = CFAbsoluteTimeGetCurrent()
             let start = chunkIdx * GemmaConfig.chunkSize
+            // Safety: the cache size is clamped to what the model actually
+            // loaded, so a chunk can in principle reach past it. Mirror the
+            // decode loop's guard rather than writing out of bounds.
+            if let gcSize = currentKV.currentGlobalCacheSize,
+               start + GemmaConfig.chunkSize > gcSize {
+                throw CoreMLModelError.positionOutOfRange(
+                    position: start + GemmaConfig.chunkSize - 1, cacheSize: gcSize
+                )
+            }
             let chunkTokens = Array(padded[start..<(start + GemmaConfig.chunkSize)])
 
             let tokens = MLMultiArray.int32Row(chunkTokens)
@@ -296,8 +326,26 @@ public struct InferenceEngine: Sendable {
         chunkTokens: [Int32],
         startPosition: Int,
         kvState: KVCacheState
-    ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+    ) async throws -> (logits: MLMultiArray, kvState: KVCacheState) {
         precondition(chunkTokens.count == GemmaConfig.chunkSize)
+
+        // Safety: this chunk writes KV rows startPosition ..< +chunkSize. The
+        // eager-prefill caller sizes the cache from `materializedSize`, which
+        // clamps to the largest exported size, so an over-long prompt would
+        // otherwise write past the end of an under-allocated cache. The decode
+        // loop has the same guard.
+        if let gcSize = kvState.currentGlobalCacheSize,
+           startPosition + chunkTokens.count > gcSize {
+            throw CoreMLModelError.positionOutOfRange(
+                position: startPosition + chunkTokens.count - 1, cacheSize: gcSize
+            )
+        }
+
+        // Ensure the function for this cache size is loaded.
+        if let gcSize = kvState.currentGlobalCacheSize {
+            try await model.ensureLoaded(forGlobalCacheSize: gcSize)
+        }
+
         let tokens = MLMultiArray.int32Row(chunkTokens)
         let gcSize = kvState.currentGlobalCacheSize.map { Int32($0) }
         let (logits, newKV) = try model.prefill(
@@ -326,12 +374,18 @@ public struct InferenceEngine: Sendable {
     }
 
     /// Keep the last tokens so the prompt fits within maxSeqLen.
+    ///
+    /// The cap is rounded down to a chunk boundary: prefill pads the prompt up
+    /// to a multiple of `chunkSize`, so an unrounded cap can pad past the
+    /// largest cache the model loaded.
     private func truncatePromptIDs(
         _ ids: [Int32],
         maxSeqLen: Int,
         reserveForGeneration: Int
     ) -> [Int32] {
-        let cap = max(maxSeqLen - reserveForGeneration, 1)
+        let raw = max(maxSeqLen - reserveForGeneration, 1)
+        let chunk = GemmaConfig.chunkSize
+        let cap = max((raw / chunk) * chunk, min(chunk, maxSeqLen))
         if ids.count > cap {
             return Array(ids.suffix(cap))
         }

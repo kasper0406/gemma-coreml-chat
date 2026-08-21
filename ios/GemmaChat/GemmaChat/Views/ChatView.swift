@@ -12,6 +12,25 @@ struct ChatView: View {
             ProgressView("Loading model…")
                 .font(.headline)
                 .task { await viewModel.loadModel() }
+        case .warmingUp(let completed, let total):
+            VStack(spacing: 12) {
+                ProgressView(
+                    value: Double(completed),
+                    total: Double(max(total, 1))
+                )
+                .progressViewStyle(.linear)
+                .frame(maxWidth: 260)
+                Text("Compiling models for this device…")
+                    .font(.headline)
+                Text("\(completed) / \(total) functions ready")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("First launch only — this may take a few minutes.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
         case .error(let msg):
             VStack(spacing: 16) {
                 Image(systemName: "exclamationmark.triangle")

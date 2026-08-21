@@ -21,16 +21,21 @@ public enum Log {
     public nonisolated(unsafe) static var destination: Destination = .stderr
 
     /// Write a diagnostic message to the configured destination.
+    ///
+    /// Uses the throwing `write(contentsOf:)` API instead of legacy
+    /// `write(_:)`. The legacy variant throws `NSFileHandleOperationException`
+    /// (Obj-C, uncatchable from Swift) when the destination fd hits an I/O
+    /// error — observed on iOS when stderr breaks under memory pressure mid-
+    /// load, taking the whole app down inside an otherwise-harmless log call.
+    /// We silently drop write failures: diagnostics must never crash the app.
     public static func info(_ message: String) {
+        let handle: FileHandle
         switch destination {
-        case .stderr:
-            let data = Data((message + "\n").utf8)
-            FileHandle.standardError.write(data)
-        case .file(let handle):
-            let data = Data((message + "\n").utf8)
-            handle.write(data)
-        case .none:
-            break
+        case .stderr: handle = FileHandle.standardError
+        case .file(let h): handle = h
+        case .none: return
         }
+        let data = Data((message + "\n").utf8)
+        try? handle.write(contentsOf: data)
     }
 }

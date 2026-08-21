@@ -22,6 +22,47 @@ public enum KVCacheError: Error, LocalizedError {
     }
 }
 
+/// The single source of truth for how big a global KV cache may be.
+///
+/// A materialized model can only run the concrete sizes it was exported with,
+/// so **every** place that allocates or grows a global cache has to round
+/// through this one policy. Rounding independently — "next power of two" — is
+/// only accidentally correct for the default contiguous power-of-two export:
+/// with `--materialize-sizes 512,2048`, crossing 512 tokens grows the cache to
+/// 1024 while `CoreMLModel.functionName(prefix:cacheSize:)` resolves
+/// `decode_2048`, and every turn then fails on a shape mismatch.
+///
+/// Vend one from ``CoreMLModel/cacheSizePolicy`` rather than constructing it
+/// ad hoc: the model wrapper is what knows the sizes that were actually loaded.
+public struct KVCacheSizePolicy: Sendable {
+    /// Concrete materialized sizes in ascending order, or nil for standard
+    /// (RangeDim) models, which accept any dim-1.
+    public let materializedSizes: [Int]?
+
+    /// Largest cache size the loaded model can serve.
+    public let maxLen: Int
+
+    public init(materializedSizes: [Int]?, maxLen: Int) {
+        self.materializedSizes = materializedSizes?.sorted()
+        self.maxLen = maxLen
+    }
+
+    /// Smallest runnable cache size that holds `needed` tokens.
+    ///
+    /// When `needed` exceeds `maxLen` the result is clamped to `maxLen`, so
+    /// callers must independently cap how many token positions they feed the
+    /// model — a clamped cache cannot hold every requested position.
+    public func size(forNeeded needed: Int) -> Int {
+        let clamped = min(max(needed, 1), maxLen)
+        if let sizes = materializedSizes, let largest = sizes.last {
+            return sizes.first { $0 >= clamped } ?? largest
+        }
+        var pow2 = 1
+        while pow2 < clamped { pow2 *= 2 }
+        return min(pow2, maxLen)
+    }
+}
+
 /// Immutable snapshot of the KV cache state.
 /// Each prediction returns a new KVCacheState with updated arrays.
 public struct KVCacheState: @unchecked Sendable {
@@ -156,13 +197,19 @@ public struct KVCacheState: @unchecked Sendable {
         )
     }
 
-    /// Grow global caches so dim-1 >= `needed` using a doubling strategy.
-    /// Returns self unchanged if no growth is required or if there are no global caches.
-    public func grownToFit(needed: Int, maxLen: Int) throws -> KVCacheState {
+    /// Grow global caches so dim-1 >= `needed`, using `policy` to pick the new
+    /// size. Returns self unchanged if no growth is required, if there are no
+    /// global caches, or if the policy cannot offer anything larger.
+    ///
+    /// The size MUST come from the policy: the resolved `{decode,prefill}_N`
+    /// function and the cache have to agree on dim-1, and only the model knows
+    /// which `N` were exported.
+    public func grownToFit(needed: Int, policy: KVCacheSizePolicy) throws -> KVCacheState {
         guard !globalNames.isEmpty else { return self }
         guard let curSize = currentGlobalCacheSize, curSize < needed else { return self }
 
-        let newLen = min(max(curSize * 2, needed), maxLen)
+        let newLen = policy.size(forNeeded: needed)
+        guard newLen > curSize else { return self }
         Log.info("[KV] Growing global caches: \(curSize) → \(newLen) (needed \(needed))")
 
         var newDict = arraysByName

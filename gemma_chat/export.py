@@ -1,13 +1,16 @@
 """Export Gemma4-E2B chunk_prefill + decode_step as a CoreML .mlpackage.
 
 By default, both functions are merged into a single multifunction .mlpackage
-with shared (int4-quantized) weights and RangeDim on global KV caches for
-dynamic context window sizing up to 60k tokens.
+with shared (int4-quantized) weights, and the global KV caches are
+materialized into one concrete-shape function per size so the model runs on
+ANE / CPU as well as GPU.  Pass --no-materialize to keep RangeDim shapes
+(GPU-only) for a single dynamic-shape function pair.
 
 Usage:
     uv run gemma-export
     uv run gemma-export --output gemma4-e2b.mlpackage
-    uv run gemma-export --skip-warmup   # save RAM on constrained machines
+    uv run gemma-export --no-materialize  # GPU-only, dynamic-shape export
+    uv run gemma-export --skip-warmup     # save RAM on constrained machines
 """
 
 from __future__ import annotations
@@ -706,14 +709,29 @@ def _run_phase(phase: str, args: argparse.Namespace, output_path: Path) -> None:
         raise ValueError(f"Unknown phase: {phase}")
 
 
+def _parse_materialize_sizes(s: str | None) -> list[int]:
+    """Parse a comma-separated list of sizes, or default to powers of 2."""
+    from gemma_chat.materialize import DEFAULT_SIZES
+    if s is None:
+        return list(DEFAULT_SIZES)
+    out = [int(tok) for tok in s.split(",") if tok.strip()]
+    if not out:
+        raise argparse.ArgumentTypeError("--materialize-sizes: empty list")
+    if any(v <= 0 for v in out):
+        raise argparse.ArgumentTypeError("--materialize-sizes: values must be positive")
+    return sorted(set(out))
+
+
 def main() -> None:
     import shutil
     import tempfile
 
     parser = argparse.ArgumentParser(
         description=(
-            "Export Gemma4-E2B prefill + decode as a CoreML .mlpackage "
-            "with dynamic shapes (RangeDim) for global KV caches."
+            "Export Gemma4-E2B prefill + decode as a CoreML .mlpackage.  "
+            "By default the global KV caches are materialized to concrete "
+            "per-size functions for ANE/CPU compatibility; pass "
+            "--no-materialize for a GPU-only dynamic-shape (RangeDim) export."
         )
     )
     parser.add_argument(
@@ -756,6 +774,29 @@ def main() -> None:
             "instead of a single multifunction model."
         ),
     )
+    parser.add_argument(
+        "--materialize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Replace the dynamic-shape (RangeDim) global KV caches with one "
+            "concrete-shape function per size.  Produces an ANE-compatible "
+            "multifunction .mlpackage with `{prefill,decode}_{size}` functions "
+            "that share deduplicated weights.  Defaults to powers of 2 from "
+            "CHUNK_SIZE to --max-seq-len; override with --materialize-sizes.  "
+            "Enabled by default because the ANE and CPU backends hit runtime "
+            "issues with RangeDim shapes; pass --no-materialize for a "
+            "GPU-only dynamic-shape export."
+        ),
+    )
+    parser.add_argument(
+        "--materialize-sizes",
+        default=None,
+        help=(
+            "Comma-separated concrete cache sizes when --materialize is set "
+            "(default: powers of 2 from 8 up to --max-seq-len)"
+        ),
+    )
     # Internal: run a single phase (used by subprocess isolation).
     parser.add_argument("--_phase", help=argparse.SUPPRESS)
     parser.add_argument("--_phase-output", help=argparse.SUPPRESS)
@@ -765,6 +806,29 @@ def main() -> None:
     if args._phase:
         _run_phase(args._phase, args, Path(args._phase_output))
         return
+
+    if args.materialize and args.separate:
+        parser.error("--materialize cannot be combined with --separate")
+
+    materialize_sizes: list[int] = []
+    if args.materialize:
+        materialize_sizes = _parse_materialize_sizes(args.materialize_sizes)
+        # Cap sizes to --max-seq-len.
+        over = [s for s in materialize_sizes if s > args.max_seq_len]
+        if over:
+            print(
+                f"  [materialize] dropping sizes > --max-seq-len ({args.max_seq_len}): {over}",
+                flush=True,
+            )
+            materialize_sizes = [s for s in materialize_sizes if s <= args.max_seq_len]
+        if not materialize_sizes:
+            parser.error(
+                "--materialize: no valid sizes after clamping to --max-seq-len"
+            )
+        print(
+            f"\nMaterialize plan: one function per size in {materialize_sizes}",
+            flush=True,
+        )
 
     output = Path(args.output)
 
@@ -785,6 +849,27 @@ def main() -> None:
         result = subprocess.run(cmd, env={**_os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
         if result.returncode != 0:
             print(f"\n!!! {phase} export failed (exit {result.returncode})", file=sys.stderr)
+            sys.exit(result.returncode)
+
+    def _subprocess_materialize(src: Path, dst: Path, sizes: list[int]) -> None:
+        """Materialize `src` → `dst` in a lean subprocess.
+
+        Target is ``gemma_chat.materialize`` (not ``gemma_chat.export``) so the
+        child doesn't import JAX/flax at startup — the pymil load + materialize
+        pass + final save need every spare GB, especially with a combined
+        (prefill + decode) multifunction source.
+        """
+        cmd = [sys.executable, "-m", "gemma_chat.materialize"]
+        cmd += ["--input", str(src)]
+        cmd += ["--output", str(dst)]
+        cmd += ["--sizes", ",".join(str(s) for s in sizes)]
+        print(
+            f"\n  [materialize] {src.name} → {len(sizes)} sizes per source function …",
+            flush=True,
+        )
+        result = subprocess.run(cmd, env={**_os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        if result.returncode != 0:
+            print(f"\n!!! materialize failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(result.returncode)
 
     if args.separate:
@@ -851,10 +936,14 @@ def main() -> None:
 
             from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
 
+            # ── Combine prefill + decode into a dynamic-shape multifunction ──
+            # Runs in the parent: each source is a single-function package
+            # with ~2.6 GB of weights, so the merge's peak memory is bounded.
+            # This intermediate feeds either the final output (non-materialize)
+            # or the materialize subprocess.
             print("=" * 60)
             print("Merging into multifunction .mlpackage (weight deduplication) ...")
             print("=" * 60)
-
             desc = MultiFunctionDescriptor()
             if not args.decode_only:
                 desc.add_function(str(tmp_prefill), src_function_name="main",
@@ -863,12 +952,33 @@ def main() -> None:
                               target_function_name="decode")
             desc.default_function_name = "decode"
 
-            if output.exists():
-                shutil.rmtree(output)
-            save_multifunction(desc, str(output))
+            if materialize_sizes:
+                tmp_combined = tmp_dir / "combined.mlpackage"
+                save_multifunction(desc, str(tmp_combined))
 
-            final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
-            print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
+                # Materialize the combined multifunction. Loading it once into
+                # pymil and running materialize_symbolic_shape_program per
+                # source function keeps peak RAM at the weight-set size, vs
+                # the old per-phase-then-merge flow which multiplied weights
+                # by ``phases × sizes_per_phase`` and blew past 40 GB commit.
+                print("=" * 60)
+                print("Materializing dynamic shapes to per-size concrete functions …")
+                print("=" * 60)
+                _subprocess_materialize(tmp_combined, output, materialize_sizes)
+
+                n_phases = 1 if args.decode_only else 2
+                final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
+                print(
+                    f"\n  Final model: {output} ({final_size / 1e9:.2f} GB, "
+                    f"{len(materialize_sizes) * n_phases} functions)\n"
+                )
+            else:
+                if output.exists():
+                    shutil.rmtree(output)
+                save_multifunction(desc, str(output))
+
+                final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
+                print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
 
             _embed_tokenizer(args.model_id, output)
 
