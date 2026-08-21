@@ -65,49 +65,50 @@ class PowerTrace:
         }
 
 
-def _parse_power_plist(data: bytes) -> list[PowerSample]:
-    """Parse powermetrics plist output into PowerSample list."""
+_PLIST_START = b"<?xml"
+_PLIST_END = b"</plist>"
+
+
+def _parse_power_plist(data: bytes) -> tuple[list[PowerSample], bytes]:
+    """Parse a ``powermetrics -f plist`` byte stream into PowerSamples.
+
+    ``powermetrics`` emits one XML plist per sample, separated by a NUL byte
+    (the stream reads ``…</plist>\\n\\x00<?xml…``), so NULs are stripped before
+    the documents are handed to :mod:`plistlib`.
+
+    Documents are cut on the ``</plist>`` boundary and the trailing bytes that
+    do not yet form a complete document are returned alongside the samples.  A
+    streaming caller must keep that remainder and prepend it to its next read —
+    a single sample is larger than a 4 KiB read, so dropping the remainder
+    loses roughly every second sample.
+    """
     samples: list[PowerSample] = []
-    try:
-        # powermetrics outputs concatenated plists — split on the XML header.
-        chunks = data.split(b"<?xml")
-        for chunk in chunks:
-            if not chunk.strip():
-                continue
-            xml = b"<?xml" + chunk
-            try:
-                d = plistlib.loads(xml)
-            except Exception:
-                continue
+    pos = 0
+    while (end := data.find(_PLIST_END, pos)) >= 0:
+        end += len(_PLIST_END)
+        doc = data[pos:end].replace(b"\x00", b"")
+        pos = end
+        start = doc.find(_PLIST_START)
+        if start < 0:
+            continue
+        try:
+            d = plistlib.loads(doc[start:])
+        except Exception:
+            continue
 
-            cpu_mw = 0.0
-            gpu_mw = 0.0
-            ane_mw = 0.0
-
-            # CPU power — look in processor dict
-            proc = d.get("processor", {})
-            cpu_mw = proc.get("cpu_power", proc.get("package_power", 0.0))
-
-            # GPU power
-            gpu_entries = d.get("gpu", [])
-            if isinstance(gpu_entries, list):
-                for g in gpu_entries:
-                    gpu_mw += g.get("gpu_power", 0.0)
-            elif isinstance(gpu_entries, dict):
-                gpu_mw = gpu_entries.get("gpu_power", 0.0)
-
-            # ANE power
-            ane_mw = d.get("ane_power", proc.get("ane_power", 0.0))
-
-            samples.append(PowerSample(
-                timestamp=time.monotonic(),
-                cpu_mw=cpu_mw,
-                gpu_mw=gpu_mw,
-                ane_mw=ane_mw,
-            ))
-    except Exception:
-        pass
-    return samples
+        # Every power field lives under "processor"; the top-level "gpu" dict
+        # only carries dvfm/frequency/energy entries, so reading gpu_power
+        # from it always yielded 0.
+        proc = d.get("processor", {})
+        samples.append(PowerSample(
+            timestamp=time.monotonic(),
+            cpu_mw=float(proc.get("cpu_power", proc.get("package_power", 0.0)) or 0.0),
+            gpu_mw=float(proc.get("gpu_power", d.get("gpu_power", 0.0)) or 0.0),
+            ane_mw=float(proc.get("ane_power", d.get("ane_power", 0.0)) or 0.0),
+        ))
+    # Drop the separator (newline + NUL) so a caller's buffer is left empty
+    # when the stream ends on a document boundary.
+    return samples, data[pos:].lstrip(b"\x00 \t\r\n")
 
 
 class PowerMonitor:
@@ -125,7 +126,6 @@ class PowerMonitor:
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._trace = PowerTrace()
-        self._stop = threading.Event()
 
     @property
     def trace(self) -> PowerTrace:
@@ -155,41 +155,42 @@ class PowerMonitor:
             print("⚠ powermetrics not found — power monitoring disabled")
             return
 
-        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread = threading.Thread(
+            target=self._reader, args=(self._proc.stdout,), daemon=True,
+        )
         self._thread.start()
 
-    def _reader(self) -> None:
-        """Background thread: read stdout and parse samples."""
-        assert self._proc is not None
+    def _reader(self, stdout) -> None:
+        """Background thread: sole reader of stdout, until EOF.
+
+        ``stdout`` is passed in rather than reached for through ``self._proc``
+        so that ``stop()`` clearing that attribute cannot race this thread.
+        The loop runs to EOF, which ``stop()`` produces by terminating the
+        process; anything left buffered at that point is parsed here.
+        """
         buf = b""
-        while not self._stop.is_set():
-            chunk = self._proc.stdout.read(4096)  # type: ignore[union-attr]
-            if not chunk:
-                break
+        while chunk := stdout.read(4096):
             buf += chunk
-            # Try to parse completed plist entries
-            samples = _parse_power_plist(buf)
-            if samples:
-                self._trace.samples.extend(samples)
-                buf = b""
+            samples, buf = _parse_power_plist(buf)
+            self._trace.samples.extend(samples)
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._proc is not None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-            # Read any remaining data
-            remaining = self._proc.stdout.read()  # type: ignore[union-attr]
-            if remaining:
-                samples = _parse_power_plist(remaining)
-                self._trace.samples.extend(samples)
-            self._proc = None
+        proc = self._proc
+        if proc is None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        # The reader thread owns stdout — let it drain to EOF and finish
+        # before anything else touches the pipe or clears self._proc.
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=10)
             self._thread = None
+        proc.stdout.close()  # type: ignore[union-attr]
+        self._proc = None
 
 
 def check_power_available() -> bool:
