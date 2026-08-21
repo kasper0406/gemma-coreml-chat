@@ -31,7 +31,6 @@ struct BenchArgs {
     var contextLength: Int = 128
     var decodeTokens: Int = 32
     var runIndex: Int = 0
-    var stopOnStopToken: Bool = false        // bench runs fake prompts
     var warmup: Bool = true                  // do one prefill+decode to prime caches
 }
 
@@ -50,7 +49,6 @@ func parseArgs() -> BenchArgs {
         case "--decode-tokens":    a.decodeTokens = Int(next!)!; i += 2
         case "--run-index":        a.runIndex = Int(next!)!; i += 2
         case "--no-warmup":        a.warmup = false; i += 1
-        case "--stop-on-stop-token": a.stopOnStopToken = true; i += 1
         case "--help", "-h":
             printUsage()
             exit(0)
@@ -74,7 +72,6 @@ func printUsage() {
       --decode-tokens N         decode steps to time            (default: 32)
       --run-index N             metadata only, echoed back      (default: 0)
       --no-warmup               skip the priming prefill+decode
-      --stop-on-stop-token      stop generation on real stop tokens (default: run full decode-tokens)
 
     Emits one JSON object on stdout.
 
@@ -116,6 +113,24 @@ func syntheticPrompt(length: Int, seed: Int) -> [Int32] {
         out.append(id)
     }
     return out
+}
+
+
+/// Global KV cache sizes the engine will touch for a run of `promptLen` prompt
+/// tokens generating `newTokens` tokens: the padded-prefill bucket and the
+/// decode-target bucket, both put through the model's own bucketing policy.
+///
+/// The bench pre-loads exactly these before starting a timer. Leaving it to the
+/// background preload instead means a multi-GB `MLModel.load` can land inside
+/// the measured window — and `ensureLoaded` for the decode bucket then races
+/// that preload, so `prefill_time_s` randomly includes a whole model load.
+func requiredCacheSizes(model: CoreMLModel, promptLen: Int, newTokens: Int) -> [Int] {
+    let nChunks = (promptLen + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
+    let paddedLen = nChunks * GemmaConfig.chunkSize
+    let maxSteps = min(newTokens, max(model.effectiveMaxSeqLen - promptLen, 0))
+    let decodeTarget = min(promptLen + maxSteps, model.effectiveMaxSeqLen)
+    let policy = model.cacheSizePolicy
+    return [policy.size(forNeeded: paddedLen), policy.size(forNeeded: decodeTarget)]
 }
 
 
@@ -177,12 +192,37 @@ struct GemmaBenchMain {
             model = try await CoreMLModel.load(
                 from: modelURL,
                 computeUnits: units,
-                maxContextSize: maxContext
+                maxContextSize: maxContext,
+                // No background preload: it would run multi-GB MLModel loads
+                // underneath the measured window. We load what we need below,
+                // deterministically, before any timer starts.
+                backgroundPreload: false
             )
         } catch {
             FileHandle.standardError.write(Data("error: load failed: \(error)\n".utf8))
             exit(3)
         }
+
+        // Bring up exactly the function pairs this run will touch, so nothing
+        // loads lazily once we are measuring.
+        var neededSizes = Set<Int>()
+        if args.warmup {
+            neededSizes.formUnion(
+                requiredCacheSizes(model: model, promptLen: 16, newTokens: 2)
+            )
+        }
+        neededSizes.formUnion(requiredCacheSizes(
+            model: model, promptLen: args.contextLength, newTokens: args.decodeTokens + 1
+        ))
+        do {
+            for size in neededSizes.sorted() {
+                try await model.ensureLoaded(forGlobalCacheSize: size)
+            }
+        } catch {
+            FileHandle.standardError.write(Data("error: preload failed: \(error)\n".utf8))
+            exit(3)
+        }
+        // Counts the full "model is ready to run" cost, compile + preload.
         let loadTime = now() - loadStart
 
         let engine = InferenceEngine(model: model, temperature: 0.0, topP: 1.0)
@@ -214,18 +254,13 @@ struct GemmaBenchMain {
         )
         do {
             var first = true
-            for try await token in stream {
+            for try await _ in stream {
                 if first {
                     firstTokenAt = now()
                     first = false
                 } else {
                     lastTokenAt = now()
                     decodeTokensGenerated += 1
-                }
-                if args.stopOnStopToken {
-                    // Surface-level check: engine already stops internally on
-                    // real stop tokens; keep for completeness.
-                    if token == 1 || token == 106 || token == 107 { break }
                 }
                 if decodeTokensGenerated >= args.decodeTokens { break }
             }
