@@ -79,18 +79,18 @@ _BACKEND_TO_SWIFT = {
 # ---------------------------------------------------------------------------
 
 
-_BENCH_BUILD_LOCK_MARKER = _SWIFT_BENCH_PKG / ".build" / "bench-built.stamp"
-
-
 def ensure_swift_bench_built(verbose: bool = True) -> Path:
-    """Build the Swift bench binary (once) and return the executable path.
+    """Build the Swift bench binary and return the executable path.
+
+    The build always runs.  GemmaCore is the code under benchmark, so an
+    existing binary says nothing about whether it matches the current
+    sources — skipping the build silently measures the previous revision.
+    An up-to-date `swift build` is a ~1 s no-op.
 
     Requires Xcode (not Command Line Tools) — the package targets
     macOS 15, which the CommandLineTools SDK doesn't provide.
     """
     exe = _SWIFT_BENCH_PKG / ".build" / "release" / "GemmaBench"
-    if exe.exists():
-        return exe
     if verbose:
         print("Building GemmaBench (swift build -c release) …", flush=True)
     r = subprocess.run(
@@ -107,8 +107,6 @@ def ensure_swift_bench_built(verbose: bool = True) -> Path:
         raise RuntimeError(msg)
     if not exe.exists():
         raise RuntimeError(f"GemmaBench built but not at {exe}")
-    _BENCH_BUILD_LOCK_MARKER.parent.mkdir(parents=True, exist_ok=True)
-    _BENCH_BUILD_LOCK_MARKER.write_text(time.strftime("%FT%T%z"))
     return exe
 
 
