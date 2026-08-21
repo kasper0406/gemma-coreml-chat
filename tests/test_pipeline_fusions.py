@@ -14,7 +14,6 @@ placement, and the graph shapes this project actually produces.
 import numpy as np
 import jax
 import jax.numpy as jnp
-import pytest
 import coremltools as ct
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
@@ -111,6 +110,20 @@ def decode_attention(q, k, v, valid):
     return _attend(q, k, v, valid[jnp.newaxis, jnp.newaxis, jnp.newaxis], kv_rep=2)
 
 
+def sliding_cache_write(cache, value, slot):
+    """``decode_coreml._sliding_ring_write``: masked whole-tensor cache write.
+
+    Both operands broadcast against the ``(1, window, nkv, hd)`` cache — the
+    ``(window,)`` slot mask and the ``(1, 1, nkv, hd)`` new entry — so StableHLO
+    materializes a ``tile`` for each before the ``select``.
+    """
+    window = cache.shape[1]
+    mask = (jnp.arange(window, dtype=jnp.int32) == slot)[
+        jnp.newaxis, :, jnp.newaxis, jnp.newaxis
+    ]
+    return jnp.where(mask, value, cache)
+
+
 def rmsnorm(x, scale):
     """``decode_coreml._rmsnorm``."""
     x32 = x.astype(jnp.float32)
@@ -171,29 +184,27 @@ def test_global_attention_fuses_to_sdpa():
     assert any(abs(s - np.sqrt(512.0)) < 0.1 for s in scales), scales
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="stablehlo-coreml 0.1.4 fuse_attention_to_sdpa gives up when the query "
-           "sequence length is 1: _analyse_space cannot tell the unit query axis "
-           "apart from a split of the key axis. Remove this xfail once upstream "
-           "handles it — the decode function is the hot path.",
-)
 def test_decode_attention_fuses_to_sdpa():
+    """Decode is the hot path: query length 1 must fuse as completely as prefill.
+
+    stablehlo-coreml 0.1.5 taught ``fuse_attention_to_sdpa`` to handle a unit
+    query axis, so the whole block collapses and the mask rides along as SDPA's
+    ``attn_mask`` rather than surviving as a ``select``.
+    """
     q, k, v = _attn_args(C=1, hd=256)
     valid = jnp.ones((128,), jnp.bool_)
     _, prog = _convert(decode_attention, q, k, v, valid)
 
     assert _count(prog, "scaled_dot_product_attention") == 1
-
-
-def test_decode_attention_softmax_is_fused():
-    """Even without SDPA, the decomposed softmax must collapse to one op."""
-    q, k, v = _attn_args(C=1, hd=256)
-    valid = jnp.ones((128,), jnp.bool_)
-    _, prog = _convert(decode_attention, q, k, v, valid)
-
-    assert _count(prog, "softmax") == 1
+    assert _count(prog, "softmax") == 0
+    assert _count(prog, "matmul") == 0
+    assert _count(prog, "select") == 0
+    # Only the two GQA repeat tiles (k and v) are left; the mask tile is gone.
+    assert _count(prog, "tile") == 2
     _assert_softmax_not_decomposed(prog)
+
+    sdpa = next(op for op in _ops(prog) if op.op_type == "scaled_dot_product_attention")
+    assert sdpa.inputs.get("attn_mask") is not None, "the mask was dropped, not absorbed"
 
 
 def test_standalone_softmax_stays_a_softmax():
@@ -210,21 +221,24 @@ def test_standalone_softmax_stays_a_softmax():
 def test_tile_feeding_select_is_preserved():
     """E5RT's multifunction shape propagation rejects a broadcasting ``select``.
 
-    The pipeline must keep the explicit ``tile`` that makes the operand shapes
-    match. Exercised on the decode graph, where the mask survives as a ``select``
-    because SDPA fusion does not reach it.
+    ``remove_broadcast_tiles`` deliberately excludes ``select`` from the ops it
+    strips tiles from: E5RT fails type inference on an implicitly broadcasting
+    ``select`` in a multifunction ``.mlpackage``. Exercised on the sliding-cache
+    write, the graph that puts a ``select`` in the real exported model.
     """
-    q, k, v = _attn_args(C=1, hd=256)
-    valid = jnp.ones((128,), jnp.bool_)
-    _, prog = _convert(decode_attention, q, k, v, valid)
+    cache = jnp.ones((1, 128, 4, 256), jnp.float16)
+    value = jnp.ones((1, 1, 4, 256), jnp.float16)
+    _, prog = _convert(sliding_cache_write, cache, value, jnp.int32(3))
 
-    tiled_selects = [
-        op for op in _ops(prog)
-        if op.op_type == "select"
-        and any(op.inputs[name].op is not None and op.inputs[name].op.op_type == "tile"
-                for name in ("cond", "a", "b"))
-    ]
-    assert tiled_selects, "the mask tile feeding select was removed"
+    assert _count(prog, "select") == 1
+    select = next(op for op in _ops(prog) if op.op_type == "select")
+    # Both broadcasting operands keep their tile; only ``b`` is already full size.
+    tiled = [name for name in ("cond", "a", "b")
+             if select.inputs[name].op is not None
+             and select.inputs[name].op.op_type == "tile"]
+    assert tiled == ["cond", "a"], f"tiles feeding select were removed: kept {tiled}"
+    for name in ("cond", "a", "b"):
+        assert tuple(select.inputs[name].shape) == (1, 128, 4, 256)
 
 
 # ── softcap / norm / activation fusion ───────────────────────────────────
@@ -302,11 +316,12 @@ def test_numerical_decode_attention():
     valid = np.arange(S) < 20
 
     ref = np.array(decode_attention(jnp.array(q), jnp.array(k), jnp.array(v), jnp.array(valid)))
-    model, _ = _convert(
+    model, prog = _convert(
         decode_attention,
         jnp.ones_like(q), jnp.ones_like(k), jnp.ones_like(v), jnp.ones((S,), jnp.bool_),
         load=True,
     )
+    assert _count(prog, "scaled_dot_product_attention") == 1
     out = _predict(model, q, k, v, valid.astype(np.float32))
 
     assert np.max(np.abs(ref - out)) < 1e-3
