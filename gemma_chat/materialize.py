@@ -21,6 +21,10 @@ model has:
 
 The runtime picks the function whose size matches the current cache length.
 
+Note: as of macOS 26 / current coremltools (2026) the CPU/ANE load failure no
+longer reproduces on macOS — the dynamic-shape model loads on `CPU_ONLY` there.
+Materialization still matters for iOS/ANE and older OS versions.
+
 Usage
 -----
 ```
