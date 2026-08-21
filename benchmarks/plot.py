@@ -89,12 +89,14 @@ def _aggregate_power(
 
 BACKEND_COLORS = {
     "cpu": "#2196F3",
+    "gpu": "#9C27B0",
     "ane": "#4CAF50",
     "all": "#FF9800",
 }
 
 BACKEND_LABELS = {
     "cpu": "CPU Only",
+    "gpu": "CPU + GPU",
     "ane": "CPU + ANE",
     "all": "CPU + GPU + ANE",
 }
