@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import copy
-
 import coremltools as ct
+from stablehlo_coreml import build_pass_pipeline
 
 
 _backend_patched = False
@@ -13,10 +12,10 @@ _backend_patched = False
 def _patch_backend_pipeline():
     """Append replace_scalar_broadcasts to the backend_mlprogram pipeline.
 
-    The backend pipeline runs AFTER the main (DEFAULT) pipeline and contains
-    two ``const_elimination`` passes that fold ``fill`` ops back into
-    materialized constants.  By appending our pass at the end of the backend
-    pipeline we ensure fill ops survive to serialization.
+    The backend pipeline runs AFTER the main pipeline and contains two
+    ``const_elimination`` passes that fold ``fill`` ops back into materialized
+    constants.  By appending our pass at the end of the backend pipeline we
+    ensure fill ops survive to serialization.
     """
     global _backend_patched
     if _backend_patched:
@@ -29,38 +28,28 @@ def _patch_backend_pipeline():
     _backend_patched = True
 
 
-def build_ct_convert_pass_pipeline():
-    """Build the MIL pass pipeline for int8 export, then defaults + remove_noop."""
-    from stablehlo_coreml.passes.remove_noop_slice_update import (  # noqa: F401
-        remove_noop_slice_update,
-    )
+def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
+    """Return the stablehlo-coreml pipeline plus this project's own passes.
+
+    ``stablehlo_coreml.build_pass_pipeline`` supplies the cleanup group
+    (``remove_broadcast_tiles``, ``fuse_reduce_keep_dims``, dce,
+    ``remove_noop_slice_update``) and the fusion group
+    (``replace_decomposed_softmax``, ``fuse_attention_to_sdpa``,
+    ``fuse_logit_softcap``, ``fuse_gelu_erfc``) on top of
+    ``ct.PassPipeline.DEFAULT``.
+    """
     import gemma_chat.mil_passes.quantize_const_weights  # noqa: F401
-    import gemma_chat.mil_passes.replace_erf_gelu  # noqa: F401
-    import gemma_chat.mil_passes.collapse_reshape_chains  # noqa: F401
-    import gemma_chat.mil_passes.collapse_transpose_chains  # noqa: F401
     import gemma_chat.mil_passes.collapse_cast_chains  # noqa: F401
-    import gemma_chat.mil_passes.fuse_reduce_sum_to_mean  # noqa: F401
-    import gemma_chat.mil_passes.remove_redundant_maximum  # noqa: F401
-    import gemma_chat.mil_passes.remove_broadcast_tiles  # noqa: F401
-    import gemma_chat.mil_passes.replace_decomposed_softmax  # noqa: F401
-    import gemma_chat.mil_passes.fuse_attention_to_sdpa  # noqa: F401
-    import gemma_chat.mil_passes.fuse_logit_softcap  # noqa: F401
 
     _patch_backend_pipeline()
 
-    pipeline = copy.deepcopy(ct.PassPipeline.DEFAULT)
+    pipeline = build_pass_pipeline()
+    # First: weights must be quantized before any pass materializes them.
     pipeline.insert_pass(0, "common::quantize_const_weights")
-    # Cleanup passes first — simplify the graph for fusion
-    pipeline.append_pass("common::remove_noop_slice_update")
-    pipeline.append_pass("common::replace_erf_gelu")
-    pipeline.append_pass("common::collapse_reshape_chains")
-    pipeline.append_pass("common::collapse_transpose_chains")
-    pipeline.append_pass("common::collapse_cast_chains")
-    pipeline.append_pass("common::fuse_reduce_sum_to_mean")
-    pipeline.append_pass("common::remove_redundant_maximum")
-    pipeline.append_pass("common::remove_broadcast_tiles")
-    # Fusion passes — must run after cleanup
-    pipeline.append_pass("common::replace_decomposed_softmax")
-    pipeline.append_pass("common::fuse_logit_softcap")
-    pipeline.append_pass("common::fuse_attention_to_sdpa")
+    # Just before the fusion group, so the fusion passes see fewer casts and
+    # the dce entries interleaved with them clean up what this pass orphans.
+    pipeline.insert_pass(
+        pipeline.passes.index("common::replace_decomposed_softmax"),
+        "common::collapse_cast_chains",
+    )
     return pipeline

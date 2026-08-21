@@ -3,13 +3,23 @@
 By default, both functions are merged into a single multifunction .mlpackage
 with shared (int4-quantized) weights, and the global KV caches are
 materialized into one concrete-shape function per size so the model runs on
-ANE / CPU as well as GPU.  Pass --no-materialize to keep RangeDim shapes
-(GPU-only) for a single dynamic-shape function pair.
+ANE / CPU as well as GPU.  Pass --no-materialize to keep RangeDim shapes for a
+single dynamic-shape function pair.
+
+The 12 sliding-window KV caches are exported as Core ML **state** rather than
+model I/O; only the 3 global caches (symbolic dim 1) and the int32
+``sliding_pos_ring`` are passed in and out per call.  Core ML states must be
+static-shaped and floating point, which is exactly why those two stay I/O.
+
+Note: --no-materialize does not produce a loadable model any more — a
+dynamic-shape (RangeDim) program that also declares states fails to load with
+E5RT/BNNS errors.  That path was already GPU-only/experimental; use the default
+materialized flow.
 
 Usage:
     uv run gemma-export
     uv run gemma-export --output gemma4-e2b.mlpackage
-    uv run gemma-export --no-materialize  # GPU-only, dynamic-shape export
+    uv run gemma-export --no-materialize  # dynamic-shape, does not load
     uv run gemma-export --skip-warmup     # save RAM on constrained machines
 """
 
@@ -84,6 +94,7 @@ import jax
 import jax.numpy as jnp
 
 import coremltools as ct
+from stablehlo_coreml import StateSpec
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN
@@ -140,13 +151,44 @@ def _truncate_params(params: dict, num_layers: int, ple_dim: int) -> dict:
 # ── Shared helpers ─────────────────────────────────────────────────────────
 
 
-def _build_kv_names(n_layers: int) -> list[str]:
-    """Return 30 KV cache names: ['k_0', 'v_0', 'k_1', 'v_1', ..., 'k_14', 'v_14']."""
-    names: list[str] = []
-    for i in range(n_layers):
-        names.append(f"k_{i}")
-        names.append(f"v_{i}")
-    return names
+def _kv_export_plan(
+    cache_specs, has_global: bool,
+) -> tuple[dict[int, StateSpec], list[str], list[str]]:
+    """Split the flat KV caches into Core ML state and ordinary I/O.
+
+    Sliding caches are static-shaped, so they become Core ML **state**: the
+    converter drops them from the model inputs and drops their updated value
+    from the outputs, exposing a state feature instead.  Global caches carry a
+    symbolic dim 1 (states must be static-shaped) and ``sliding_pos_ring`` is
+    int32 (states must be floating point), so both stay ordinary I/O.
+
+    Both traced functions have the argument order
+    ``[N?] + [tokens, start_position] + kv_flat + [sliding_pos_ring]`` and the
+    result order ``[logits] + kv_flat_out + [sliding_pos_ring_out]``, where
+    ``kv_flat`` is ``[k_0, v_0, k_1, v_1, ...]``.  Cache slot ``s`` is therefore
+    argument ``base + 2s`` (k) / ``base + 2s + 1`` (v) with
+    ``base = (1 if has_global else 0) + 2``, and output ``1 + 2s`` / ``2 + 2s``.
+    ``N`` is the leading dimension-variable argument JAX adds for the symbolic
+    global cache length; it is absent when no layer is global.
+
+    Returns ``(states, kv_input_names, kv_output_names)`` where the two name
+    lists cover only the caches that remain I/O, in slot order.  State features
+    keep the names the inputs used to have (``k_0``, ``v_0``, …) so the layout
+    is unchanged from the runtime's point of view.
+    """
+    base = (1 if has_global else 0) + 2
+    states: dict[int, StateSpec] = {}
+    kv_input_names: list[str] = []
+    kv_output_names: list[str] = []
+    for slot, spec in enumerate(cache_specs):
+        k_name, v_name = f"k_{slot}", f"v_{slot}"
+        if spec.attn_type == AttentionType.GLOBAL:
+            kv_input_names += [k_name, v_name]
+            kv_output_names += [k_name + "_out", v_name + "_out"]
+        else:
+            states[base + 2 * slot] = StateSpec(output=1 + 2 * slot, name=k_name)
+            states[base + 2 * slot + 1] = StateSpec(output=2 + 2 * slot, name=v_name)
+    return states, kv_input_names, kv_output_names
 
 
 def _rename_model_io(
@@ -160,6 +202,11 @@ def _rename_model_io(
     ``FeatureDescription`` names **and** the MLProgram function input/output
     names.  This is required for ``save_multifunction`` — its validator
     checks that spec names and MLProgram names match.
+
+    State features are *not* covered here: they live in ``description.state``,
+    not ``description.input``/``.output``, and already carry their final names
+    from the ``StateSpec(name=...)`` handed to the converter.  So the two name
+    lists must enumerate only the non-state inputs/outputs.
     """
     from coremltools.models.utils import rename_feature
 
@@ -183,8 +230,12 @@ def _rename_model_io(
             rename_feature(spec, feat.name, new_name, rename_inputs=False)
 
 
-def _hlo_to_mil_streaming(hlo_module):
+def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     """Convert StableHLO to MIL with streaming int8/int4 quantization.
+
+    ``states`` maps traced-argument indices to :class:`StateSpec` — see
+    :func:`_kv_export_plan`.  Those arguments become Core ML state features and
+    disappear from the model's inputs/outputs.
 
     Returns the MIL program.  The caller should ``del hlo_module`` after
     this returns to free the MLIR IR (~3.5 GB) before the heavier
@@ -252,9 +303,14 @@ def _hlo_to_mil_streaming(hlo_module):
     set_streaming_quantizer(_stream_quantize)
     print("  [convert] streaming mixed-precision quantization enabled", flush=True)
 
-    print(f"  [convert {_os.getpid()}] hlo_to_mil …", flush=True)
+    print(
+        f"  [convert {_os.getpid()}] hlo_to_mil ({len(states)} state args) …",
+        flush=True,
+    )
     try:
-        mil_program = hlo_to_mil(hlo_module, minimum_deployment_target=ct.target.iOS18)
+        mil_program = hlo_to_mil(
+            hlo_module, minimum_deployment_target=ct.target.iOS18, states=states,
+        )
     finally:
         set_streaming_quantizer(None)
 
@@ -394,14 +450,16 @@ def export_chunk_prefill(
 
     Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
     so a single model works at any cache length up to ``max_seq_len``.
+    Sliding KV caches are Core ML state and never cross the model boundary.
 
     Inputs:  N (1,) int32 — phantom dim for current global cache length
              tokens (1, chunk_size) int32
              start_position (1,) int32  — absolute position of first token in chunk
-             k_0, v_0, ..., k_N, v_N — current KV cache arrays float16
+             k_s, v_s — current **global** KV cache arrays float16 (slot order)
              sliding_pos_ring (1, sliding_window_size) int32
+    States:  k_s, v_s — the sliding KV caches, float16, updated in place
     Outputs: logits (chunk_size, vocab_size) float32
-             k_0_out, v_0_out, ..., k_N_out, v_N_out — updated KV caches
+             k_s_out, v_s_out — updated global KV caches
              sliding_pos_ring_out (1, sliding_window_size) int32
     """
     import gc
@@ -491,20 +549,17 @@ def export_chunk_prefill(
         print("=" * 60)
         print("Chunk-prefill export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        n_kv = len(cache_specs)
-        kv_names = _build_kv_names(n_kv)
-        kv_out_names = [n + "_out" for n in kv_names]
+        states, kv_names, kv_out_names = _kv_export_plan(cache_specs, has_global)
+        print(
+            f"  Sliding caches as Core ML state: {len(states)}; "
+            f"global caches as I/O: {len(kv_names)}",
+            flush=True,
+        )
 
-        # Build flexible_shapes for global cache dims (prefill).
-        flex_shapes: dict[str, tuple[int, int]] = {}
-        for slot, spec in enumerate(cache_specs):
-            if spec.attn_type == AttentionType.GLOBAL:
-                k_name = kv_names[slot * 2]
-                v_name = kv_names[slot * 2 + 1]
-                flex_shapes[k_name] = (1, max_seq_len)
-                flex_shapes[v_name] = (1, max_seq_len)
+        # Only the global caches keep a flexible dim 1.
+        flex_shapes = {name: (1, max_seq_len) for name in kv_names}
 
-        mil_program = _hlo_to_mil_streaming(hlo_module)
+        mil_program = _hlo_to_mil_streaming(hlo_module, states)
         del hlo_module
         _release_malloc()
         print(f"  [memory] RSS after HLO release: {_rss_mb():.0f} MB", flush=True)
@@ -534,14 +589,16 @@ def export_decode_step(
 
     Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
     so a single model works at any cache length up to ``max_seq_len``.
+    Sliding KV caches are Core ML state and never cross the model boundary.
 
     Inputs:  N (1,) int32 — phantom dim for current global cache length
              token_id (1,) int32
              position (1,) int32  — absolute position of this token
-             k_0, v_0, ..., k_N, v_N — current KV cache arrays float16
+             k_s, v_s — current **global** KV cache arrays float16 (slot order)
              sliding_pos_ring (1, sliding_window_size) int32
+    States:  k_s, v_s — the sliding KV caches, float16, updated in place
     Outputs: logits (vocab_size,) float32
-             k_0_out, v_0_out, ..., k_N_out, v_N_out — updated KV caches
+             k_s_out, v_s_out — updated global KV caches
              sliding_pos_ring_out (1, sliding_window_size) int32
     """
     import numpy as np
@@ -631,20 +688,17 @@ def export_decode_step(
         print("=" * 60)
         print("Decode export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        n_kv = len(cache_specs)
-        kv_names = _build_kv_names(n_kv)
-        kv_out_names = [n + "_out" for n in kv_names]
+        states, kv_names, kv_out_names = _kv_export_plan(cache_specs, has_global)
+        print(
+            f"  Sliding caches as Core ML state: {len(states)}; "
+            f"global caches as I/O: {len(kv_names)}",
+            flush=True,
+        )
 
-        # Build flexible_shapes for global cache dims (decode).
-        flex_shapes: dict[str, tuple[int, int]] = {}
-        for slot, spec in enumerate(cache_specs):
-            if spec.attn_type == AttentionType.GLOBAL:
-                k_name = kv_names[slot * 2]
-                v_name = kv_names[slot * 2 + 1]
-                flex_shapes[k_name] = (1, max_seq_len)
-                flex_shapes[v_name] = (1, max_seq_len)
+        # Only the global caches keep a flexible dim 1.
+        flex_shapes = {name: (1, max_seq_len) for name in kv_names}
 
-        mil_program = _hlo_to_mil_streaming(hlo_module)
+        mil_program = _hlo_to_mil_streaming(hlo_module, states)
         del hlo_module
         _release_malloc()
         print(f"  [memory] RSS after HLO release: {_rss_mb():.0f} MB", flush=True)
@@ -785,8 +839,11 @@ def main() -> None:
             "that share deduplicated weights.  Defaults to powers of 2 from "
             "CHUNK_SIZE to --max-seq-len; override with --materialize-sizes.  "
             "Enabled by default because the ANE and CPU backends hit runtime "
-            "issues with RangeDim shapes; pass --no-materialize for a "
-            "GPU-only dynamic-shape export."
+            "issues with RangeDim shapes.  --no-materialize keeps the "
+            "dynamic-shape export, but since the sliding KV caches became "
+            "Core ML state such a model no longer loads at all (E5RT/BNNS "
+            "errors on a RangeDim program that declares states) — it is only "
+            "useful for inspecting the converted program."
         ),
     )
     parser.add_argument(

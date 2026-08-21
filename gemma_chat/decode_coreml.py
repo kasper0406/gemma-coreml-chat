@@ -18,6 +18,22 @@ Only 15 of the 35 layers store their own KV (layers 15-34 are KV-shared).
 Flat KV representation: ``[k0, v0, k1, v1, ..., k14, v14]`` — 30 arrays.
 Layer order: 0, 1, 2, 3 (LOCAL_SLIDING), 4 (GLOBAL), 5-8, 9, 10-13, 14.
 
+Core ML state
+-------------
+Both functions still take and return all 30 caches, but ``export.py`` binds the
+**sliding** ones to Core ML *state* (they have static shapes, which Core ML
+states require) so they never cross the model boundary at run time.  The global
+caches keep their symbolic dim-1 and stay ordinary inputs/outputs, and
+``sliding_pos_ring`` stays I/O because it is int32 (states must be floating
+point).
+
+That is why every sliding-cache write below is a whole-tensor ``jnp.where``
+rather than ``jax.lax.dynamic_update_slice``: on macOS 26 a Core ML state write
+whose value comes from ``slice_update`` is applied to a freshly zeroed buffer
+instead of the persisted one, while a ``select``-shaped write persists
+correctly.  Global writes are unaffected and keep using
+``dynamic_update_slice``.
+
 Tokens: right-padded — real tokens at positions 0..T-1, zeros at T..L-1.
 """
 
@@ -68,6 +84,21 @@ def empty_kv_cache(
 def empty_pos_ring(cfg: Gemma4Config = E2B_CONFIG) -> jnp.ndarray:
     """Return (1, sliding_window_size) int32 filled with -1 (no entries)."""
     return jnp.full((1, cfg.sliding_window_size), -1, dtype=jnp.int32)
+
+
+def _sliding_ring_write(cache, value, position, window: int):
+    """Write ``value`` into ring slot ``position % window`` of ``cache``.
+
+    ``cache`` is ``(1, window, nkv, hd)``, ``value`` is ``(1, 1, nkv, hd)`` and
+    broadcasts across the window; the mask selects the one live slot.  Equivalent
+    to ``jax.lax.dynamic_update_slice(cache, value, (0, position % window, 0, 0))``
+    but built from a whole-tensor select, which is what a CoreML state update
+    needs — see the module docstring.
+    """
+    mask = (
+        jnp.arange(window, dtype=jnp.int32) == (position % window)
+    )[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]  # (1, window, 1, 1)
+    return jnp.where(mask, value, cache)
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +215,17 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
         v_new = _rmsnorm_noscale(v_new)
         k_new = _apply_rope(k_new, pos_arr, base_freq, rope_frac)
 
-        # Write slot: ring-buffer modular index for sliding, absolute for global.
-        write_idx = (position % cfg.sliding_window_size) if is_sliding else position
         k_new_f16 = k_new.astype(jnp.float16)
         v_new_f16 = v_new.astype(jnp.float16)
-        k_updated = jax.lax.dynamic_update_slice(k_cache, k_new_f16, (0, write_idx, 0, 0))
-        v_updated = jax.lax.dynamic_update_slice(v_cache, v_new_f16, (0, write_idx, 0, 0))
+        if is_sliding:
+            W = cfg.sliding_window_size
+            k_updated = _sliding_ring_write(k_cache, k_new_f16, position, W)
+            v_updated = _sliding_ring_write(v_cache, v_new_f16, position, W)
+        else:
+            # Global caches stay ordinary I/O tensors — linear write at the
+            # absolute position.
+            k_updated = jax.lax.dynamic_update_slice(k_cache, k_new_f16, (0, position, 0, 0))
+            v_updated = jax.lax.dynamic_update_slice(v_cache, v_new_f16, (0, position, 0, 0))
         k_full, v_full = k_updated, v_updated
 
     # Attention validity mask
@@ -373,7 +409,8 @@ def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
     v_new_f16 = v_new.astype(jnp.float16)
 
     if is_sliding:
-        # Ring-buffer write via einsum scatter.
+        # Ring-buffer write via einsum scatter.  Already a whole-tensor select,
+        # which is what the Core ML state update needs (see module docstring).
         W = cfg.sliding_window_size
         abs_pos = positions[0]  # (C,)
         ring_slots = abs_pos % W  # (C,)

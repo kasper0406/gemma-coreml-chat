@@ -14,6 +14,12 @@
 /// Materialized models are produced by `gemma-materialize` and work on all
 /// backends including ANE and iPhone, whereas standard RangeDim models only
 /// work on GPU.
+///
+/// Every function declares the 12 sliding-window KV caches as CoreML **state**
+/// (`k_<slot>` / `v_<slot>`), so only the 3 global caches and the int32
+/// `sliding_pos_ring` are passed in and out per call. An artifact without those
+/// state features predates the change and is rejected at load — re-run
+/// `gemma-export`.
 
 import CoreML
 import CryptoKit
@@ -44,6 +50,9 @@ public final class CoreMLModel: @unchecked Sendable {
 
     /// Global KV input names (caches whose dim-1 varies with context length).
     public let globalKVInputNames: Set<String>
+
+    /// Names of the sliding KV caches, which are CoreML state rather than I/O.
+    public let slidingStateNames: Set<String>
 
     /// Shapes of each prefill KV input, extracted once so the prefill model
     /// can be released without losing the metadata needed to re-seed KV caches.
@@ -106,6 +115,11 @@ public final class CoreMLModel: @unchecked Sendable {
     private var nextLoadID: UInt64 = 0
     private let cacheLock = NSLock()
 
+    /// The function instance `makeState()` allocates from. Any loaded instance
+    /// works — states are keyed by name and shared across every function of the
+    /// package — so this is just "one we know is loaded" (the bootstrap decode).
+    private let stateSourceModel: MLModel
+
     private init(
         prefillIO: ClassifiedIO,
         prefillKVShapes: [String: [NSNumber]],
@@ -119,6 +133,7 @@ public final class CoreMLModel: @unchecked Sendable {
         sourceURL: URL,
         sourceFingerprint: String?,
         computeUnits: MLComputeUnits,
+        stateSourceModel: MLModel,
         initialFunctions: [String: MLModel]
     ) {
         self.prefillLogitsName = prefillIO.logitsOutputName
@@ -136,6 +151,7 @@ public final class CoreMLModel: @unchecked Sendable {
         self.prefillKVShapes = prefillKVShapes
         self.prefillKVDtypes = prefillKVDtypes
         self.globalKVInputNames = globalKVInputNames
+        self.slidingStateNames = decodeIO.stateNames
         self.materializedSizes = materializedSizes
         self.effectiveMaxSeqLen = effectiveMaxSeqLen
         self.isDecodeOnly = isDecodeOnly
@@ -143,7 +159,32 @@ public final class CoreMLModel: @unchecked Sendable {
         self.sourceURL = sourceURL
         self.sourceFingerprint = sourceFingerprint
         self.computeUnits = computeUnits
+        self.stateSourceModel = stateSourceModel
         self.functions = initialFunctions.mapValues { .loaded($0) }
+    }
+
+    /// Allocate a fresh, zero-filled set of sliding KV cache buffers.
+    ///
+    /// One `MLState` serves every function in the package: `decode_512`,
+    /// `prefill_1024`, … all bind the same named state buffers, so the runtime
+    /// can switch sizes mid-conversation without touching the sliding caches.
+    /// Make a new one per conversation — reusing one across a reset would leave
+    /// stale K/V that a re-populated `sliding_pos_ring` marks valid again.
+    public func makeState() -> MLState {
+        stateSourceModel.makeState()
+    }
+
+    /// A zeroed KV state: fresh global caches, fresh `sliding_pos_ring`, and a
+    /// fresh `MLState` for the sliding caches.
+    public func makeEmptyKVState(initialGlobalSize: Int? = nil) throws -> KVCacheState {
+        try KVCacheState.empty(
+            kvInputNames: prefillKVInputNames,
+            shapes: prefillKVShapes,
+            dtypes: prefillKVDtypes,
+            globalNames: globalKVInputNames,
+            initialGlobalSize: initialGlobalSize,
+            slidingCaches: makeState()
+        )
     }
 
     /// Bucketing policy for this model's global KV caches. Hand this to
@@ -486,6 +527,8 @@ public final class CoreMLModel: @unchecked Sendable {
 
         let decodeIO = classifyIO(model: decodeModel)
         let prefillIO = classifyIO(model: prefillModel)
+        try requireStatefulKV(decodeIO, function: "decode")
+        try requireStatefulKV(prefillIO, function: "prefill")
         let (prefillKVShapes, prefillKVDtypes) = extractKVMetadata(
             model: prefillModel, kvInputNames: prefillIO.kvInputNames
         )
@@ -511,7 +554,22 @@ public final class CoreMLModel: @unchecked Sendable {
             sourceURL: sourceURL,
             sourceFingerprint: sourceFingerprint,
             computeUnits: computeUnits,
+            stateSourceModel: decodeModel,
             initialFunctions: ["decode": decodeModel, "prefill": prefillModel]
+        )
+    }
+
+    /// Reject artifacts exported before the sliding KV caches became state.
+    ///
+    /// Such a model takes all 30 caches as inputs, so it would load and then
+    /// fail per-prediction on missing features — or worse, silently run with
+    /// whatever the runtime defaulted them to. Fail at load with the fix.
+    private static func requireStatefulKV(
+        _ io: ClassifiedIO, function: String
+    ) throws {
+        guard io.stateNames.isEmpty else { return }
+        throw CoreMLModelError.modelPredatesStatefulKVCaches(
+            function: function, kvInputCount: io.kvInputNames.count
         )
     }
 
@@ -662,6 +720,10 @@ public final class CoreMLModel: @unchecked Sendable {
         // the two functions, and the per-token loop in `decodeOnlyPrefill`
         // doesn't use prefill's own token/position input names.
         let prefillIO = prefillModel.map { classifyIO(model: $0) } ?? decodeIO
+        try requireStatefulKV(decodeIO, function: "decode_\(bootSize)")
+        if prefillModel != nil {
+            try requireStatefulKV(prefillIO, function: prefillName)
+        }
         let prefillSourceModel = prefillModel ?? decodeModel
         let (prefillKVShapes, prefillKVDtypes) = extractKVMetadata(
             model: prefillSourceModel, kvInputNames: prefillIO.kvInputNames
@@ -689,6 +751,7 @@ public final class CoreMLModel: @unchecked Sendable {
             sourceURL: sourceURL,
             sourceFingerprint: sourceFingerprint,
             computeUnits: computeUnits,
+            stateSourceModel: decodeModel,
             initialFunctions: initialFunctions
         )
         if backgroundPreload {
@@ -740,7 +803,10 @@ public final class CoreMLModel: @unchecked Sendable {
         }
         let sig = String(text[r])
 
-        // Each param is `tensor<dtype, [d0, d1, ...]> name`.
+        // Each tensor param is `tensor<dtype, [d0, d1, ...]> name`. The sliding
+        // KV caches are state params, spelled `state<tensor<…>> name`, and the
+        // trailing `>>` makes them fall out of this pattern — which is what we
+        // want: their length is the sliding window, never the context size.
         let paramPattern = #"tensor<[^,]+,\s*\[([^\]]+)\]>\s*([A-Za-z_][A-Za-z0-9_]*)"#
         guard let paramRe = try? NSRegularExpression(pattern: paramPattern) else { return nil }
         var result: [String: Int] = [:]
@@ -854,8 +920,8 @@ public final class CoreMLModel: @unchecked Sendable {
 
     /// Log I/O classification summary.
     private static func logIOSummary(decodeIO: ClassifiedIO, prefillIO: ClassifiedIO) {
-        Log.info("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count)")
-        Log.info("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName), token=\(prefillIO.tokenInputName), pos=\(prefillIO.positionInputName), kvIn=\(prefillIO.kvInputNames.count), kvOut=\(prefillIO.kvOutputNames.count)")
+        Log.info("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count), slidingStates=\(decodeIO.stateNames.count)")
+        Log.info("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName), token=\(prefillIO.tokenInputName), pos=\(prefillIO.positionInputName), kvIn=\(prefillIO.kvInputNames.count), kvOut=\(prefillIO.kvOutputNames.count), slidingStates=\(prefillIO.stateNames.count)")
         if decodeIO.nInputName != nil {
             Log.info("[CoreML] Dynamic context: N input detected (decode=\(decodeIO.nInputName!), prefill=\(prefillIO.nInputName ?? "none"))")
         }
@@ -1185,13 +1251,15 @@ public final class CoreMLModel: @unchecked Sendable {
             kvNames: prefillKVInputNames,
             kvState: kvState
         )
-        let result = try activeModel.prediction(from: provider)
+        // The sliding caches are updated in place inside `slidingCaches`.
+        let result = try activeModel.prediction(from: provider, using: kvState.slidingCaches)
         let logits = result.featureValue(for: prefillLogitsName)!.multiArrayValue!
         let newKV = try KVCacheState.from(
             prediction: result,
             outputNames: prefillKVOutputNames,
             inputNames: prefillKVInputNames,
-            globalNames: kvState.globalNames
+            globalNames: kvState.globalNames,
+            slidingCaches: kvState.slidingCaches
         )
         return (logits, newKV)
     }
@@ -1321,13 +1389,15 @@ public final class CoreMLModel: @unchecked Sendable {
             kvNames: decodeKVInputNames,
             kvState: kvState
         )
-        let result = try activeModel.prediction(from: provider)
+        // The sliding caches are updated in place inside `slidingCaches`.
+        let result = try activeModel.prediction(from: provider, using: kvState.slidingCaches)
         let logits = result.featureValue(for: decodeLogitsName)!.multiArrayValue!
         let newKV = try KVCacheState.from(
             prediction: result,
             outputNames: decodeKVOutputNames,
             inputNames: decodeKVInputNames,
-            globalNames: kvState.globalNames
+            globalNames: kvState.globalNames,
+            slidingCaches: kvState.slidingCaches
         )
         return (logits, newKV)
     }
@@ -1340,16 +1410,30 @@ public final class CoreMLModel: @unchecked Sendable {
         let tokenInputName: String
         let positionInputName: String
         let nInputName: String?
+        /// KV features passed per call: the global caches plus `sliding_pos_ring`.
         let kvInputNames: [String]
         let kvOutputNames: [String]
+        /// CoreML state features: the sliding KV caches. Empty only for an
+        /// artifact exported before they became state.
+        let stateNames: Set<String>
     }
 
     /// Classify model I/O using name matching with positional fallback.
+    ///
+    /// The sliding KV caches are state, so they appear in neither
+    /// `inputDescriptionsByName` nor `outputDescriptionsByName`; what remains to
+    /// pair up is the global caches (`k_<slot>` ↔ `k_<slot>_out`) and
+    /// `sliding_pos_ring`.
     static func classifyIO(model: MLModel) -> ClassifiedIO {
-        let inputDescs = model.modelDescription.inputDescriptionsByName
-        let outputDescs = model.modelDescription.outputDescriptionsByName
+        let description = model.modelDescription
+        let stateNames = Set(description.stateDescriptionsByName.keys)
+        let outputDescs = description.outputDescriptionsByName
+        // Defensive: keep state features out of the input classification even
+        // if a future CoreML release starts listing them there too.
+        let inputDescs = description.inputDescriptionsByName
+            .filter { !stateNames.contains($0.key) }
 
-        // Outputs: float32 = logits, everything else = state
+        // Outputs: float32 = logits, everything else = KV
         var logitsName = ""
         var kvOutputs: [String] = []
         for (name, desc) in outputDescs {
@@ -1361,7 +1445,7 @@ public final class CoreMLModel: @unchecked Sendable {
         }
         kvOutputs.sort { naturalCompare($0, $1) }
 
-        // Try name matching: input name ∈ output names → state
+        // Try name matching: input name ∈ output names → KV
         let stateOutputSet = Set(kvOutputs)
         var controlInputs: [String] = []
         var kvInputs: [String] = []
@@ -1387,7 +1471,7 @@ public final class CoreMLModel: @unchecked Sendable {
 
         assert(!logitsName.isEmpty, "No Float32 output found (logits)")
         assert(kvInputs.count == kvOutputs.count,
-               "State input count (\(kvInputs.count)) != output count (\(kvOutputs.count))")
+               "KV input count (\(kvInputs.count)) != output count (\(kvOutputs.count))")
 
         let (tokenName, posName, nName) = identifyControlInputs(
             controlInputs, inputDescs: inputDescs
@@ -1399,7 +1483,8 @@ public final class CoreMLModel: @unchecked Sendable {
             positionInputName: posName,
             nInputName: nName,
             kvInputNames: kvInputs,
-            kvOutputNames: kvOutputs
+            kvOutputNames: kvOutputs,
+            stateNames: stateNames
         )
     }
 
@@ -1582,6 +1667,9 @@ public enum CoreMLModelError: Error, LocalizedError {
     case globalKVDetectionFailed(String)
     /// An MLMultiArray had a dtype/shape/stride we can't safely memcpy.
     case unexpectedBufferLayout(String)
+    /// The artifact declares no CoreML state features, i.e. it was exported
+    /// before the sliding KV caches moved into state.
+    case modelPredatesStatefulKVCaches(function: String, kvInputCount: Int)
     /// A token position doesn't fit the allocated global KV cache.
     case positionOutOfRange(position: Int, cacheSize: Int)
     /// Both load strategies failed; both causes are kept because the standard
@@ -1600,6 +1688,8 @@ public enum CoreMLModelError: Error, LocalizedError {
             "Could not identify the global KV cache inputs: \(reason)"
         case .unexpectedBufferLayout(let reason):
             "Unexpected MLMultiArray layout: \(reason)"
+        case .modelPredatesStatefulKVCaches(let function, let kvInputCount):
+            "Function '\(function)' declares no CoreML state features (it takes \(kvInputCount) KV inputs) — this model predates stateful KV caches. Re-run `uv run gemma-export`."
         case .positionOutOfRange(let position, let cacheSize):
             "Token position \(position) does not fit a global KV cache of size \(cacheSize)"
         case .loadFailed(let standard, let materialized):

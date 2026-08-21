@@ -1,1 +1,1 @@
-"""Gemma-specific MIL passes vendored for use with PyPI stablehlo-coreml."""
+"""MIL passes this project adds on top of the ones stablehlo-coreml ships."""

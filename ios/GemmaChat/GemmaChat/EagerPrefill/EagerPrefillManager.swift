@@ -42,7 +42,7 @@ actor EagerPrefillManager {
         self.tokenizer = tokenizer
         self.model = model
         // Initial empty state is a tiny allocation (no global size override) — safe to force.
-        self.kvState = try! Self.emptyKV(model: model, initialGlobalSize: nil)
+        self.kvState = try! model.makeEmptyKVState()
     }
 
     /// Most tokens we may eagerly prefill: whole chunks only, and never past
@@ -54,16 +54,6 @@ actor EagerPrefillManager {
     /// has no per-position guard of its own the way the decode loop does.
     private var maxEagerTokens: Int {
         (model.effectiveMaxSeqLen / GemmaConfig.chunkSize) * GemmaConfig.chunkSize
-    }
-
-    private static func emptyKV(model: CoreMLModel, initialGlobalSize: Int?) throws -> KVCacheState {
-        try KVCacheState.empty(
-            kvInputNames: model.prefillKVInputNames,
-            shapes: model.prefillKVShapes,
-            dtypes: model.prefillKVDtypes,
-            globalNames: model.globalKVInputNames,
-            initialGlobalSize: initialGlobalSize
-        )
     }
 
     /// Called when the user's input text changes.
@@ -167,7 +157,7 @@ actor EagerPrefillManager {
             clearInternalState()
             return (
                 promptIDs,
-                try Self.emptyKV(model: model, initialGlobalSize: nil),
+                try model.makeEmptyKVState(),
                 0
             )
         }
@@ -204,7 +194,7 @@ actor EagerPrefillManager {
         prefillTokens = []
         completedChunks = 0
         // Tiny allocation (no global size override) — safe to force.
-        kvState = try! Self.emptyKV(model: model, initialGlobalSize: nil)
+        kvState = try! model.makeEmptyKVState()
         lastLogits = nil
         isPrefilling = false
     }
@@ -228,7 +218,7 @@ actor EagerPrefillManager {
                 let neededSize = upToChunk * GemmaConfig.chunkSize
                 let roundedSize = model.cacheSizePolicy.size(forNeeded: neededSize)
                 if startChunk == 0 {
-                    kvState = try Self.emptyKV(model: model, initialGlobalSize: roundedSize)
+                    kvState = try model.makeEmptyKVState(initialGlobalSize: roundedSize)
                 } else {
                     kvState = try kvState.grownToFit(
                         needed: roundedSize, policy: model.cacheSizePolicy

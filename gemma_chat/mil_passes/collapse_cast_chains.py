@@ -6,6 +6,13 @@ by pre-FFN norm), the graph contains ``cast(fp32→fp16) → cast(fp16→fp32)``
 chains where the intermediate representation is never used by anything
 else. Collapsing these avoids pointless precision round-trips.
 
+Not covered upstream: coremltools' ``cast_optimization`` deliberately keeps a
+downcast→upcast pair because dropping it skips the fp16 rounding, and
+stablehlo-coreml has no equivalent pass. We *want* it dropped — the round-trip
+is an artefact of writing the norm in fp32 and handing fp16 to the next op,
+not a deliberate quantization step. Measured on a Gemma-shaped transformer
+block (two adjacent RMSNorms): 16 → 14 cast ops.
+
 Rules:
 - ``cast(x, A) → cast(_, B)`` where B == x.dtype  →  remove both (identity)
 - ``cast(x, A) → cast(_, B)`` otherwise            →  single ``cast(x, B)``

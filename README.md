@@ -22,7 +22,7 @@ uv sync
 
 # 2. Export the model to CoreML (one-time, ~10-30 min, ~8 GB disk)
 uv run gemma-export
-# (add --no-materialize for a GPU-only, dynamic-shape export — see below)
+# (--no-materialize emits a dynamic-shape export that no longer loads — see below)
 
 # 3. Build and run the Swift CLI chat
 cd cli && swift build -c release
@@ -37,13 +37,19 @@ The first CLI launch compiles `.mlpackage` → `.mlmodelc` next to the source (c
 
 `uv run gemma-export` downloads HF weights, defines the full transformer in JAX/Flax, and traces it via `jax.jit` → StableHLO → CoreML MIL, producing a single multifunction `.mlpackage` with both **chunked prefill** and **KV-cached decode** functions (and the embedded tokenizer).
 
-**Materialized by default (`--materialize`).** The exporter materializes the global KV caches into one concrete-shape function pair per cache size (powers of 2 up to `--max-seq-len`), sharing deduplicated weights across functions. This is the default because the **ANE and CPU** CoreML backends have runtime issues with dynamic (`RangeDim`) shapes — they either fail to load or fall back silently to GPU. If you only care about the **GPU** backend, pass `--no-materialize` to skip materialization and emit a single dynamic-shape function pair instead.
+**Materialized by default (`--materialize`).** The exporter materializes the global KV caches into one concrete-shape function pair per cache size (powers of 2 up to `--max-seq-len`), sharing deduplicated weights across functions. This is the default because the **ANE and CPU** CoreML backends have runtime issues with dynamic (`RangeDim`) shapes — they either fail to load or fall back silently to GPU.
+
+`--no-materialize` still emits a single dynamic-shape function pair, but that artifact **no longer loads on any backend**: a `RangeDim` program that also declares CoreML states fails with E5RT/BNNS errors. It is useful only for inspecting the converted program.
+
+**KV caches: half state, half I/O.** Of the 15 cache slots, the 12 sliding-window ones are exported as CoreML **state** — the model owns those buffers and updates them in place, so they never cross the model boundary and the Swift runtime never copies them. The 3 global caches stay ordinary inputs/outputs because their dim 1 is symbolic (states must be static-shaped), and so does the int32 `sliding_pos_ring` (states must be floating point). The sliding writes are built from a whole-tensor `jnp.where` rather than `dynamic_update_slice`: on macOS 26 a state update fed by `slice_update` is applied to a freshly zeroed buffer instead of the live one, while a `select`-shaped update persists correctly.
+
+> **Re-export required.** The Swift runtime expects those state features. Loading a `.mlpackage` exported before this change fails with *"this model predates stateful KV caches"* — re-run `uv run gemma-export`.
 
 ### Phase 2 — Inference (Swift)
 
 All inference runs through native Swift for ~20x faster model loading vs Python coremltools:
 
-- **`GemmaCore/`** — Shared SPM library: model loading (`CoreMLModel`), KV cache (`KVCacheState`), tokenization (`GemmaTokenizer`), sampling, and the inference engine (`InferenceEngine`).
+- **`GemmaCore/`** — Shared SPM library: model loading (`CoreMLModel`), KV cache (`KVCacheState` — global caches plus the shared `MLState` holding the sliding caches), tokenization (`GemmaTokenizer`), sampling, and the inference engine (`InferenceEngine`). One `MLState` is made per conversation via `CoreMLModel.makeState()` and passed to every function of the package, so switching between `decode_512`, `prefill_1024`, … mid-conversation keeps the same sliding caches.
 - **`cli/`** — Readline-based Swift CLI chat with streaming output.
 - **`ios/GemmaChat/`** — SwiftUI chat app. Uses eager prefill (prefills prompt chunks as the user types) for a snappy first token.
 
@@ -92,7 +98,7 @@ GemmaCore/      Swift Package — shared inference library (model, KV cache, tok
 cli/            Swift CLI chat app
 ios/GemmaChat/  iOS SwiftUI chat app
 gemma_chat/     Python export pipeline (JAX → StableHLO → CoreML)
-tests/          Python tests for MIL passes and multifunction export
+tests/          Python tests for MIL passes, stateful KV export, and multifunction export
 benchmarks/     Standalone Swift benchmark for model loading / first prediction
 ```
 
@@ -100,6 +106,7 @@ benchmarks/     Standalone Swift benchmark for model loading / first prediction
 
 - **`Error: model not found`** — pass `--model <path>` or run from the repo root where `gemma4-e2b.mlpackage` lives.
 - **Tokenizer errors** — re-run `uv run gemma-export`; it embeds the tokenizer inside the `.mlpackage` (the CLI falls back to downloading from Hugging Face if missing).
+- **`this model predates stateful KV caches`** — the `.mlpackage` was exported before the sliding KV caches became CoreML state. Re-run `uv run gemma-export`.
 - **Slow first load with `--compute-units all`** — ANE compilation can take 10–30 minutes, but is cached in `.mlmodelc` for subsequent runs.
 
 ## License

@@ -20,7 +20,10 @@ public enum InferenceError: Error, LocalizedError {
 /// Captures post-generation KV state for reuse across turns.
 ///
 /// Pass the same instance to successive ``InferenceEngine/generate`` calls
-/// to skip re-prefilling tokens that are already in the KV cache.
+/// to skip re-prefilling tokens that are already in the KV cache. The captured
+/// ``KVCacheState`` carries the sliding caches' `MLState`, so a reused context
+/// keeps the same state object; dropping the context is what gets the next turn
+/// a fresh one.
 public final class GenerationContext: @unchecked Sendable {
     /// Token sequence currently represented in the KV cache (prompt + generated).
     public internal(set) var cachedTokens: [Int32] = []
@@ -30,7 +33,8 @@ public final class GenerationContext: @unchecked Sendable {
 
     public init() {}
 
-    /// Discard cached state (e.g., on conversation reset).
+    /// Discard cached state (e.g., on conversation reset). The next generation
+    /// allocates fresh global caches and a fresh sliding `MLState`.
     public func reset() {
         cachedTokens = []
         kvState = nil
@@ -76,6 +80,9 @@ public struct InferenceEngine: Sendable {
 
                     // Invalidate KV reuse if truncation changed the prompt —
                     // the cached prefix no longer matches the truncated suffix.
+                    // Clearing the state here routes us through `fullPrefill`,
+                    // which allocates a fresh sliding `MLState` as well as fresh
+                    // global caches.
                     var effectiveKVState = existingKVState
                     var effectivePrefillOffset = prefillOffset
                     if ids.count < promptIDs.count && prefillOffset > 0 {
@@ -230,6 +237,12 @@ public struct InferenceEngine: Sendable {
                     context?.kvState = currentKV
                     continuation.finish()
                 } catch {
+                    // The sliding caches live in an MLState that every
+                    // prediction mutates in place, so a run that died part-way
+                    // leaves them ahead of `cachedTokens`. Drop the context so
+                    // the next turn re-prefills against a fresh state instead of
+                    // trusting a half-written cache.
+                    context?.reset()
                     Log.info("Inference error: \(error)")
                     continuation.finish(throwing: error)
                 }
@@ -251,13 +264,10 @@ public struct InferenceEngine: Sendable {
             try await model.ensureLoaded(forGlobalCacheSize: globalSize)
         }
 
-        let emptyKV = try KVCacheState.empty(
-            kvInputNames: model.prefillKVInputNames,
-            shapes: model.prefillKVShapes,
-            dtypes: model.prefillKVDtypes,
-            globalNames: model.globalKVInputNames,
-            initialGlobalSize: globalSize
-        )
+        // Fresh global caches *and* a fresh sliding MLState — a full prefill
+        // starts from position 0, so any surviving sliding K/V would be read
+        // back as valid once `sliding_pos_ring` is repopulated.
+        let emptyKV = try model.makeEmptyKVState(initialGlobalSize: globalSize)
         let (logits, kv) = try await continuePrefill(ids: ids, fromOffset: 0, kvState: emptyKV)
         guard let logits else {
             throw InferenceError.emptyPrompt
