@@ -5,6 +5,7 @@
 ///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage --compute-units all
 ///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage --verbose
 ///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage --log-file /tmp/gemma.log
+///   swift run GemmaChatCLI --model ./gemma4-e2b.mlpackage --max-context 16384
 ///
 /// Commands: /reset  /quit  /help
 
@@ -13,8 +14,21 @@ import Foundation
 import GemmaCore
 
 /// Known CLI flags and which ones consume the next argument as a value.
-private let knownFlags: Set<String> = ["--model", "--compute-units", "--verbose", "--log-file"]
-private let flagsWithValue: Set<String> = ["--model", "--compute-units", "--log-file"]
+private let knownFlags: Set<String> = [
+    "--model", "--compute-units", "--verbose", "--log-file", "--max-context",
+]
+private let flagsWithValue: Set<String> = [
+    "--model", "--compute-units", "--log-file", "--max-context",
+]
+
+/// Default cap on retained materialized function pairs.
+///
+/// A materialized export ships a pair per size up to `GemmaConfig.maxSeqLen`,
+/// and each retained pair is a separate resident `MLModel`. Keeping all of them
+/// swap-thrashes a 16 GB Mac, and an interactive chat session's context is
+/// bounded well below the export's ceiling anyway. Raise it with
+/// `--max-context` when you actually need a longer conversation.
+private let defaultMaxContext = 8192
 
 @main
 struct GemmaChatCLI {
@@ -22,6 +36,7 @@ struct GemmaChatCLI {
         let args = ProcessInfo.processInfo.arguments
         let modelPath = parseArg(args, flag: "--model") ?? "./gemma4-e2b.mlpackage"
         let computeUnits = parseComputeUnits(args)
+        let maxContext = parseMaxContext(args)
 
         // --- Configure logging ---
         configureLogging(args)
@@ -36,12 +51,16 @@ struct GemmaChatCLI {
             return
         }
 
-        print("Loading model from \(modelPath) (compute: \(computeUnitsLabel(computeUnits)))...")
+        print("Loading model from \(modelPath) (compute: \(computeUnitsLabel(computeUnits)), max context: \(maxContext))...")
         let loadStart = CFAbsoluteTimeGetCurrent()
 
         let model: CoreMLModel
         do {
-            model = try await CoreMLModel.load(from: modelURL, computeUnits: computeUnits)
+            model = try await CoreMLModel.load(
+                from: modelURL,
+                computeUnits: computeUnits,
+                maxContextSize: maxContext
+            )
         } catch {
             print("Error loading model: \(error)")
             return
@@ -262,6 +281,17 @@ struct GemmaChatCLI {
         return args[idx + 1]
     }
 
+    static func parseMaxContext(_ args: [String]) -> Int {
+        guard let value = parseArg(args, flag: "--max-context") else {
+            return defaultMaxContext
+        }
+        guard let parsed = Int(value), parsed > 0 else {
+            print("Warning: invalid --max-context '\(value)', using \(defaultMaxContext)")
+            return defaultMaxContext
+        }
+        return min(parsed, GemmaConfig.maxSeqLen)
+    }
+
     static func parseComputeUnits(_ args: [String]) -> MLComputeUnits {
         guard let value = parseArg(args, flag: "--compute-units") else {
             return .cpuAndGPU
@@ -305,6 +335,7 @@ struct GemmaChatCLI {
         CLI flags:
           --model <path>           Path to .mlpackage or .mlmodelc
           --compute-units <units>  all | cpu-and-gpu (default) | cpu-only | cpu-and-ne
+          --max-context <tokens>   Largest materialized size to keep resident (default: \(defaultMaxContext))
           --verbose                Show diagnostic logs on stderr
           --log-file <path>        Write diagnostic logs to a file
         

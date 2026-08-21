@@ -59,7 +59,34 @@ final class ChatViewModel {
                 content: "⚠️ Generation stopped due to low memory."
             ))
         }
+        // Drop both KV caches we own: the eager-prefill one and the cross-turn
+        // one. Each is tens of MB at long contexts and both are pure caches —
+        // the next turn just re-prefills.
         Task { await eagerPrefill?.reset() }
+        genContext.reset()
+        // TODO: also evict cached `MLModel` function pairs, which dwarf the KV
+        // caches. Not done here because `CoreMLModel.getFunction` is a
+        // synchronous `fatalError`-on-miss lookup: evicting while the detached
+        // generate task is between `ensureLoaded` and `decode` crashes the app.
+        // Doing this safely needs `getFunction` to fail recoverably (or an
+        // eviction barrier that waits for in-flight predictions) first.
+    }
+
+    /// Largest materialized function pair to keep resident on device.
+    ///
+    /// Every retained size is a separate `MLModel`; `CoreMLModel.load`'s own
+    /// docs note that loading all 16 exported pairs OOMs on iPhone. A chat turn
+    /// plus `maxNewTokens` fits comfortably inside 2048 tokens, and the engine
+    /// truncates the prompt to `effectiveMaxSeqLen` if a conversation runs long.
+    private static let deviceMaxContextSize = 2048
+
+    /// Whether to skip prefill functions entirely and prefill via per-token
+    /// decode. Halves the resident `MLModel` count, which `CoreMLModel.load`
+    /// documents as the only way the model fits on iPhone 12 Pro / 6 GB
+    /// devices. Roomier devices keep the (much faster) real prefill kernel.
+    private static var useDecodeOnly: Bool {
+        let gigabytes = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        return gigabytes < 7.0
     }
 
     // MARK: - Model Loading
@@ -81,10 +108,19 @@ final class ChatViewModel {
             #if targetEnvironment(simulator)
             let units: MLComputeUnits = .cpuOnly
             #else
-            let units: MLComputeUnits = .cpuAndGPU
+            // Materialized (concrete-shape) models are ANE-compatible — that is
+            // the whole point of the materialization pass — so let CoreML use it.
+            let units: MLComputeUnits = .all
             #endif
 
-            let coreml = try await CoreMLModel.load(from: modelURL, computeUnits: units)
+            let decodeOnly = Self.useDecodeOnly
+            Log.info("[Model] Loading with maxContextSize=\(Self.deviceMaxContextSize), decodeOnly=\(decodeOnly)")
+            let coreml = try await CoreMLModel.load(
+                from: modelURL,
+                computeUnits: units,
+                maxContextSize: Self.deviceMaxContextSize,
+                decodeOnly: decodeOnly
+            )
             model = coreml
 
             // First-run warm-up: if the ANE / E5RT cache has never been
