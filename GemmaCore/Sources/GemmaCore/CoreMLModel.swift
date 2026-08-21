@@ -131,6 +131,13 @@ public final class CoreMLModel: @unchecked Sendable {
         self.functions = initialFunctions.mapValues { .loaded($0) }
     }
 
+    /// Bucketing policy for this model's global KV caches. Hand this to
+    /// ``KVCacheState/grownToFit(needed:policy:)`` and anything else that needs
+    /// to size a cache, so cache shape and resolved function never disagree.
+    public var cacheSizePolicy: KVCacheSizePolicy {
+        KVCacheSizePolicy(materializedSizes: materializedSizes, maxLen: effectiveMaxSeqLen)
+    }
+
     /// Load the multifunction model from a .mlpackage or .mlmodelc URL.
     ///
     /// Auto-detects whether the model uses standard (`decode`/`prefill`)
@@ -628,11 +635,17 @@ public final class CoreMLModel: @unchecked Sendable {
 
     // MARK: - Function Resolution
 
-    /// Round a cache size up to the nearest materialized size.
-    /// Returns nil for standard (non-materialized) models.
+    /// Round a cache size up to the nearest materialized size, clamped to the
+    /// largest size this model actually loaded. Returns nil for standard
+    /// (non-materialized) models.
+    ///
+    /// Delegates to ``cacheSizePolicy`` so this and `KVCacheState.grownToFit`
+    /// can never disagree. Note the clamp: asking for more than
+    /// `effectiveMaxSeqLen` yields `effectiveMaxSeqLen`, which is *smaller*
+    /// than requested — callers must cap their own token counts too.
     public func materializedSize(forCacheSize cacheSize: Int) -> Int? {
-        guard let sizes = materializedSizes else { return nil }
-        return sizes.first { $0 >= cacheSize } ?? sizes.last!
+        guard materializedSizes != nil else { return nil }
+        return cacheSizePolicy.size(forNeeded: cacheSize)
     }
 
     /// Resolve the function name for a given prefix and cache size.

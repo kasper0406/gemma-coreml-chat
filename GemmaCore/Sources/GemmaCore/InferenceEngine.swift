@@ -150,7 +150,7 @@ public struct InferenceEngine: Sendable {
                     // enough steps ("Failed to allocate E5 buffer object").
                     let targetCacheSize = min(nReal + maxSteps, model.effectiveMaxSeqLen)
                     var currentKV = try kvState.grownToFit(
-                        needed: targetCacheSize, maxLen: model.effectiveMaxSeqLen
+                        needed: targetCacheSize, policy: model.cacheSizePolicy
                     )
 
                     // Pre-load the decode function for the target cache size.
@@ -182,7 +182,7 @@ public struct InferenceEngine: Sendable {
 
                         currentKV = try currentKV.grownToFit(
                             needed: Int(position) + 1,
-                            maxLen: model.effectiveMaxSeqLen
+                            policy: model.cacheSizePolicy
                         )
 
                         // Safety: verify position fits in the global cache before decode.
@@ -242,15 +242,10 @@ public struct InferenceEngine: Sendable {
         let nChunks = (ids.count + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
         let paddedLen = nChunks * GemmaConfig.chunkSize
 
-        // For materialized models, round to the nearest materialized size.
-        let globalSize: Int?
-        if model.globalKVInputNames.isEmpty {
-            globalSize = nil
-        } else if let matSize = model.materializedSize(forCacheSize: paddedLen) {
-            globalSize = matSize
-        } else {
-            globalSize = paddedLen
-        }
+        // One bucketing policy for everyone — see `KVCacheSizePolicy`.
+        let globalSize: Int? = model.globalKVInputNames.isEmpty
+            ? nil
+            : model.cacheSizePolicy.size(forNeeded: paddedLen)
 
         if let globalSize {
             try await model.ensureLoaded(forGlobalCacheSize: globalSize)
@@ -283,7 +278,7 @@ public struct InferenceEngine: Sendable {
                                    count: paddedLen - nReal)
 
         let startChunk = fromOffset / GemmaConfig.chunkSize
-        var currentKV = try kvState.grownToFit(needed: paddedLen, maxLen: model.effectiveMaxSeqLen)
+        var currentKV = try kvState.grownToFit(needed: paddedLen, policy: model.cacheSizePolicy)
 
         // Ensure the function for the (possibly grown) cache size is loaded.
         if let gcSize = currentKV.currentGlobalCacheSize {

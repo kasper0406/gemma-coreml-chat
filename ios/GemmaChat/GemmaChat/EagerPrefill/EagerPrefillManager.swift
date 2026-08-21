@@ -205,15 +205,18 @@ actor EagerPrefillManager {
         let batchStart = CFAbsoluteTimeGetCurrent()
 
         do {
-            // Size/grow global caches to fit all chunks we're about to process
+            // Size/grow global caches to fit all chunks we're about to process,
+            // via the model's own bucketing policy so the cache shape and the
+            // resolved `prefill_<N>` function agree.
             if !model.globalKVInputNames.isEmpty {
                 let neededSize = upToChunk * GemmaConfig.chunkSize
-                // Round to materialized size if applicable.
-                let roundedSize = model.materializedSize(forCacheSize: neededSize) ?? neededSize
+                let roundedSize = model.cacheSizePolicy.size(forNeeded: neededSize)
                 if startChunk == 0 {
                     kvState = try Self.emptyKV(model: model, initialGlobalSize: roundedSize)
                 } else {
-                    kvState = try kvState.grownToFit(needed: roundedSize, maxLen: model.effectiveMaxSeqLen)
+                    kvState = try kvState.grownToFit(
+                        needed: roundedSize, policy: model.cacheSizePolicy
+                    )
                 }
                 try await model.ensureLoaded(forGlobalCacheSize: roundedSize)
             }
