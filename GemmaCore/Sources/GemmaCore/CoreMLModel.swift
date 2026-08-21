@@ -432,9 +432,13 @@ public final class CoreMLModel: @unchecked Sendable {
                 computeUnits: computeUnits
             )
         } catch let standardError {
-            // We only get here when `model.mil` was unreadable, so the layout
-            // is genuinely unknown: probe for materialized functions as a
-            // desktop-only safety net. If that fails too, surface BOTH errors —
+            // Reached when `model.mil` was unreadable (layout genuinely
+            // unknown) or when it declared no materialized functions but the
+            // standard load still failed — including a `.mil` parse that
+            // missed real declarations due to format drift. Probe for
+            // materialized functions as a desktop-only safety net; on a truly
+            // standard artifact the probe fails fast on unknown function
+            // names. If it fails too, surface BOTH errors —
             // the standard one is usually the real cause (corrupt bundle,
             // unsupported compute units) and used to be demoted to a log line
             // and replaced by an unrelated `.modelNotFound`.
