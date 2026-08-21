@@ -291,6 +291,15 @@ public struct InferenceEngine: Sendable {
         for chunkIdx in startChunk..<nChunks {
             let chunkStart = CFAbsoluteTimeGetCurrent()
             let start = chunkIdx * GemmaConfig.chunkSize
+            // Safety: the cache size is clamped to what the model actually
+            // loaded, so a chunk can in principle reach past it. Mirror the
+            // decode loop's guard rather than writing out of bounds.
+            if let gcSize = currentKV.currentGlobalCacheSize,
+               start + GemmaConfig.chunkSize > gcSize {
+                throw CoreMLModelError.positionOutOfRange(
+                    position: start + GemmaConfig.chunkSize - 1, cacheSize: gcSize
+                )
+            }
             let chunkTokens = Array(padded[start..<(start + GemmaConfig.chunkSize)])
 
             let tokens = MLMultiArray.int32Row(chunkTokens)
@@ -319,6 +328,18 @@ public struct InferenceEngine: Sendable {
         kvState: KVCacheState
     ) async throws -> (logits: MLMultiArray, kvState: KVCacheState) {
         precondition(chunkTokens.count == GemmaConfig.chunkSize)
+
+        // Safety: this chunk writes KV rows startPosition ..< +chunkSize. The
+        // eager-prefill caller sizes the cache from `materializedSize`, which
+        // clamps to the largest exported size, so an over-long prompt would
+        // otherwise write past the end of an under-allocated cache. The decode
+        // loop has the same guard.
+        if let gcSize = kvState.currentGlobalCacheSize,
+           startPosition + chunkTokens.count > gcSize {
+            throw CoreMLModelError.positionOutOfRange(
+                position: startPosition + chunkTokens.count - 1, cacheSize: gcSize
+            )
+        }
 
         // Ensure the function for this cache size is loaded.
         if let gcSize = kvState.currentGlobalCacheSize {
@@ -353,12 +374,18 @@ public struct InferenceEngine: Sendable {
     }
 
     /// Keep the last tokens so the prompt fits within maxSeqLen.
+    ///
+    /// The cap is rounded down to a chunk boundary: prefill pads the prompt up
+    /// to a multiple of `chunkSize`, so an unrounded cap can pad past the
+    /// largest cache the model loaded.
     private func truncatePromptIDs(
         _ ids: [Int32],
         maxSeqLen: Int,
         reserveForGeneration: Int
     ) -> [Int32] {
-        let cap = max(maxSeqLen - reserveForGeneration, 1)
+        let raw = max(maxSeqLen - reserveForGeneration, 1)
+        let chunk = GemmaConfig.chunkSize
+        let cap = max((raw / chunk) * chunk, min(chunk, maxSeqLen))
         if ids.count > cap {
             return Array(ids.suffix(cap))
         }

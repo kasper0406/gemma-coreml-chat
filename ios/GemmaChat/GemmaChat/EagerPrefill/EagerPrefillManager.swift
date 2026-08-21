@@ -45,6 +45,17 @@ actor EagerPrefillManager {
         self.kvState = try! Self.emptyKV(model: model, initialGlobalSize: nil)
     }
 
+    /// Most tokens we may eagerly prefill: whole chunks only, and never past
+    /// what the loaded model can hold.
+    ///
+    /// `CoreMLModel.materializedSize` clamps to the largest size actually
+    /// loaded, so without this cap a long prompt would size the cache to that
+    /// clamped value and then chunk right past the end of it — the prefill path
+    /// has no per-position guard of its own the way the decode loop does.
+    private var maxEagerTokens: Int {
+        (model.effectiveMaxSeqLen / GemmaConfig.chunkSize) * GemmaConfig.chunkSize
+    }
+
     private static func emptyKV(model: CoreMLModel, initialGlobalSize: Int?) throws -> KVCacheState {
         try KVCacheState.empty(
             kvInputNames: model.prefillKVInputNames,
@@ -91,8 +102,13 @@ actor EagerPrefillManager {
             }
         }
 
-        // Check if there are new complete chunks to prefill
-        let totalChunks = newTokens.count / GemmaConfig.chunkSize
+        // Check if there are new complete chunks to prefill, capped to what
+        // the model can actually hold.
+        let eagerTokens = min(newTokens.count, maxEagerTokens)
+        if eagerTokens < newTokens.count {
+            Log.info("[Perf] Eager prefill capped at \(eagerTokens)/\(newTokens.count) tokens (model max \(model.effectiveMaxSeqLen))")
+        }
+        let totalChunks = eagerTokens / GemmaConfig.chunkSize
         if totalChunks > completedChunks {
             await prefillNewChunks(tokens: newTokens, upToChunk: totalChunks)
         }
