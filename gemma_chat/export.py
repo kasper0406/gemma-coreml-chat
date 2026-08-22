@@ -3,21 +3,28 @@
 By default, both functions are merged into a single multifunction .mlpackage
 with shared quantized weights (per-channel int4 for matmul weights, since
 blockwise scales are not ANE-eligible; block-32 int4 for the CPU-side embedding
-tables; per-channel int8 for the logit projection — see
-``mil_passes/quantize_const_weights``), and the global KV caches are
+tables; the logit projection left unquantized as plain fp16, because int8 is
+what MPSGraph constant-folds on first prediction and int4 cannot carry the
+logits — see ``mil_passes/quantize_const_weights``), and the global KV caches are
 materialized into one concrete-shape function per size so the model runs on
 ANE / CPU as well as GPU.  Pass --no-materialize to keep RangeDim shapes for a
 single dynamic-shape function pair.
 
-The 12 sliding-window KV caches are exported as Core ML **state** rather than
-model I/O; only the 3 global caches (symbolic dim 1) and the int32
-``sliding_pos_ring`` are passed in and out per call.  Core ML states must be
-static-shaped and floating point, which is exactly why those two stay I/O.
+All 15 KV caches end up as Core ML **state** in the materialized model; the
+int32 ``sliding_pos_ring`` is the only thing besides tokens/positions that
+still crosses the model boundary (states must be floating point).
+
+The two halves get there by different routes.  The 12 sliding-window caches are
+static-shaped from the start, so the StableHLO→MIL converter binds them to
+state directly (see :func:`_kv_export_plan`).  The 3 global caches keep a
+symbolic dim 1 through conversion — a state cannot have a flexible shape — and
+only become state once materialization has given every function a concrete
+cache length, in ``mil_passes.global_cache_states``.
 
 Note: --no-materialize does not produce a loadable model any more — a
 dynamic-shape (RangeDim) program that also declares states fails to load with
-E5RT/BNNS errors.  That path was already GPU-only/experimental; use the default
-materialized flow.
+E5RT/BNNS errors, and its global caches stay ordinary I/O.  That path was
+already GPU-only/experimental; use the default materialized flow.
 
 Usage:
     uv run gemma-export
@@ -163,7 +170,10 @@ def _kv_export_plan(
     converter drops them from the model inputs and drops their updated value
     from the outputs, exposing a state feature instead.  Global caches carry a
     symbolic dim 1 (states must be static-shaped) and ``sliding_pos_ring`` is
-    int32 (states must be floating point), so both stay ordinary I/O.
+    int32 (states must be floating point), so both stay ordinary I/O here.
+    The global caches join the states after materialization concretizes their
+    length — see ``mil_passes.global_cache_states``; ``sliding_pos_ring`` stays
+    I/O for good.
 
     Both traced functions have the argument order
     ``[N?] + [tokens, start_position] + kv_flat + [sliding_pos_ring]`` and the
@@ -234,7 +244,7 @@ def _rename_model_io(
 
 
 def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
-    """Convert StableHLO to MIL with streaming int4/int8 weight quantization.
+    """Convert StableHLO to MIL with streaming int4 weight quantization.
 
     ``states`` maps traced-argument indices to :class:`StateSpec` — see
     :func:`_kv_export_plan`.  Those arguments become Core ML state features and
@@ -267,40 +277,40 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     except Exception as _e:
         print(f"  [convert] malloc_zone_pressure_relief skipped: {_e}", flush=True)
 
-    # ── Streaming mixed-precision quantization during HLO→MIL ──
+    # ── Streaming int4 quantization during HLO→MIL ──
+    # Returning None hands the constant back to the converter untouched, which
+    # emits it as a plain ``mb.const`` — that is how a weight opts out.
     _WEIGHT_THRESHOLD = 2048
-    _stream_counter = [0, 0, 0]  # [count_int4, count_int8, total_bytes]
+    _stream_counter = [0, 0]  # [count, total_bytes]
 
     def _stream_quantize(arr: np.ndarray, name: str):
         if arr.ndim < 2 or arr.size <= _WEIGHT_THRESHOLD:
             return None
         if arr.dtype not in (np.float16, np.float32):
             return None
+        # The logit projection stays an unquantized fp16 const.  int4 is too
+        # lossy for it (it is read out as the logits, and per-channel scales
+        # leave it no grouping to fall back on) and int8 — the width that would
+        # carry it — is the one MPSGraph constant-folds on every function's
+        # first prediction, ~17 s and 18 GB a time.  See
+        # ``mil_passes/quantize_const_weights``.
+        if _is_logit_projection(arr):
+            return None
         orig_dtype = arr.dtype
         if arr.dtype == np.float32:
             arr = arr.astype(np.float16)
-        # The logit projection is the one tensor int4 is too lossy for: it is
-        # read out as vocab-sized logits, and per-channel scales give it no
-        # grouping to fall back on.  Everything else stays int4.
-        nbits = 8 if _is_logit_projection(arr) else 4
-        q_data, scale = _quantize_weight(arr, nbits=nbits)
+        q_data, scale = _quantize_weight(arr)
         del arr
-        if nbits == 8:
-            _stream_counter[1] += 1
-        else:
-            _stream_counter[0] += 1
-        _stream_counter[2] += q_data.nbytes * 2
-        total = _stream_counter[0] + _stream_counter[1]
-        if total % 20 == 0:
+        _stream_counter[0] += 1
+        _stream_counter[1] += q_data.nbytes * 2
+        if _stream_counter[0] % 20 == 0:
             print(
-                f"    streaming-quantized {_stream_counter[0]} int4 + "
-                f"{_stream_counter[1]} int8  "
-                f"({_stream_counter[2] / 1e9:.2f} GB)  RSS={_rss_mb():.0f} MB",
+                f"    streaming-quantized {_stream_counter[0]} int4  "
+                f"({_stream_counter[1] / 1e9:.2f} GB)  RSS={_rss_mb():.0f} MB",
                 flush=True,
             )
-        suffix = f"_int{nbits}"
         result = mb.constexpr_blockwise_shift_scale(
-            data=q_data, scale=scale, name=name + suffix,
+            data=q_data, scale=scale, name=name + "_int4",
         )
         if orig_dtype == np.float32:
             result = mb.cast(x=result, dtype="fp32", name=name + "_fp32")
@@ -308,7 +318,7 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
 
     install_stablehlo_streaming_patch()
     set_streaming_quantizer(_stream_quantize)
-    print("  [convert] streaming mixed-precision quantization enabled", flush=True)
+    print("  [convert] streaming int4 quantization enabled", flush=True)
 
     print(
         f"  [convert {_os.getpid()}] hlo_to_mil ({len(states)} state args) …",
@@ -321,12 +331,11 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     finally:
         set_streaming_quantizer(None)
 
-    if _stream_counter[0] or _stream_counter[1]:
+    if _stream_counter[0]:
         print(
             f"  StableHLO→MIL done — streaming-quantized "
-            f"{_stream_counter[0] + _stream_counter[1]} tensors "
-            f"({_stream_counter[0]} int4 + {_stream_counter[1]} int8, "
-            f"{_stream_counter[2] / 1e9:.2f} GB fp16).",
+            f"{_stream_counter[0]} tensors to int4 "
+            f"({_stream_counter[1] / 1e9:.2f} GB fp16).",
             flush=True,
         )
     else:
@@ -459,7 +468,9 @@ def export_chunk_prefill(
 
     Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
     so a single model works at any cache length up to ``max_seq_len``.
-    Sliding KV caches are Core ML state and never cross the model boundary.
+    Sliding KV caches are Core ML state and never cross the model boundary;
+    materialization later turns the global ones into state as well, dropping
+    them from the signature described below.
 
     Inputs:  N (1,) int32 — phantom dim for current global cache length
              tokens (1, chunk_size) int32
@@ -598,7 +609,9 @@ def export_decode_step(
 
     Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
     so a single model works at any cache length up to ``max_seq_len``.
-    Sliding KV caches are Core ML state and never cross the model boundary.
+    Sliding KV caches are Core ML state and never cross the model boundary;
+    materialization later turns the global ones into state as well, dropping
+    them from the signature described below.
 
     Inputs:  N (1,) int32 — phantom dim for current global cache length
              token_id (1,) int32
@@ -845,8 +858,10 @@ def main() -> None:
             "Replace the dynamic-shape (RangeDim) global KV caches with one "
             "concrete-shape function per size.  Produces an ANE-compatible "
             "multifunction .mlpackage with `{prefill,decode}_{size}` functions "
-            "that share deduplicated weights.  Defaults to powers of 2 from "
-            "CHUNK_SIZE to --max-seq-len; override with --materialize-sizes.  "
+            "that share deduplicated weights, and turns the global KV caches "
+            "into Core ML state (the sliding ones already are).  Defaults to "
+            "powers of 2 from 512 to --max-seq-len; override with "
+            "--materialize-sizes.  "
             "Enabled by default because the ANE and CPU backends hit runtime "
             "issues with RangeDim shapes.  --no-materialize keeps the "
             "dynamic-shape export, but since the sliding KV caches became "
@@ -860,7 +875,8 @@ def main() -> None:
         default=None,
         help=(
             "Comma-separated concrete cache sizes when --materialize is set "
-            "(default: powers of 2 from 8 up to --max-seq-len)"
+            f"(default: powers of 2 from 512 up to --max-seq-len; every size "
+            f"must be >= CHUNK_SIZE = {CHUNK_SIZE})"
         ),
     )
     # Internal: run a single phase (used by subprocess isolation).
@@ -890,6 +906,14 @@ def main() -> None:
         if not materialize_sizes:
             parser.error(
                 "--materialize: no valid sizes after clamping to --max-seq-len"
+            )
+        # A prefill chunk is written into the cache in one go, so a cache
+        # shorter than a chunk cannot be filled.
+        too_small = [s for s in materialize_sizes if s < CHUNK_SIZE]
+        if too_small:
+            parser.error(
+                f"--materialize-sizes: {too_small} are smaller than "
+                f"CHUNK_SIZE ({CHUNK_SIZE}); a prefill chunk must fit in the cache"
             )
         print(
             f"\nMaterialize plan: one function per size in {materialize_sizes}",

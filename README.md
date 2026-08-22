@@ -41,7 +41,11 @@ The first CLI launch compiles `.mlpackage` → `.mlmodelc` next to the source (c
 
 `--no-materialize` still emits a single dynamic-shape function pair, but that artifact **no longer loads on any backend**: a `RangeDim` program that also declares CoreML states fails with E5RT/BNNS errors. It is useful only for inspecting the converted program.
 
-**KV caches: half state, half I/O.** Of the 15 cache slots, the 12 sliding-window ones are exported as CoreML **state** — the model owns those buffers and updates them in place, so they never cross the model boundary and the Swift runtime never copies them. The 3 global caches stay ordinary inputs/outputs because their dim 1 is symbolic (states must be static-shaped), and so does the int32 `sliding_pos_ring` (states must be floating point). The sliding writes are built from a whole-tensor `jnp.where` rather than `dynamic_update_slice`: on macOS 26 a state update fed by `slice_update` is applied to a freshly zeroed buffer instead of the live one, while a `select`-shaped update persists correctly.
+**KV caches: all state.** All 15 cache slots are exported as CoreML **state** — the model owns those buffers and updates them in place, so no cache ever crosses the model boundary and the Swift runtime never copies one. Only the int32 `sliding_pos_ring` stays ordinary I/O, because states must be floating point.
+
+The two halves get there differently. The 12 sliding-window caches are static-shaped from the start and are bound to state during StableHLO→MIL conversion. The 3 global caches carry a symbolic dim 1 through conversion (a state cannot have a flexible shape) and only become state afterwards, in the post-materialization MIL pass `gemma_chat/mil_passes/global_cache_states.py`, once every function has a concrete cache length. **Consequence for the runtime:** the state layout is now size-dependent — a state made from the `*_512` pair does not fit the `*_1024` pair, so growing the cache means making a new state and copying the old contents into it.
+
+Both halves have to dodge the same runtime trap: on macOS 26 a state update fed by `slice_update` is applied to a freshly zeroed buffer instead of the live one, while an update that produces a tensor of its own persists correctly. The sliding writes are therefore built from a whole-tensor `jnp.where` rather than `dynamic_update_slice`, and the global-cache pass wraps its `slice_update` in a `fill_like` + `add`.
 
 > **Re-export required.** The Swift runtime expects those state features. Loading a `.mlpackage` exported before this change fails with *"this model predates stateful KV caches"* — re-run `uv run gemma-export`.
 
@@ -49,7 +53,7 @@ The first CLI launch compiles `.mlpackage` → `.mlmodelc` next to the source (c
 
 All inference runs through native Swift for ~20x faster model loading vs Python coremltools:
 
-- **`GemmaCore/`** — Shared SPM library: model loading (`CoreMLModel`), KV cache (`KVCacheState` — global caches plus the shared `MLState` holding the sliding caches), tokenization (`GemmaTokenizer`), sampling, and the inference engine (`InferenceEngine`). One `MLState` is made per conversation via `CoreMLModel.makeState()` and passed to every function of the package, so switching between `decode_512`, `prefill_1024`, … mid-conversation keeps the same sliding caches.
+- **`GemmaCore/`** — Shared SPM library: model loading (`CoreMLModel`), KV cache (`KVCacheState` — the `MLState` holding every cache), tokenization (`GemmaTokenizer`), sampling, and the inference engine (`InferenceEngine`). One `MLState` is made per conversation *per cache size* via `CoreMLModel.makeState()`: it is shared by the `prefill_N`/`decode_N` pair, and on growth to `2N` a new state is made and the old cache contents are migrated into it.
 - **`cli/`** — Readline-based Swift CLI chat with streaming output.
 - **`ios/GemmaChat/`** — SwiftUI chat app. Uses eager prefill (prefills prompt chunks as the user types) for a snappy first token.
 

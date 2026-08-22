@@ -350,8 +350,13 @@ def decode_step(
         x = x * lp['layer_scalar']
 
     x = _rmsnorm(x, params['norm']['scale'])
-    logits = jnp.dot(x[0, 0].astype(jnp.float32),
-                     params['embed_tokens'].T.astype(jnp.float32))  # (vocab,)
+    # fp16 matmul, fp32 only from the logits onward.  Upcasting the weight
+    # instead would put a [dim, vocab] *fp32* constant in the graph — 1.6 GB
+    # that no pass can shrink, since the export leaves this tensor unquantized
+    # (see ``mil_passes/quantize_const_weights``: int4 cannot carry the logits
+    # and int8 is what MPSGraph constant-folds on every first prediction).
+    logits = jnp.dot(x[0, 0],
+                     params['embed_tokens'].T).astype(jnp.float32)  # (vocab,)
     if cfg.final_logit_softcap is not None:
         cap = cfg.final_logit_softcap
         logits = jnp.tanh(logits / cap) * cap
@@ -614,8 +619,10 @@ def chunk_prefill_step(
         x = x * lp['layer_scalar']
 
     x = _rmsnorm(x, params['norm']['scale'])
-    logits = jnp.dot(x[0].astype(jnp.float32),
-                     params['embed_tokens'].T.astype(jnp.float32))  # (C, vocab)
+    # fp16 matmul, fp32 from the logits onward — see the note in
+    # :func:`decode_step` on why the weight must not be upcast.
+    logits = jnp.dot(x[0],
+                     params['embed_tokens'].T).astype(jnp.float32)  # (C, vocab)
     if cfg.final_logit_softcap is not None:
         cap = cfg.final_logit_softcap
         logits = jnp.tanh(logits / cap) * cap

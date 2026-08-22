@@ -125,8 +125,8 @@ func syntheticPrompt(length: Int, seed: Int) -> [Int32] {
 /// the measured window — and `ensureLoaded` for the decode bucket then races
 /// that preload, so `prefill_time_s` randomly includes a whole model load.
 func requiredCacheSizes(model: CoreMLModel, promptLen: Int, newTokens: Int) -> [Int] {
-    let nChunks = (promptLen + GemmaConfig.chunkSize - 1) / GemmaConfig.chunkSize
-    let paddedLen = nChunks * GemmaConfig.chunkSize
+    let chunk = model.chunkSize
+    let paddedLen = ((promptLen + chunk - 1) / chunk) * chunk
     let maxSteps = min(newTokens, max(model.effectiveMaxSeqLen - promptLen, 0))
     let decodeTarget = min(promptLen + maxSteps, model.effectiveMaxSeqLen)
     let policy = model.cacheSizePolicy
@@ -199,7 +199,7 @@ struct GemmaBenchMain {
                 backgroundPreload: false
             )
         } catch {
-            FileHandle.standardError.write(Data("error: load failed: \(error)\n".utf8))
+            FileHandle.standardError.write(Data("error: load failed: \(error.localizedDescription)\n".utf8))
             exit(3)
         }
 
@@ -219,7 +219,7 @@ struct GemmaBenchMain {
                 try await model.ensureLoaded(forGlobalCacheSize: size)
             }
         } catch {
-            FileHandle.standardError.write(Data("error: preload failed: \(error)\n".utf8))
+            FileHandle.standardError.write(Data("error: preload failed: \(error.localizedDescription)\n".utf8))
             exit(3)
         }
         // Counts the full "model is ready to run" cost, compile + preload.

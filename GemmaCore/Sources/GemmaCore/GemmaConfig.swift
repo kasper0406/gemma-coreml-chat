@@ -1,26 +1,18 @@
 /// Constants mirroring gemma_chat/config.py for Gemma4-E2B.
 ///
-/// KV cache layout: 15 non-shared layers (0–14) for the 35-layer model.
-/// Layers 15–34 are KV-shared and read from layers 13 (sliding) and 14 (global).
+/// Deliberately small: anything the exported artifact already states — chunk
+/// size, cache lengths, vocabulary — is read from the model description at load
+/// (see ``CoreMLModel``) so a re-export can change it without a matching edit
+/// here. What is left is tokenizer-level vocabulary that no CoreML feature
+/// describes.
 
 import Foundation
 
 public enum GemmaConfig {
-    /// Upper bound for global KV caches.  Models exported with RangeDim
-    /// can dynamically grow up to this limit.
+    /// Upper bound for the exported context length. Only used to clamp
+    /// user-supplied context limits before the model reports what it actually
+    /// materialized (`CoreMLModel.effectiveMaxSeqLen`).
     public static let maxSeqLen = 65_536
-
-    /// Sliding window size for LOCAL_SLIDING layers (ring-buffer length).
-    public static let slidingWindowSize = 512
-
-    /// Tokens per chunked-prefill call.
-    public static let chunkSize = 8
-
-    /// Vocabulary size (Gemma4-E2B).
-    public static let vocabSize = 262_144
-
-    /// Number of KV arrays: 15 layers × (k + v) + 1 sliding_pos_ring.
-    public static let numStateArrays = 31
 
     /// EOS token ID for Gemma4.
     public static let eosTokenID: Int32 = 1
@@ -34,6 +26,6 @@ public enum GemmaConfig {
     /// BOS (beginning-of-sequence) token ID.
     public static let bosTokenID: Int = 2
 
-    /// Pad token ID.
+    /// Pad token ID, used to fill the tail of a short prefill chunk.
     public static let padTokenID: Int32 = 0
 }

@@ -62,7 +62,9 @@ struct GemmaChatCLI {
                 maxContextSize: maxContext
             )
         } catch {
-            print("Error loading model: \(error)")
+            // localizedDescription, not the raw value: the load errors carry
+            // the fix ("re-run gemma-export") in their message.
+            print("Error loading model: \(error.localizedDescription)")
             return
         }
 

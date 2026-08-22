@@ -15,9 +15,11 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import coremltools as ct
+from coremltools.converters.mil.mil import types as mil_types
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
 from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
+from gemma_chat.model import _embed_lookup
 
 # Kept in sync with gemma_chat/export.py:_mil_to_mlpackage.
 _REMOVED_PASSES = [
@@ -349,3 +351,55 @@ def test_numerical_rmsnorm_and_gelu():
     ref_gelu = np.array(exact_gelu(jnp.array(x)))
     model, _ = _convert(exact_gelu, jnp.array(x), load=True)
     np.testing.assert_allclose(_predict(model, x), ref_gelu, atol=1e-2, rtol=1e-2)
+
+
+# ── weight quantization: what gets a constexpr and what does not ─────────
+
+def test_logit_projection_stays_unquantized_fp16():
+    """The [dim, vocab] logit projection must reach the model as a plain const.
+
+    Quantizing it at all is a trap in both directions.  int4 cannot carry the
+    logits (per-channel scales leave it no grouping to fall back on), and int8
+    — the width that could — is what MPSGraph's ``LowerDequantizeND`` pass
+    constant-folds on the *first* prediction of every function in every
+    process: measured at 16.7 s and an 18 GB transient for the real
+    [1536, 262144] tensor on CPU_AND_GPU, never cached to disk.  A plain fp16
+    const has no dequantize op for anything to fold.
+
+    The gather table in the same graph is the control: it is the same size and
+    over the same threshold, and it *does* get quantized.
+    """
+    rng = np.random.RandomState(5)
+    vocab = 262144
+    # Distinct embedding/logit dims, so neither tensor can be mistaken for the
+    # other's transpose when the converter picks a matmul orientation.
+    table = (rng.randn(vocab, 32) * 0.05).astype(np.float16)
+    hidden = (rng.randn(32, 64) * 0.1).astype(np.float16)
+    logit_w = (rng.randn(64, vocab) * 0.02).astype(np.float16)
+
+    def fn(tokens):
+        embedded = _embed_lookup(jnp.asarray(table), tokens)
+        return jnp.matmul(jnp.matmul(embedded, jnp.asarray(hidden)),
+                          jnp.asarray(logit_w))
+
+    _, prog = _convert(fn, jnp.zeros((1, 4), jnp.int32))
+
+    def _shapes(op_type):
+        return {tuple(op.outputs[0].shape)
+                for op in _ops(prog) if op.op_type == op_type}
+
+    quantized = _shapes("constexpr_blockwise_shift_scale")
+    assert not ({logit_w.shape, logit_w.T.shape} & quantized), (
+        f"the logit projection was quantized (constexprs: {quantized}); "
+        "MPSGraph folds int8 dequantizes and int4 is too lossy here"
+    )
+    assert table.shape in quantized, "the embedding table stopped being quantized"
+
+    # It reaches the model as a plain fp16 const instead.
+    logit_consts = [
+        op for op in _ops(prog)
+        if op.op_type == "const"
+        and tuple(op.outputs[0].shape) in (logit_w.shape, logit_w.T.shape)
+    ]
+    assert len(logit_consts) == 1, [op.name for op in logit_consts]
+    assert logit_consts[0].outputs[0].dtype == mil_types.fp16
