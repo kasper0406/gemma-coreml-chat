@@ -296,9 +296,14 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
         # ``mil_passes/quantize_const_weights``.
         if _is_logit_projection(arr):
             return None
-        orig_dtype = arr.dtype
-        if arr.dtype == np.float32:
-            arr = arr.astype(np.float16)
+        # Weights reach here as fp16 (``_inplace_bf16_to_f16`` runs before the
+        # trace); the downcast is just a guard.  There used to be a matching
+        # ``mb.cast(..., dtype="fp32")`` on the way out for weights whose
+        # consumer was fp32 — that is gone: no fp32 weight survives the trace,
+        # and the 35 o_proj weights that *were* re-materialized as fp32 at
+        # runtime (528 MB) got there from JAX's own dot-promotion, not from
+        # here.  With the graph fp16 end to end they are consumed as fp16.
+        arr = arr.astype(np.float16, copy=False)
         q_data, scale = _quantize_weight(arr)
         del arr
         _stream_counter[0] += 1
@@ -309,12 +314,9 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
                 f"({_stream_counter[1] / 1e9:.2f} GB)  RSS={_rss_mb():.0f} MB",
                 flush=True,
             )
-        result = mb.constexpr_blockwise_shift_scale(
+        return mb.constexpr_blockwise_shift_scale(
             data=q_data, scale=scale, name=name + "_int4",
         )
-        if orig_dtype == np.float32:
-            result = mb.cast(x=result, dtype="fp32", name=name + "_fp32")
-        return result
 
     install_stablehlo_streaming_patch()
     set_streaming_quantizer(_stream_quantize)
@@ -384,9 +386,16 @@ def _mil_to_mlpackage(
             convert_kwargs = dict(
                 source="milinternal",
                 minimum_deployment_target=ct.target.iOS18,
-                # When using ct.precision.FLOAT16 the model output becomes unstable and garbage
-                # tokens are produced. We use FLOAT16 precision in the model where permissible
-                # by manual casting.
+                # FLOAT32 here means "leave the dtypes alone", not "compute in
+                # fp32": the traced graph already places fp16 and fp32 by hand
+                # (see the precision note in ``decode_coreml``), and this is the
+                # only setting that preserves that placement — it is why
+                # ``common::add_fp16_cast`` is dropped from the pipeline below.
+                # ct.precision.FLOAT16 would re-run that pass and pull the
+                # RMSNorm statistics, the RoPE angles and the ring-position
+                # scatter down to fp16 as well; those are fp32 for range and
+                # accumulation reasons, and downcasting them is what produced
+                # the unstable/garbage-token output seen previously.
                 compute_precision=ct.precision.FLOAT32,
                 pass_pipeline=pipeline,
                 skip_model_load=True,

@@ -124,12 +124,15 @@ class Gemma4Config:
 class RMSNorm(nnx.Module):
     """RMS normalization with learnable scale.
 
-    Computes in float32 to prevent fp16 underflow (epsilon=1e-6 underflows
-    to 0 in fp16) and keeps the fp32 result so all downstream activations
-    stay in fp32.  Returning fp32 from fp16 input causes JAX to insert an
-    explicit cast(fp16→fp32) in StableHLO for the residual add, which
-    cast_optimization will NOT fold (we remove that pass) → fp16 weights
-    stored compactly while all compute runs in fp32.
+    Computes in float32 — the sum of squares over the embedding axis reaches
+    ~1e7 and would overflow fp16, and epsilon=1e-6 underflows to 0 there — and
+    returns fp32.
+
+    This class is used by the eager :class:`Gemma4Transformer` reference model
+    only; it is the fp32 reference the exported model is checked against, so it
+    stays fp32 throughout.  The traced export path has its own ``_rmsnorm`` in
+    ``decode_coreml``, which does the same fp32 statistics but casts the result
+    back to fp16 — see the precision note in that module.
     """
     def __init__(self, dim: int, *, rngs: nnx.Rngs):
         self.scale = nnx.Param(jnp.ones((dim,)))
@@ -145,6 +148,7 @@ class RMSNormNoScale(nnx.Module):
     """RMS normalization without a learnable scale parameter.
 
     Matches Gemma4RMSNorm(with_scale=False) — computes in fp32 and returns fp32.
+    Reference-model counterpart of ``decode_coreml._rmsnorm_noscale``.
     """
     def __call__(self, x):
         x32 = x.astype(jnp.float32)
@@ -164,6 +168,16 @@ def _apply_rope(x, positions, base_frequency, rope_fraction=1.0):
         rotate_half (pairing i↔i+head_dim//2) this rotates only pairs
         (0, head_dim//2) … (half_dim-1, head_dim//2+half_dim-1); all other
         dims are unchanged (cos=1, sin=0 from zero frequencies).
+
+    Precision: the *angles* are computed in fp32 — ``positions`` reaches 65535
+    and fp16 cannot represent integers past 2048, so the sinusoid argument has
+    to be fp32 — but ``sin``/``cos`` are cast down to ``x``'s dtype before the
+    rotation.  That keeps the rotation in the activation dtype and makes this
+    function dtype-preserving; letting it promote fp16 → fp32 used to leak fp32
+    through q into SDPA, the attention output and o_proj (see the note in
+    ``decode_coreml``).  Both factors are in [-1, 1], where fp16 carries ~5e-4
+    absolute error — an order of magnitude finer than the bf16 cos/sin the HF
+    and JAX Gemma reference implementations rotate with.
     """
     head_dim = x.shape[-1]
     rope_dim = int(head_dim * rope_fraction)
@@ -181,9 +195,10 @@ def _apply_rope(x, positions, base_frequency, rope_fraction=1.0):
     positions = positions[..., jnp.newaxis].astype(jnp.float32)
     sinusoid_inp = positions / timescale[jnp.newaxis, jnp.newaxis, :]
 
-    # Expand sin/cos for broadcasting with heads: (B, L, 1, half_dim)
-    sin = jnp.sin(sinusoid_inp)[:, :, jnp.newaxis, :]
-    cos = jnp.cos(sinusoid_inp)[:, :, jnp.newaxis, :]
+    # Expand sin/cos for broadcasting with heads: (B, L, 1, half_dim).
+    # Cast to x's dtype so the rotation below stays in the activation dtype.
+    sin = jnp.sin(sinusoid_inp)[:, :, jnp.newaxis, :].astype(x.dtype)
+    cos = jnp.cos(sinusoid_inp)[:, :, jnp.newaxis, :].astype(x.dtype)
 
     # x1: first half_dim dims;  x2: paired dims at offset head_half
     x1 = x[..., :half_dim]

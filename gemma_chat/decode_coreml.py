@@ -45,6 +45,35 @@ Since materialization turns the global caches into state too (see
 well: there is no ``slice_update`` left anywhere on a cache path.
 
 Tokens: right-padded — real tokens at positions 0..T-1, zeros at T..L-1.
+
+Numeric precision
+-----------------
+Every *stored* activation is fp16 — the residual stream, the attention
+inputs/outputs, the KV caches, the MLP activations.  fp32 is used only where an
+accumulation or a range genuinely needs it, mirroring how the HF and JAX Gemma
+references run bf16 storage with fp32 norms:
+
+* **RMSNorm statistics** (``_rmsnorm``, ``_rmsnorm_noscale``): the square, the
+  mean over the 1536/256-wide axis and the rsqrt run in fp32 — the sum of
+  squares reaches ~1e7 and would overflow fp16, and eps=1e-6 underflows to 0 in
+  fp16.  The normalized result is cast straight back to fp16.
+* **RoPE angles** (``model._apply_rope``): positions run to 65535, which fp16
+  cannot represent exactly; the sinusoid argument, ``sin`` and ``cos`` are
+  computed in fp32 and cast to fp16 before the rotation itself.
+* **The prefill ring-position scatter**, for the same range reason — see the
+  comment at its ``jnp.dot``.
+* **The logits**, from the output matmul onward: fp16 dot against the fp16
+  embedding table, fp32 out (upcasting the *weight* instead would put a 1.6 GB
+  fp32 constant in the graph — see the note in :func:`decode_step`).
+
+Everything else stays fp16 end to end, which matters because the decode graph is
+dispatch-bound: any op that returns fp32 drags its consumers up with it.  A
+single fp32 leak in ``_apply_rope`` used to promote q, and through it SDPA, the
+attention output and o_proj — which forced the 35 o_proj weights to be
+re-materialized as fp32 constants at runtime (528 MB) and put ~1 GB of fp32
+attention intermediates in every step.  Long-axis sums inside `matmul` and the
+fused ``scaled_dot_product_attention`` are left to the backend, which
+accumulates them in fp32.
 """
 
 from __future__ import annotations
@@ -255,16 +284,16 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
         v_new = _rmsnorm_noscale(v_new)
         k_new = _apply_rope(k_new, pos_arr, base_freq, rope_frac)
 
-        k_new_f16 = k_new.astype(jnp.float16)
-        v_new_f16 = v_new.astype(jnp.float16)
+        # k_new/v_new are already fp16 — the norms and `_apply_rope` are both
+        # dtype-preserving — so they go straight into the fp16 caches.
         if is_sliding:
             W = cfg.sliding_window_size
-            k_updated = _sliding_ring_write(k_cache, k_new_f16, position, W)
-            v_updated = _sliding_ring_write(v_cache, v_new_f16, position, W)
+            k_updated = _sliding_ring_write(k_cache, k_new, position, W)
+            v_updated = _sliding_ring_write(v_cache, v_new, position, W)
         else:
             # Global: linear write, row index = absolute position.
-            k_updated = _row_write(k_cache, k_new_f16, position)
-            v_updated = _row_write(v_cache, v_new_f16, position)
+            k_updated = _row_write(k_cache, k_new, position)
+            v_updated = _row_write(v_cache, v_new, position)
         k_full, v_full = k_updated, v_updated
 
     # Attention validity mask
@@ -448,15 +477,13 @@ def _attn_chunk(lp, x, positions, cfg: Gemma4Config, attn_type: str,
     q = _apply_rope(q, positions, base_freq, rope_frac)
     k_new = _apply_rope(k_new, positions, base_freq, rope_frac)
 
-    k_new_f16 = k_new.astype(jnp.float16)
-    v_new_f16 = v_new.astype(jnp.float16)
-
     abs_pos = positions[0]  # (C,)
     # Sliding layers wrap into the ring; global layers write at the absolute
     # position.  Either way one whole-tensor scatter (see module docstring).
+    # k_new/v_new are already fp16 (the norms and `_apply_rope` preserve dtype).
     slots = abs_pos % cfg.sliding_window_size if is_sliding else abs_pos
-    k_updated = _chunk_write(k_cache, k_new_f16, slots)
-    v_updated = _chunk_write(v_cache, v_new_f16, slots)
+    k_updated = _chunk_write(k_cache, k_new, slots)
+    v_updated = _chunk_write(v_cache, v_new, slots)
 
     # GQA repeat for attention
     kv_rep = num_heads // num_kv_heads
@@ -583,9 +610,18 @@ def chunk_prefill_step(
     write_mask = (jnp.arange(W, dtype=jnp.int32)[:, None]
                   == ring_slots[None, :])  # (W, C)
     any_written = write_mask.any(axis=1)  # (W,)
-    # Use float16 dot — MPS does not support int32 matmul.
+    # MPS has no int32 matmul, so the scatter runs as a float dot — but it has
+    # to be **fp32**, not fp16: these are absolute positions running up to
+    # max_seq_len-1 = 65535, and fp16 only represents integers exactly below
+    # 2048.  In fp16 every position past 2048 lands in the ring rounded (off by
+    # 2 at 4096), and 65535 rounds to 65536 — past fp16's 65504 max — so the
+    # top size bucket writes inf and the int32 cast turns the whole ring to
+    # garbage.  Either way the `pk <= pos_q` validity test is corrupted.  fp32
+    # is exact for every position (integers are exact below 2^24).  This is the
+    # one deliberately-fp32 tensor left in the graph; it is a single
+    # [W, C] x [C] product per prefill call.
     new_ring_vals = jnp.dot(
-        write_mask.astype(jnp.float16), abs_pos.astype(jnp.float16)
+        write_mask.astype(jnp.float32), abs_pos.astype(jnp.float32)
     ).astype(jnp.int32)  # (W,)
     sliding_pos_ring = jnp.where(any_written[None, :], new_ring_vals[None, :],
                                  sliding_pos_ring)
