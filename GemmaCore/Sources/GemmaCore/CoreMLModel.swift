@@ -35,9 +35,6 @@ public final class CoreMLModel: @unchecked Sendable {
         let tokenInputName: String
         let tokenLength: Int
         let positionInputName: String
-        /// Cache-length input, when the export still declares one. Fed
-        /// `kvState.size` — the length this function was materialized for.
-        let nInputName: String?
         let ringInputName: String
         let ringOutputName: String
         let ringShape: [NSNumber]
@@ -1011,15 +1008,11 @@ public final class CoreMLModel: @unchecked Sendable {
         try kvState.loadChunk(tokens)
         kvState.setScalar(startPosition, in: kvState.positionScalar)
 
-        var inputs: [String: MLMultiArray] = [
+        let inputs: [String: MLMultiArray] = [
             prefillIO.tokenInputName: kvState.chunkTokens,
             prefillIO.positionInputName: kvState.positionScalar,
             prefillIO.ringInputName: kvState.ring,
         ]
-        if let nName = prefillIO.nInputName {
-            kvState.setScalar(Int32(kvState.size), in: kvState.nScalar)
-            inputs[nName] = kvState.nScalar
-        }
 
         let logitsBacking = try kvState.prefillLogits(
             shape: prefillIO.logitsShape, dataType: prefillIO.logitsDataType
@@ -1085,15 +1078,11 @@ public final class CoreMLModel: @unchecked Sendable {
         kvState.setScalar(token, in: kvState.tokenScalar)
         kvState.setScalar(position, in: kvState.positionScalar)
 
-        var inputs: [String: MLMultiArray] = [
+        let inputs: [String: MLMultiArray] = [
             decodeIO.tokenInputName: kvState.tokenScalar,
             decodeIO.positionInputName: kvState.positionScalar,
             decodeIO.ringInputName: kvState.ring,
         ]
-        if let nName = decodeIO.nInputName {
-            kvState.setScalar(Int32(kvState.size), in: kvState.nScalar)
-            inputs[nName] = kvState.nScalar
-        }
 
         let logitsBacking = try kvState.nextDecodeLogitsBacking(
             shape: decodeIO.logitsShape, dataType: decodeIO.logitsDataType
@@ -1194,14 +1183,10 @@ public final class CoreMLModel: @unchecked Sendable {
             )
         }
 
-        var control = inputs.keys.filter { $0 != ringInputName }.sorted()
-        // `N` survives materialization in exports derived from the RangeDim
-        // graph, where it still drives the cache slicing. It is always the
-        // function's own materialized length.
-        var nInputName: String? = nil
-        if let idx = control.firstIndex(of: "N") {
-            nInputName = control.remove(at: idx)
-        }
+        // Token and position are all that is left: the caches are state, and
+        // `concretize_cache_length` folds each function's own cache length into
+        // the graph, so nothing else crosses the boundary.
+        let control = inputs.keys.filter { $0 != ringInputName }.sorted()
         guard control.count == 2 else {
             throw CoreMLModelError.unexpectedSignature(
                 function: function,
@@ -1219,7 +1204,6 @@ public final class CoreMLModel: @unchecked Sendable {
             tokenInputName: tokenName,
             tokenLength: tokenLength,
             positionInputName: positionName,
-            nInputName: nInputName,
             ringInputName: ringInputName,
             ringOutputName: ringOutputName,
             ringShape: ringConstraint.shape,

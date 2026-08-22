@@ -27,14 +27,14 @@ special-cased by name.
 
 The ``fill_like`` + ``add`` wrapper
 -----------------------------------
-The updated cache is produced by a ``slice_update`` on the value read out of
-the cache.  Handing *that var* straight to ``coreml_update_state`` produces a
+Handing the updated-cache var straight to ``coreml_update_state`` produces a
 model that loads and runs but silently loses the state: on macOS 26 the runtime
-turns ``read_state -> slice_update -> write_state`` into an in-place slice write
+turns ``read_state -> <in-place-looking update> -> write_state`` into a write
 whose base is not the previous state contents, so every prediction sees a cache
-holding only the row it just wrote.  (The same trap is why the sliding caches
-write with a whole-tensor select instead of ``dynamic_update_slice``; see
-``tests/test_sliding_state_write.py``.)
+holding only the row it just wrote.  (The same trap is why every cache write in
+``decode_coreml`` is a whole-tensor select rather than
+``jax.lax.dynamic_update_slice``; see ``tests/test_sliding_state_write.py`` and
+``tests/test_global_cache_write.py``.)
 
 Adding a ``fill_like``-produced zero tensor forces the written value into a
 tensor of its own and the state then persists.  ``fill_like`` (rather than a

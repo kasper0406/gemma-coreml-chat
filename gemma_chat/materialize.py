@@ -23,6 +23,11 @@ model has:
   runs here, right after materialization.  Note this makes the state layout
   size-dependent — a state made from `prefill_512` fits only the `*_512`
   pair, and growing the cache means migrating contents into a new state.
+- The cache *length* folded in as a constant: JAX's dimension-variable argument
+  `N` is a value, not a shape, so materialization leaves it a runtime input and
+  the global attention mask symbolic.  `concretize_cache_length` replaces it and
+  the attention fusion is re-run, which is what lets the global attention sites
+  become `scaled_dot_product_attention` (they could not before).
 
 The runtime picks the function whose size matches the current cache length.
 
@@ -50,6 +55,7 @@ from typing import Sequence
 
 import coremltools as ct
 
+from gemma_chat.mil_passes.concretize_cache_length import concretize_cache_length
 from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
 
 
@@ -59,6 +65,47 @@ from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
 DEFAULT_SIZES: tuple[int, ...] = tuple(
     2 ** k for k in range(9, 17)   # 512, 1024, 2048, ..., 65536
 )
+
+
+def _sdpa_count(prog) -> int:
+    return sum(
+        1
+        for func in prog.functions.values()
+        for op in func.operations
+        if op.op_type == "scaled_dot_product_attention"
+    )
+
+
+def _concretize_and_fuse(prog, function_name_to_length: dict[str, int]) -> None:
+    """Fold each function's cache length in, then re-run the attention fusion.
+
+    ``fuse_attention_to_sdpa`` gave up on the *global* attention sites during
+    export: their key axis was the symbolic ``N`` and the pass bails on symbolic
+    dimensions.  Folding ``N`` in makes those shapes concrete, so re-running the
+    fusion here collects the sites that export could not — which is the whole
+    reason to fold it in.  ``dead_code_elimination`` then drops the matmuls,
+    masks and transposes the fusion made redundant (it keeps
+    ``coreml_update_state`` explicitly, so the cache writes survive).
+    """
+    from coremltools.converters.mil.mil.passes.pass_pipeline import (
+        PassPipelineManager as _PassPipelineManager,
+    )
+    import stablehlo_coreml  # noqa: F401 — registers common::fuse_attention_to_sdpa
+
+    pass_obj = concretize_cache_length()
+    pass_obj.function_name_to_length = function_name_to_length
+    pass_obj.apply(prog)
+
+    before = _sdpa_count(prog)
+    pipeline = ct.PassPipeline.EMPTY
+    pipeline.append_pass("common::fuse_attention_to_sdpa")
+    pipeline.append_pass("common::dead_code_elimination")
+    _PassPipelineManager.apply_pipeline(prog, pipeline)
+    print(
+        f"  fuse_attention_to_sdpa (re-run): {before} → {_sdpa_count(prog)} "
+        "sdpa ops",
+        flush=True,
+    )
 
 
 def _function_inputs(spec, function_name: str):
@@ -170,6 +217,9 @@ def _materialize_single_function(
     # Now that every function has concrete shapes, the global KV caches can
     # become Core ML state like the sliding ones already are.
     global_kv_caches_to_states().apply(prog)
+
+    # The cache *length* is still a runtime input; fold it in and re-fuse.
+    _concretize_and_fuse(prog, {f"{target_prefix}_{size}": size for size in sizes})
 
     # After materialization, point the default at one of the new functions.
     # (The upstream helper hard-codes "main", which breaks for non-"main"
@@ -353,6 +403,12 @@ def _materialize_multifunction_source(
     # state like the sliding ones already are.  Must run after the source
     # functions are dropped — those still carry symbolic cache lengths.
     global_kv_caches_to_states().apply(prog)
+
+    # The cache *length* is still a runtime input; fold it in and re-fuse.
+    _concretize_and_fuse(
+        prog,
+        {f"{src_fn}_{size}": size for src_fn, _ in src_specs for size in sizes},
+    )
 
     # Smallest decode (if present) as default — least work on load; matches
     # gemma-export's convention.

@@ -112,10 +112,6 @@ public final class KVCacheState: @unchecked Sendable {
     let tokenScalar: MLMultiArray
     let positionScalar: MLMultiArray
 
-    /// Reusable int32 scalar for the cache-length input `N`, on exports that
-    /// still declare one. Always fed ``size``.
-    let nScalar: MLMultiArray
-
     /// Reusable `[1, chunkSize]` int32 buffer for prefill token chunks.
     let chunkTokens: MLMultiArray
 
@@ -151,7 +147,6 @@ public final class KVCacheState: @unchecked Sendable {
         ]
         self.tokenScalar = try MLMultiArray(shape: [1], dataType: .int32)
         self.positionScalar = try MLMultiArray(shape: [1], dataType: .int32)
-        self.nScalar = try MLMultiArray(shape: [1], dataType: .int32)
         self.chunkTokens = try MLMultiArray(
             shape: [1, NSNumber(value: chunkSize)], dataType: .int32
         )

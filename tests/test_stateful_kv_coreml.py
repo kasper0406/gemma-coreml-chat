@@ -9,13 +9,16 @@ It mirrors the real export in miniature:
   bound to CoreML **state** by the StableHLO→MIL converter (a state write fed by
   ``slice_update`` does not persist on macOS 26, which is why the real decode
   step uses a select);
-* one symbolic-dim "global" cache, written with ``dynamic_update_slice`` and
-  left as an ordinary input/output through conversion, because a state cannot
-  have a symbolic shape;
+* one symbolic-dim "global" cache, left as an ordinary input/output through
+  conversion because a state cannot have a symbolic shape.  It is written here
+  with ``dynamic_update_slice`` — the real export uses a select for both caches
+  now, and keeping the slice update makes this the harder case for the state
+  pass to carry;
 * ``gemma_chat.materialize`` then clones the dynamic-shape function into two
   concrete sizes — and, now that every function has concrete shapes, turns the
-  global cache into state too (``mil_passes.global_cache_states``), exactly as
-  ``gemma-export`` does.
+  global cache into state too (``mil_passes.global_cache_states``) and folds the
+  cache length in (``mil_passes.concretize_cache_length``, which is what drops
+  ``N`` from the signature), exactly as ``gemma-export`` does.
 
 and then asserts what the Swift runtime relies on: both caches live entirely in
 the ``MLState``, they persist across predictions, one state drives the
@@ -149,16 +152,11 @@ def _build_dynamic_package(dest: Path) -> None:
 def _predict(model, state, pos: int, size: int):
     """One step.  Both caches are state now, so only `pos` crosses the boundary.
 
-    `N` survives materialization as an unused phantom input; the runtime still
-    has to feed it the cache size.
+    `N` is gone: ``concretize_cache_length`` folded each function's own cache
+    length in, so `size` is only here to say which function the caller means.
     """
-    return model.predict(
-        {
-            "N": np.array([size], dtype=np.int32),
-            "pos": np.array([pos], dtype=np.int32),
-        },
-        state=state,
-    )
+    assert size in SIZES
+    return model.predict({"pos": np.array([pos], dtype=np.int32)}, state=state)
 
 
 @pytest.fixture(scope="module")
@@ -193,7 +191,7 @@ def test_materialize_makes_every_cache_a_state(materialized_package):
     for size in SIZES:
         fd = by_name[f"step_{size}"]
         assert [s.name for s in fd.state] == ["sliding", "glob"]
-        assert [i.name for i in fd.input] == ["N", "pos"]
+        assert [i.name for i in fd.input] == ["pos"]
         assert [o.name for o in fd.output] == ["sliding_total", "glob_total"]
         glob = next(s for s in fd.state if s.name == "glob")
         assert list(glob.type.stateType.arrayType.shape) == [1, size, 1, HEAD_DIM]
@@ -290,7 +288,7 @@ def test_state_is_shared_across_prefill_and_decode_of_one_size(merged_package):
     assert names == {f"{p}_{s}" for p in ("prefill", "decode") for s in SIZES}
     for fd in spec.description.functions:
         assert [s.name for s in fd.state] == ["sliding", "glob"], fd.name
-        assert [i.name for i in fd.input] == ["N", "pos"], fd.name
+        assert [i.name for i in fd.input] == ["pos"], fd.name
 
     size = SIZES[0]
     decode = ct.models.MLModel(

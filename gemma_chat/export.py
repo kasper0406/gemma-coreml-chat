@@ -469,8 +469,9 @@ def export_chunk_prefill(
     Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
     so a single model works at any cache length up to ``max_seq_len``.
     Sliding KV caches are Core ML state and never cross the model boundary;
-    materialization later turns the global ones into state as well, dropping
-    them from the signature described below.
+    materialization later turns the global ones into state as well and folds
+    ``N`` into a per-function constant, dropping both from the signature
+    described below.
 
     Inputs:  N (1,) int32 — phantom dim for current global cache length
              tokens (1, chunk_size) int32
@@ -610,8 +611,9 @@ def export_decode_step(
     Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
     so a single model works at any cache length up to ``max_seq_len``.
     Sliding KV caches are Core ML state and never cross the model boundary;
-    materialization later turns the global ones into state as well, dropping
-    them from the signature described below.
+    materialization later turns the global ones into state as well and folds
+    ``N`` into a per-function constant, dropping both from the signature
+    described below.
 
     Inputs:  N (1,) int32 — phantom dim for current global cache length
              token_id (1,) int32
