@@ -60,13 +60,16 @@ public struct InferenceEngine: Sendable {
     ///   - existingKVState: Optional pre-populated KV state (from eager prefill or prior turn)
     ///   - prefillOffset: If using existingKVState, how many tokens were already prefilled
     ///   - context: Optional context for capturing post-generation KV state (enables cross-turn reuse)
+    ///   - respectStopTokens: When false, generation runs to `maxNewTokens` even if a stop token
+    ///     is sampled (benchmarks need a fixed number of decode steps)
     /// - Returns: AsyncStream yielding generated token IDs (including EOS)
     public func generate(
         promptIDs: [Int32],
         maxNewTokens: Int = 256,
         existingKVState: KVCacheState? = nil,
         prefillOffset: Int = 0,
-        context: GenerationContext? = nil
+        context: GenerationContext? = nil,
+        respectStopTokens: Bool = true
     ) -> AsyncThrowingStream<Int32, Error> {
         AsyncThrowingStream { continuation in
             Task.detached { [self] in
@@ -182,7 +185,7 @@ public struct InferenceEngine: Sendable {
 
                         continuation.yield(nextID)
 
-                        if GemmaConfig.stopTokenIDs.contains(nextID) { break }
+                        if respectStopTokens && GemmaConfig.stopTokenIDs.contains(nextID) { break }
                         if Task.isCancelled { break }
 
                         let position = Int32(nReal + step)

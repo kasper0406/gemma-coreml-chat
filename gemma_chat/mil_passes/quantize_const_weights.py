@@ -2,13 +2,30 @@
 # Copyright (c) 2024 Kasper Nielsen
 # Vendored from stablehlo-coreml (https://github.com/kasper0406/stablehlo-coreml).
 """
-MIL pass: quantize large float weight constants using symmetric block-wise
-quantization, replacing them with constexpr_blockwise_shift_scale (iOS18) ops
-that are immune to constant folding.
+MIL pass: quantize large float weight constants, replacing them with
+constexpr_blockwise_shift_scale (iOS18) ops that are immune to constant folding.
 
-Mixed precision: embedding tables (detected by having a dimension matching
-VOCAB_SIZE) are quantized to int8 for accuracy (they double as the logit
-projection), while all other large weights use int4.
+Scale granularity is picked by what consumes the tensor (see
+:func:`_quantize_weight`), bit width by how lossy int4 would be there:
+
+* **Per-channel int4** for matmul weights — one scale per *output* channel, each
+  block spanning the whole input (contraction) axis.  Required for the ANE: the
+  CoreML ANE backend refuses to run any op fed by a
+  constexpr_blockwise_shift_scale whose scales are grouped along the contraction
+  axis (e.g. [D, O/32] for a [D, O] weight), silently pushing the whole model
+  onto the CPU.  Scales of shape [1, O] are ANE-eligible at int4 and int8 alike.
+  These weights are laid out [input_dim, output_dim] — they feed ``matmul`` as
+  the ``y`` operand with ``transpose_y=False`` — so the output axis is the last
+  one and the scale shape is [1, O].
+* **Block-32 int4** for the [VOCAB_SIZE, dim] embedding lookup tables.  They
+  feed ``gather``, which never runs on the ANE anyway, so there is nothing to
+  gain from per-channel scales and real accuracy to lose: one block would span
+  all 262144 vocab rows.  Scale shape stays [V, D/32].
+* **Per-channel int8** for the [dim, VOCAB_SIZE] logit projection.  It feeds a
+  matmul we want on the ANE, so it must be per-channel; but it emits the logits
+  directly and has no grouping left to fall back on, which is more than int4
+  can carry.  Vocab sits on the *last* axis there, so the leading-dim check
+  keeps it off the gather-table path.
 
 This pass runs early in the pipeline so that coremltools' ~95 optimization
 passes work on a compressed model instead of a full ~17GB fp32 model,
@@ -33,15 +50,9 @@ _INT4_NP_DTYPE = np.dtype(np.int8, metadata={_SUB_BYTE_KEY: _mil_types.int4})
 # Bias vectors (1D) and small positional buffers are left uncompressed.
 _WEIGHT_THRESHOLD = 2048
 
-# Vocab size used to detect embedding tables. Tensors with any dimension
-# matching this value are quantized at int8 instead of int4, because the
-# embedding table doubles as the logit projection and int4 is too lossy.
+# Vocab size used to detect the embedding lookup tables, which keep block-32
+# scales because they feed CPU-side gathers rather than ANE matmuls.
 _VOCAB_SIZE = 262144
-
-# Group size for block-wise quantization along the reduction axis.
-# Smaller groups = more scales = better accuracy but slightly larger model.
-# 32 is the standard for int4 group quantization (matches GPTQ/AWQ conventions).
-_GROUP_SIZE = 32
 
 # Module-level counters shared between _quantize_consts_in_block and apply().
 # Reset by apply() before each run.
@@ -51,8 +62,23 @@ _counter_skip: list = [0]      # [count] — skipped (already constexpr)
 
 
 def _is_embedding(val: np.ndarray) -> bool:
-    """True if this tensor looks like an embedding table (has VOCAB_SIZE dim)."""
-    return any(s == _VOCAB_SIZE for s in val.shape)
+    """True if this tensor is an embedding lookup table: [VOCAB_SIZE, dim].
+
+    Only the *leading* dim counts.  The logit projection is [dim, VOCAB_SIZE]
+    and feeds a matmul, so it deliberately does not match.
+    """
+    return val.ndim == 2 and val.shape[0] == _VOCAB_SIZE
+
+
+def _is_logit_projection(val: np.ndarray) -> bool:
+    """True if this tensor is the [dim, VOCAB_SIZE] logit projection.
+
+    Vocab on the *last* axis, so it is the ``y`` operand of the final matmul
+    rather than a gather table.  It gets int8: per-channel int4 leaves it with
+    no grouping to fall back on, and it produces the logits directly.
+    """
+    return (val.ndim == 2 and val.shape[-1] == _VOCAB_SIZE
+            and val.shape[0] != _VOCAB_SIZE)
 
 
 def _classify_quantize(op):
@@ -60,7 +86,7 @@ def _classify_quantize(op):
 
     Returns:
         'int4' — standard weight, quantize to int4
-        'int8' — embedding table, quantize to int8
+        'int8' — logit projection, quantize to int8
         'skip_constexpr' — already feeds a constexpr op
         None — not a quantizable const (wrong type, too small, etc.)
     """
@@ -77,116 +103,134 @@ def _classify_quantize(op):
     for child_op in op.outputs[0].child_ops:
         if child_op.op_type.startswith("constexpr_"):
             return "skip_constexpr"
-    return "int4"
+    return "int8" if _is_logit_projection(val) else "int4"
 
 
-def _quantize_symmetric_blockwise(val: np.ndarray, axis: int = 0,
-                                  group_size: int = _GROUP_SIZE,
-                                  nbits: int = 4):
+def _quantize_symmetric_per_channel(val: np.ndarray, nbits: int = 4):
     """
-    Symmetric block-wise quantization (round-to-nearest).
+    Symmetric per-channel quantization (round-to-nearest).
 
     nbits=4: signed int4 range [-7, 7], tagged with int4 metadata
     nbits=8: signed int8 range [-127, 127], plain int8
 
-    Quantizes with one scale per group of `group_size` elements along each
-    non-`axis` dimension. Along `axis`, each channel gets its own scale
-    (block_size=1).
+    One scale per output channel: the last axis of `val` is the output axis
+    (weights feed ``matmul`` as ``y`` with ``transpose_y=False``, i.e. they are
+    laid out [input_dim, output_dim]), and each block spans the entire
+    remaining (contraction) extent.  For a [D, O] weight the scale is [1, O].
+    This is the only granularity the ANE will accept — grouped scales along the
+    contraction axis force the whole model onto the CPU.
 
     Returns:
         quantized_data: int8 array with same shape as val
-        scale: float array, same rank as val
+        scale: float array, same rank as val, shape [1, ..., 1, O]
 
-    Note: processes in chunks along axis=0 to avoid OOM on large tensors.
+    Note: processes in chunks along axis 0 to avoid OOM on large tensors.
     """
     max_val = (1 << (nbits - 1)) - 1  # 7 for int4, 127 for int8
 
-    # Determine scale shape: per-channel on axis, grouped on other dims
-    scale_shape = []
-    for d in range(val.ndim):
-        if d == axis:
-            scale_shape.append(val.shape[d])
-        else:
-            n_groups = (val.shape[d] + group_size - 1) // group_size
-            scale_shape.append(n_groups)
-
-    # Pad non-axis dims to be divisible by group_size for reshape
-    padded_shape = list(val.shape)
-    pad_widths = [(0, 0)] * val.ndim
-    needs_pad = False
-    for d in range(val.ndim):
-        if d != axis and val.shape[d] % group_size != 0:
-            pad_amount = group_size - (val.shape[d] % group_size)
-            pad_widths[d] = (0, pad_amount)
-            padded_shape[d] = val.shape[d] + pad_amount
-            needs_pad = True
-
-    if needs_pad:
-        val_padded = np.pad(val, pad_widths, mode='constant', constant_values=0)
-    else:
-        val_padded = val
-
-    # Reshape to [..., n_groups, group_size, ...] for grouped max computation
-    # For 2D [out, in] with axis=0: reshape to [out, n_groups, group_size]
-    # then compute max over the group_size dim
-    grouped_shape = []
-    reduce_axes_grouped = []
-    dim_idx = 0
-    for d in range(val.ndim):
-        if d == axis:
-            grouped_shape.append(padded_shape[d])
-            dim_idx += 1
-        else:
-            n_g = padded_shape[d] // group_size
-            grouped_shape.append(n_g)
-            grouped_shape.append(group_size)
-            reduce_axes_grouped.append(dim_idx + 1)
-            dim_idx += 2
-
-    val_grouped = val_padded.reshape(grouped_shape)
-    group_max_f32 = np.max(
-        np.abs(val_grouped), axis=tuple(reduce_axes_grouped), keepdims=True
-    ).astype(np.float32)
-    group_max_f32 = np.where(group_max_f32 == 0.0, 1.0, group_max_f32)
-    scale_grouped_f32 = group_max_f32 / float(max_val)
-
-    # Quantize in the grouped view
-    n_channels = padded_shape[axis]
+    reduce_axes = tuple(range(val.ndim - 1))
+    n_rows = val.shape[0]
     _CHUNK = 2048
-    quantized_grouped = np.empty(val_grouped.shape, dtype=np.int8)
 
-    for start in range(0, n_channels, _CHUNK):
-        end = min(start + _CHUNK, n_channels)
-        # Build slice for the grouped array (axis position is the same)
-        slc = []
-        for d in range(len(grouped_shape)):
-            if d == axis:
-                slc.append(slice(start, end))
-            else:
-                slc.append(slice(None))
-        slc = tuple(slc)
-        chunk_f32 = val_grouped[slc].astype(np.float32)
-        chunk_scale = scale_grouped_f32[slc]
-        quantized_grouped[slc] = np.clip(
-            np.round(chunk_f32 / chunk_scale), -max_val, max_val
+    # Pass 1: per-output-channel absmax, accumulated chunk-wise in fp32.
+    chan_max_f32 = np.zeros((val.shape[-1],), dtype=np.float32)
+    for start in range(0, n_rows, _CHUNK):
+        chunk_f32 = val[start:start + _CHUNK].astype(np.float32)
+        np.maximum(
+            chan_max_f32,
+            np.max(np.abs(chunk_f32), axis=reduce_axes),
+            out=chan_max_f32,
+        )
+        del chunk_f32
+    chan_max_f32 = np.where(chan_max_f32 == 0.0, 1.0, chan_max_f32)
+
+    # Store the scale in the weight dtype and quantize against that exact
+    # value, so dequantization on-device reproduces what we rounded against.
+    scale_shape = (1,) * (val.ndim - 1) + (val.shape[-1],)
+    scale = (chan_max_f32 / float(max_val)).astype(val.dtype).reshape(scale_shape)
+    scale_f32 = scale.astype(np.float32)
+
+    # Pass 2: quantize chunk-wise.
+    quantized = np.empty(val.shape, dtype=np.int8)
+    for start in range(0, n_rows, _CHUNK):
+        end = min(start + _CHUNK, n_rows)
+        chunk_f32 = val[start:end].astype(np.float32)
+        quantized[start:end] = np.clip(
+            np.round(chunk_f32 / scale_f32), -max_val, max_val
         ).astype(np.int8)
-        del chunk_f32, chunk_scale
+        del chunk_f32
 
-    # Reshape back to original padded shape and trim
-    quantized_padded = quantized_grouped.reshape(padded_shape)
-    quantized = quantized_padded[tuple(slice(0, s) for s in val.shape)]
-
-    # Scale: squeeze out the group_size dims to get [out, n_groups] shape
-    scale_f32 = group_max_f32.squeeze(axis=tuple(reduce_axes_grouped)) / float(max_val)
-    scale = scale_f32.astype(val.dtype)
-
-    del val_padded, val_grouped, quantized_grouped, quantized_padded
-    del group_max_f32, scale_grouped_f32, scale_f32
+    del chan_max_f32, scale_f32
     if nbits == 4:
         # Tag the int8 container with int4 metadata so coremltools serializes
         # the data as packed 4-bit (halving on-disk weight storage).
         quantized = quantized.view(_INT4_NP_DTYPE)
     return quantized, scale
+
+
+def _quantize_symmetric_embedding_blocks(val: np.ndarray, nbits: int = 4):
+    """
+    Symmetric block-wise quantization for the [VOCAB_SIZE, dim] lookup tables.
+
+    One scale per group of 32 elements along the row (embedding-dim) axis, so
+    the scale is [V, D/32].  Deliberately *not* per-channel: these tensors feed
+    ``gather``, which runs on the CPU no matter how the weights are quantized,
+    and a per-channel block would span all 262144 vocab rows.  The block size is
+    fixed at 32 — this is the one path that keeps grouped scales, not a knob.
+
+    Returns:
+        quantized_data: int8 array with same shape as val
+        scale: float array [V, D/32]
+
+    Note: processes in chunks along axis 0 to avoid OOM on large tensors.
+    """
+    _GROUP = 32
+    if val.ndim != 2:
+        raise ValueError(f"embedding table must be rank 2, got shape {val.shape}")
+    max_val = (1 << (nbits - 1)) - 1  # 7 for int4, 127 for int8
+
+    n_rows, n_cols = val.shape
+    pad = (-n_cols) % _GROUP
+    n_groups = (n_cols + pad) // _GROUP
+    _CHUNK = 2048
+
+    quantized = np.empty(val.shape, dtype=np.int8)
+    scale_f32 = np.empty((n_rows, n_groups), dtype=np.float32)
+
+    for start in range(0, n_rows, _CHUNK):
+        end = min(start + _CHUNK, n_rows)
+        chunk_f32 = val[start:end].astype(np.float32)
+        if pad:
+            chunk_f32 = np.pad(chunk_f32, ((0, 0), (0, pad)))
+        chunk_f32 = chunk_f32.reshape(end - start, n_groups, _GROUP)
+        group_max = np.max(np.abs(chunk_f32), axis=2, keepdims=True)
+        group_max = np.where(group_max == 0.0, 1.0, group_max)
+        group_scale = group_max / float(max_val)
+        q = np.clip(
+            np.round(chunk_f32 / group_scale), -max_val, max_val
+        ).astype(np.int8)
+        quantized[start:end] = q.reshape(end - start, n_groups * _GROUP)[:, :n_cols]
+        scale_f32[start:end] = group_scale[:, :, 0]
+        del chunk_f32, group_max, group_scale, q
+
+    scale = scale_f32.astype(val.dtype)
+    del scale_f32
+    if nbits == 4:
+        quantized = quantized.view(_INT4_NP_DTYPE)
+    return quantized, scale
+
+
+def _quantize_weight(val: np.ndarray, nbits: int = 4):
+    """Quantize one weight tensor with the granularity its consumer requires.
+
+    Per-channel for matmul weights, so the ANE will accept the ops they feed;
+    block-32 for the [VOCAB_SIZE, dim] embedding tables, whose gathers run on
+    the CPU regardless and would only lose accuracy from per-channel scales.
+    The bit width is the caller's choice — see :func:`_is_logit_projection`.
+    """
+    if _is_embedding(val):
+        return _quantize_symmetric_embedding_blocks(val, nbits=nbits)
+    return _quantize_symmetric_per_channel(val, nbits=nbits)
 
 
 @block_context_manager
@@ -237,9 +281,7 @@ def _quantize_consts_in_block(block):
             val = op.outputs[0].val
             nbytes = val.nbytes
             nbits = 4 if precision == "int4" else 8
-            quantized_data, scale = _quantize_symmetric_blockwise(
-                val, axis=0, group_size=_GROUP_SIZE, nbits=nbits,
-            )
+            quantized_data, scale = _quantize_weight(val, nbits=nbits)
 
             op.outputs[0]._sym_val = None
             del val
@@ -291,11 +333,13 @@ def _quantize_consts_in_block(block):
 class quantize_const_weights(AbstractGraphPass):
     """
     Replace large float weight constants with constexpr_blockwise_shift_scale
-    ops using symmetric block-wise quantization (iOS18).
+    ops using symmetric quantization (iOS18).
 
-    Mixed precision: embedding tables (vocab_size dim) → int8 for accuracy,
-    all other large weights → int4 for size. Group quantization with
-    GROUP_SIZE=32 elements per block.
+    Matmul weights get int4 with one scale per output channel (last axis), the
+    block spanning the whole contraction axis — the only granularity the ANE
+    accepts.  The [vocab_size, dim] embedding tables keep block-32 int4: their
+    gathers run on the CPU either way, so per-channel would only cost accuracy.
+    The [dim, vocab_size] logit projection is per-channel int8.
 
     Inserted at position 0 in the pass pipeline so that all subsequent
     passes work on the compressed model.
