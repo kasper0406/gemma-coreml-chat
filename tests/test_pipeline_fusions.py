@@ -14,6 +14,7 @@ placement, and the graph shapes this project actually produces.
 import numpy as np
 import jax
 import jax.numpy as jnp
+import jax.scipy.special
 import coremltools as ct
 from coremltools.converters.mil.mil import types as mil_types
 from stablehlo_coreml.converter import convert as hlo_to_mil
@@ -134,8 +135,8 @@ def rmsnorm(x, scale):
 
 
 def exact_gelu(x):
-    """The FFN activation from ``decode_coreml._ffn``."""
-    return jax.nn.gelu(x.astype(jnp.float32), approximate=False).astype(jnp.float16)
+    """The FFN activation from ``decode_coreml._gelu_exact`` — fp16, erf spelling."""
+    return x * 0.5 * (1.0 + jax.scipy.special.erf(x * float(1.0 / np.sqrt(2.0))))
 
 
 def logit_softcap(x):
@@ -255,35 +256,62 @@ def test_logit_softcap_fuses_to_scaled_tanh():
     assert abs(float(op.inputs["beta"].val) - 1.0 / 30.0) < 1e-4
 
 
-def test_rmsnorm_uses_reduce_mean():
-    """``fuse_reduce_keep_dims`` + coremltools' ``fuse_reduce_mean`` cover this."""
-    x = jnp.ones((1, 8, 256), jnp.float16)
-    scale = jnp.ones((256,), jnp.float16)
-    _, prog = _convert(rmsnorm, x, scale)
-
-    assert _count(prog, "reduce_mean") == 1
-    assert _count(prog, "reduce_sum") == 0
-    mean = next(op for op in _ops(prog) if op.op_type == "reduce_mean")
-    # fuse_reduce_keep_dims folded the rank-restoring reshape into the reduction.
-    assert bool(mean.inputs["keep_dims"].val) is True
+def _rmsnorm_const_scale(x):
+    """``rmsnorm`` with the scale as a weight constant, as in the real graph."""
+    return rmsnorm(x, jnp.asarray(np.full((x.shape[-1],), 0.5, np.float16)))
 
 
-def test_exact_gelu_fuses_to_one_op():
-    """``chlo.erfc`` is mapped natively and fused by ``fuse_gelu_erfc``."""
+def test_rmsnorm_fuses_to_l2_norm():
+    """``fuse_rmsnorm`` — the eight-op chain becomes ``l2_norm`` + one ``mul``.
+
+    ``(1, 1, D)`` needs no reshape: ``l2_norm`` normalizes over the last three
+    dims, which for that shape is exactly the last one.
+    """
+    x = jnp.ones((1, 1, 256), jnp.float16)
+    _, prog = _convert(_rmsnorm_const_scale, x)
+
+    assert _count(prog, "l2_norm") == 1
+    for op_type in ("reduce_mean", "reduce_sum", "rsqrt", "reshape"):
+        assert _count(prog, op_type) == 0, f"unfused RMSNorm leftover: {op_type}"
+    # eps' = d * eps, so that l2_norm's sum-of-squares matches mean + 1e-6.
+    l2 = next(op for op in _ops(prog) if op.op_type == "l2_norm")
+    assert abs(float(l2.inputs["epsilon"].val) - 256 * 1e-6) < 1e-9
+    # cast(fp32) -> l2_norm -> mul(sqrt(d)*scale) -> cast(fp16), nothing else.
+    assert sum(1 for op in _ops(prog) if op.op_type != "const") == 4
+
+
+def test_rmsnorm_off_canonical_shape_is_left_alone():
+    """``l2_norm`` reduces the last three dims, so a ``(1, L, H, hd)`` q-norm
+    would need reshaping around it — measurably a loss, so the pass skips it."""
+    for shape in ((1, 4, 8, 256), (1, 128, 256)):
+        _, prog = _convert(_rmsnorm_const_scale, jnp.ones(shape, jnp.float16))
+        assert _count(prog, "l2_norm") == 0, shape
+        assert _count(prog, "reduce_mean") == 1, shape
+        assert _count(prog, "rsqrt") == 1, shape
+
+
+def test_exact_gelu_fuses_to_one_fp16_op():
+    """``chlo.erf`` is mapped natively and fused by ``fuse_gelu_exact``.
+
+    No cast pair: the fused op runs in the fp16 activation dtype.
+    """
     _, prog = _convert(exact_gelu, jnp.ones((1, 8, 256), jnp.float16))
 
     assert _count(prog, "gelu") == 1
+    assert _count(prog, "cast") == 0
     for op_type in ("erf", "erfc", "tanh", "pow"):
         assert _count(prog, op_type) == 0, f"unfused gelu leftover: {op_type}"
+    gelu = next(op for op in _ops(prog) if op.op_type == "gelu")
+    assert gelu.outputs[0].dtype == mil_types.fp16
 
 
 def test_adjacent_rmsnorms_have_no_cast_roundtrip():
     """``collapse_cast_chains`` — coremltools keeps lossy downcast→upcast pairs."""
-    x = jnp.ones((1, 8, 256), jnp.float16)
+    x = jnp.ones((1, 1, 256), jnp.float16)
     scale = jnp.ones((256,), jnp.float16)
     _, prog = _convert(double_rmsnorm, x, scale, scale)
 
-    assert _count(prog, "reduce_mean") == 2
+    assert _count(prog, "l2_norm") == 2
     assert _cast_roundtrips(prog) == 0
 
 

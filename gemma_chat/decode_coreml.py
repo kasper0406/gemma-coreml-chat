@@ -78,10 +78,12 @@ accumulates them in fp32.
 
 from __future__ import annotations
 
+import math
 from typing import List, Tuple
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.special
 
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN
 from gemma_chat.model import AttentionType, Gemma4Config, _apply_rope, _embed_lookup
@@ -174,6 +176,31 @@ def _chunk_write(cache, value, slots):
 # Shared utilities
 # ---------------------------------------------------------------------------
 
+_INV_SQRT2 = float(1.0 / math.sqrt(2.0))
+
+
+def _gelu_exact(x):
+    """Exact GELU in ``x``'s own dtype, spelled so the converter emits one op.
+
+    ``jax.nn.gelu(x, approximate=False)`` writes this as ``0.5 * x * erfc(-x/√2)``,
+    and stablehlo-coreml's ``chlo.erfc`` handler builds ``1 - erf(...)`` from an
+    fp32 Python literal, which fails to type-check against an fp16 operand.  The
+    algebraically identical ``0.5 * x * (1 + erf(x/√2))`` spelling goes through
+    the ``chlo.erf`` handler — a bare ``mb.erf`` — and is exactly the form
+    coremltools' ``fuse_gelu_exact`` matches, so the chain collapses to a single
+    native ``gelu(mode="EXACT")``.
+
+    That op runs in the activation dtype, which is why this is called on fp16
+    directly.  The fp32 round-trip it replaces existed to keep the erf
+    *polynomial* out of fp16; there is no polynomial left to protect once the
+    whole thing is one op, and the cast pair around it cost two dispatches per
+    GELU (140 in the full decode graph).  The cancellation in ``1 + erf`` for
+    very negative ``x`` never reaches the runtime either — the fused op computes
+    the tail itself.
+    """
+    return x * 0.5 * (1.0 + jax.scipy.special.erf(x * _INV_SQRT2))
+
+
 def _rmsnorm(x, scale):
     x32 = x.astype(jnp.float32)
     var = jnp.mean(jnp.square(x32), axis=-1, keepdims=True)
@@ -219,17 +246,14 @@ def _ffn(lp, x, hidden_dim: int):
     """GeLU-gated FFN. x: (..., D) → (..., D)."""
     gate = jnp.dot(x, lp['mlp']['gate_proj']['kernel'])
     up   = jnp.dot(x, lp['mlp']['up_proj']['kernel'])
-    # GELU in float32 so the erf polynomial stays scalar (avoids constexpr quantization)
-    gate = jax.nn.gelu(gate.astype(jnp.float32), approximate=False).astype(jnp.float16)
+    gate = _gelu_exact(gate)
     return jnp.dot(gate * up, lp['mlp']['down_proj']['kernel'])
 
 
 def _ple_gate(lp, x, ple_slice):
     """Per-layer input gate block. x: (..., D), ple_slice: (..., d) → (..., D)."""
     gate_proj = jnp.dot(x, lp['per_layer_input_gate']['kernel'])
-    gate = jax.nn.gelu(
-        gate_proj.astype(jnp.float32), approximate=False,
-    ).astype(jnp.float16) * ple_slice
+    gate = _gelu_exact(gate_proj) * ple_slice
     proj = jnp.dot(gate, lp['per_layer_projection']['kernel'])
     proj = _rmsnorm(proj, lp['post_per_layer_input_norm']['scale'])
     return x + proj
