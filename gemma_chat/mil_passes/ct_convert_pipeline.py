@@ -40,7 +40,6 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
     """
     import gemma_chat.mil_passes.quantize_const_weights  # noqa: F401
     import gemma_chat.mil_passes.collapse_cast_chains  # noqa: F401
-    import gemma_chat.mil_passes.fuse_rmsnorm  # noqa: F401
 
     _patch_backend_pipeline()
 
@@ -53,11 +52,7 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
         pipeline.passes.index("common::replace_decomposed_softmax"),
         "common::collapse_cast_chains",
     )
-    # After ``fuse_reduce_mean``: that is the pass that turns the converter's
-    # ``reduce_sum`` + ``mul(1/d)`` back into the ``reduce_mean`` the RMSNorm
-    # pattern is written against.
-    pipeline.insert_pass(
-        pipeline.passes.index("common::fuse_reduce_mean") + 1,
-        "common::fuse_rmsnorm",
-    )
+    # ``common::fuse_rmsnorm`` is no longer inserted here: stablehlo-coreml
+    # 0.1.5 ships this project's RMSNorm fusion upstream and already places it
+    # in its own late-fusion group, right after ``common::fuse_reduce_mean``.
     return pipeline
