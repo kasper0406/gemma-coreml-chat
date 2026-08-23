@@ -25,9 +25,10 @@ model has:
   pair, and growing the cache means migrating contents into a new state.
 - The cache *length* folded in as a constant: JAX's dimension-variable argument
   `N` is a value, not a shape, so materialization leaves it a runtime input and
-  the global attention mask symbolic.  `concretize_cache_length` replaces it and
-  the attention fusion is re-run, which is what lets the global attention sites
-  become `scaled_dot_product_attention` (they could not before).
+  the global attention mask symbolic.  `concretize_cache_length` replaces it,
+  which makes every shape concrete and drops `N` from the signature.  The
+  attention fusion is deliberately *not* re-run afterwards — see
+  `_concretize_cache_lengths` for the two Apple defects that keeps us clear of.
 
 The runtime picks the function whose size matches the current cache length.
 
@@ -68,45 +69,56 @@ DEFAULT_SIZES: tuple[int, ...] = tuple(
 )
 
 
-def _sdpa_count(prog) -> int:
-    return sum(
-        1
-        for func in prog.functions.values()
-        for op in func.operations
-        if op.op_type == "scaled_dot_product_attention"
-    )
+def _concretize_cache_lengths(prog, function_name_to_length: dict[str, int]) -> None:
+    """Fold each function's cache length in, then clean up.
 
+    Folding ``N`` in is load-bearing regardless of attention fusion: it is what
+    makes the global attention mask (``range_1d(end=N)``,
+    ``fill(shape=[1, H, 1, N])``) concrete, so no function keeps a symbolic
+    shape, and it is what removes ``N`` from the signature the Swift runtime
+    binds against.  ``dead_code_elimination`` then drops what folding it in made
+    unreachable (it keeps ``coreml_update_state`` explicitly, so the cache
+    writes survive).
 
-def _concretize_and_fuse(prog, function_name_to_length: dict[str, int]) -> None:
-    """Fold each function's cache length in, then re-run the attention fusion.
+    **Why the attention fusion is deliberately NOT re-run here.**  Concrete
+    shapes would let ``common::fuse_attention_to_sdpa`` finally collect the
+    *global* attention sites it had to skip during export (it bails on symbolic
+    dimensions; the *sliding* sites were always concrete, are fused at convert
+    time, and stay fused — they are not affected by either defect below).
+    Fusing the global sites trips two Apple bugs, both on macOS 26.5:
 
-    ``fuse_attention_to_sdpa`` gave up on the *global* attention sites during
-    export: their key axis was the symbolic ``N`` and the pass bails on symbolic
-    dimensions.  Folding ``N`` in makes those shapes concrete, so re-running the
-    fusion here collects the sites that export could not — which is the whole
-    reason to fold it in.  ``dead_code_elimination`` then drops the matmuls,
-    masks and transposes the fusion made redundant (it keeps
-    ``coreml_update_state`` explicitly, so the cache writes survive).
+    1. **ANE partitioner.** Once a function holds two or more global SDPAs,
+       ANECCompile() fails on the segment containing the *deepest* one with
+       "live input tensor not used in network", and the whole model silently
+       drops off the Neural Engine.  Bisected on truncated exports: a 9-layer
+       model (one global layer) compiles every procedure; the 10-layer model
+       (two global layers) stops one procedure short and logs that message —
+       scratchpad artifacts ``bisect/L9.*`` vs ``bisect/L10.*``.
+    2. **BNNS.** A fused global SDPA SIGSEGVs when a CPU segment executes it
+       with query length >= 2 — i.e. every chunk-128 prefill, on ``cpu-only``
+       and on the CPU segments of ``cpu-and-ne``.  Minimal repro:
+       ``scratchpad/bisect/synth_sdpa3.py 8 128 512 512 mq`` (one fp16 SDPA at
+       the global site's shape, with the attention-scale ``mul`` feeding the
+       query) exits 139.  ``Lq=1`` passes and ``Lq=2`` crashes; the ``+f32``
+       and ``+decomp`` variants pass, and so does ``plain`` — the producer op
+       on the query is part of the trigger.
+
+    Leaving the global sites as the ``matmul → add(mask) → softmax → matmul``
+    they already are avoids both.  When Apple fixes either defect, re-running
+    ``common::fuse_attention_to_sdpa`` here (plus DCE) is all it takes to get
+    the fused form back — benchmark it against the decomposed form first.
     """
     from coremltools.converters.mil.mil.passes.pass_pipeline import (
         PassPipelineManager as _PassPipelineManager,
     )
-    import stablehlo_coreml  # noqa: F401 — registers common::fuse_attention_to_sdpa
 
     pass_obj = concretize_cache_length()
     pass_obj.function_name_to_length = function_name_to_length
     pass_obj.apply(prog)
 
-    before = _sdpa_count(prog)
     pipeline = ct.PassPipeline.EMPTY
-    pipeline.append_pass("common::fuse_attention_to_sdpa")
     pipeline.append_pass("common::dead_code_elimination")
     _PassPipelineManager.apply_pipeline(prog, pipeline)
-    print(
-        f"  fuse_attention_to_sdpa (re-run): {before} → {_sdpa_count(prog)} "
-        "sdpa ops",
-        flush=True,
-    )
 
 
 def _function_inputs(spec, function_name: str):
@@ -219,8 +231,10 @@ def _materialize_single_function(
     # become Core ML state like the sliding ones already are.
     global_kv_caches_to_states().apply(prog)
 
-    # The cache *length* is still a runtime input; fold it in and re-fuse.
-    _concretize_and_fuse(prog, {f"{target_prefix}_{size}": size for size in sizes})
+    # The cache *length* is still a runtime input; fold it in.
+    _concretize_cache_lengths(
+        prog, {f"{target_prefix}_{size}": size for size in sizes}
+    )
 
     # After materialization, point the default at one of the new functions.
     # (The upstream helper hard-codes "main", which breaks for non-"main"
@@ -405,8 +419,8 @@ def _materialize_multifunction_source(
     # functions are dropped — those still carry symbolic cache lengths.
     global_kv_caches_to_states().apply(prog)
 
-    # The cache *length* is still a runtime input; fold it in and re-fuse.
-    _concretize_and_fuse(
+    # The cache *length* is still a runtime input; fold it in.
+    _concretize_cache_lengths(
         prog,
         {f"{src_fn}_{size}": size for src_fn, _ in src_specs for size in sizes},
     )

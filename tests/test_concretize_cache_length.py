@@ -6,10 +6,18 @@ survives as an ordinary runtime ``int32[1]`` input of every ``{prefill,decode}_S
 function, even though each of those has exactly one possible value for it.
 
 That leaves the global attention mask symbolic (``range_1d(end=N)``,
-``fill(shape=[1, H, 1, N])``), and ``fuse_attention_to_sdpa`` bails on symbolic
-dimensions — so the global attention sites stay an unfused fp32
-``matmul → select → softmax → matmul``.  ``mil_passes.concretize_cache_length``
-folds ``N`` in and ``materialize._concretize_and_fuse`` re-runs the fusion.
+``fill(shape=[1, H, 1, N])``) even in a function the materializer specialized to
+one concrete cache size.  ``mil_passes.concretize_cache_length``, driven by
+``materialize._concretize_cache_lengths``, folds ``N`` in so nothing is symbolic
+any more and the mask folds to a constant.
+
+Concrete shapes would also let ``fuse_attention_to_sdpa`` — which bails on
+symbolic dimensions — finally fuse these global sites.  That fusion is
+deliberately *not* re-run (two Apple defects; see
+``materialize._concretize_cache_lengths``), so the site must come out of the
+pass still decomposed as ``matmul → select → softmax → matmul``.  That is
+asserted here, because re-adding the fusion is a one-line change and this test
+is where the reason it was removed lives.
 
 The graph below is one global decode-attention site with GQA, the shape the real
 export produces at every global layer.  Both halves are checked: the program
@@ -34,7 +42,7 @@ from coremltools.converters.mil.mil.types.symbolic import any_symbolic
 from jax import export as jax_export
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
-from gemma_chat.materialize import _concretize_and_fuse
+from gemma_chat.materialize import _concretize_cache_lengths
 from gemma_chat.mil_passes.concretize_cache_length import LENGTH_INPUT_NAME
 from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
 
@@ -152,7 +160,7 @@ def concretized():
     # A second build rather than a copy: the pass rewrites in place, and both
     # states of the program are needed side by side.
     prog = _materialized_program()
-    _concretize_and_fuse(prog, {FUNC: CACHE_LEN})
+    _concretize_cache_lengths(prog, {FUNC: CACHE_LEN})
     return prog
 
 
@@ -198,25 +206,32 @@ def test_no_shape_is_symbolic_any_more(concretized):
     assert leftovers == []
 
 
-def test_the_attention_fuses_once_the_shapes_are_concrete(concretized):
+def test_the_global_attention_stays_decomposed(concretized):
+    """No SDPA at the global site — see the module docstring for why.
+
+    If someone re-adds ``common::fuse_attention_to_sdpa`` to
+    ``_concretize_cache_lengths``, this is the test that fails, and the comment
+    at that call site says which two Apple defects have to be fixed first.
+    """
     counts = _op_types(concretized)
-    assert counts["scaled_dot_product_attention"] == 1
-    assert counts["softmax"] == 0
-    assert counts["matmul"] == 0
-    assert counts["select"] == 0
+    assert counts["scaled_dot_product_attention"] == 0
+    assert counts["softmax"] == 1
+    assert counts["matmul"] == 2
+    assert counts["select"] == 1
 
 
-def test_the_fused_model_computes_the_attention_it_was_traced_from(concretized):
+def test_the_concretized_model_computes_the_attention_it_was_traced_from(concretized):
     """Run the rewritten model and check it against the JAX source, at three
     positions — one where the mask hides almost everything, one in the middle,
     one where it hides nothing.
 
     The oracle is the JAX function rather than the ``N``-carrying model: with a
     symbolic key axis the mask ``tile`` reaches only the first attention head in
-    this small graph, so the unfused model is not something to hold the fused one
-    against.  (The real export is not affected — its ``{prefill,decode}_512`` and
-    ``_1024`` functions agree bit for bit on the same tokens — but it is one more
-    reason not to leave the key axis symbolic.)
+    this small graph, so the pre-pass model is not something to hold the
+    concretized one against — the mask it applies is wrong.  (The real export is
+    not affected — its ``{prefill,decode}_512`` and ``_1024`` functions agree bit
+    for bit on the same tokens — but it is one more reason not to leave the key
+    axis symbolic.)
     """
     model = ct.convert(
         concretized,

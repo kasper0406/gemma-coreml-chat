@@ -11,11 +11,10 @@ though every one of those functions has exactly one possible value for it.
 The cost is not the input itself but the ops hanging off it.  The global
 attention mask is built as ``range_1d(end=N) <= position``, broadcast to
 ``[1, 8, 1, N]`` against a ``fill(shape=[1, 8, 1, N])`` of ``-10000``.  With
-``N`` unknown at compile time all of those stay symbolic, and
-``fuse_attention_to_sdpa`` bails on symbolic dimensions — so the global
-attention sites (7 of the 35 layers in the full model) run as an unfused
-fp32 ``matmul → select(mask) → softmax → matmul`` with 8× GQA tiles and the
-transposes that go with them, instead of one ``scaled_dot_product_attention``.
+``N`` unknown at compile time all of those stay symbolic, so the functions the
+materializer just specialized to a concrete cache length still carry symbolic
+shapes into the global attention of 7 of the 35 layers — which is exactly what
+the ANE cannot take, and what forces those masks to be built at runtime.
 
 What this pass does
 -------------------
@@ -30,16 +29,16 @@ For each named function it is given a length for:
    re-inferring the whole function would run value inference over the
    ``constexpr_*`` weights and decompress them.
 
-``fuse_attention_to_sdpa`` must be re-run afterwards to collect the winnings;
-``materialize.py`` does that right after calling this pass.
+Concrete shapes would also let ``fuse_attention_to_sdpa`` finally fuse those
+global sites, but that fusion is deliberately not re-run — it trips two Apple
+defects; see ``materialize._concretize_cache_lengths``.
 
 The value-inference size cap
 ----------------------------
 Re-inference computes values as well as types, and ``fill``'s value inference
 materializes the whole tensor — the ``-10000`` mask of a 65536-long prefill
-function is 268 MB of fp32.  Nothing downstream needs those values (the mask
-depends on the runtime ``position``, and ``fuse_attention_to_sdpa`` reads the
-fill's scalar operand, not its expansion), so any inferred value above
+function is 268 MB of fp32.  Nothing downstream needs those values — the mask
+depends on the runtime ``position`` — so any inferred value above
 :data:`_MAX_INFERRED_VALUE` elements is dropped again.  Small ones are kept:
 shape vectors have to stay constant for the ops they feed to infer a concrete
 shape at all, which is the entire point of the pass.
