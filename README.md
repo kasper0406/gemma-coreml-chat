@@ -41,6 +41,17 @@ The first CLI launch compiles `.mlpackage` → `.mlmodelc` next to the source (c
 
 `--no-materialize` still emits a single dynamic-shape function pair, but that artifact **no longer loads on any backend**: a `RangeDim` program that also declares CoreML states fails with E5RT/BNNS errors. It is useful only for inspecting the converted program.
 
+**Weights sharded below 2 GiB.** An `.mlpackage` stores every constant in `Data/com.apple.CoreML/weights/`, and coremltools writes all of them into one `weight.bin`. Once that single file crosses **2 GiB**, Core ML stops offering the model to the Neural Engine *entirely* — not op by op. On a synthetic chain of int4 per-channel matmuls, 1.61 GB of weights leaves all 96 ops ANE-eligible and ANE-scheduled, 2.15 GB leaves **zero** of 128, and the same 3.22 GB model spread over four ~1 GB files is back to 192 of 192. `gemma_chat/weight_shards.py` overrides the one coremltools hook that picks a constant's blob file and rolls over to `weight_1.bin`, `weight_2.bin`, … before the budget is spent; nothing else changes — same weights, same quantization, same cross-function deduplication.
+
+That is necessary but **not yet sufficient for this model**: with the blob capped at 2.03 GB, `--compute-units cpu-and-ne` still puts all 3935 `decode_512` ops on the CPU, because the ANE compiler rejects the graph for a second reason. A 5-layer export compiles for the ANE (455 of 728 ops eligible, 185 scheduled there); a 15-layer one already fails with
+
+```
+(ANECompiler) Error: live input tensor <private> not used in network
+(ANECompiler) Function call to BuildLayerGraph() failed in ZinCompilerCoreClassic.cpp:302
+```
+
+and the full 35-layer model takes `ANECompilerService` down with it (the XPC service exits mid-compile and Core ML falls back to CPU without reporting anything). `cpu-and-gpu` is unaffected and remains the shipping configuration.
+
 **KV caches: all state.** All 15 cache slots are exported as CoreML **state** — the model owns those buffers and updates them in place, so no cache ever crosses the model boundary and the Swift runtime never copies one. Only the int32 `sliding_pos_ring` stays ordinary I/O, because states must be floating point.
 
 The two halves get there differently. The 12 sliding-window caches are static-shaped from the start and are bound to state during StableHLO→MIL conversion. The 3 global caches carry a symbolic dim 1 through conversion (a state cannot have a flexible shape) and only become state afterwards, in the post-materialization MIL pass `gemma_chat/mil_passes/global_cache_states.py`, once every function has a concrete cache length. **Consequence for the runtime:** the state layout is now size-dependent — a state made from the `*_512` pair does not fit the `*_1024` pair, so growing the cache means making a new state and copying the old contents into it.
@@ -116,6 +127,7 @@ benchmarks/     Standalone Swift benchmark for model loading / first prediction
 - **Tokenizer errors** — re-run `uv run gemma-export`; it embeds the tokenizer inside the `.mlpackage` (the CLI falls back to downloading from Hugging Face if missing).
 - **`this model predates stateful KV caches`** — the `.mlpackage` was exported before the sliding KV caches became CoreML state. Re-run `uv run gemma-export`.
 - **Slow first load with `--compute-units all`** — ANE compilation can take 10–30 minutes, but is cached in `.mlmodelc` for subsequent runs.
+- **`cpu-and-ne` runs entirely on the CPU (0 mW ANE), then segfaults in prefill** — known and unfixed for the full 35-layer model; see the export section. `--compute-units cpu-only` fails the same way, so the segfault is BNNS executing this graph, not the ANE partitioning. Use `cpu-and-gpu`.
 
 ## License
 

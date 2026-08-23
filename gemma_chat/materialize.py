@@ -55,6 +55,7 @@ from typing import Sequence
 
 import coremltools as ct
 
+import gemma_chat.weight_shards  # noqa: F401  — caps blob files below 2 GiB
 from gemma_chat.mil_passes.concretize_cache_length import concretize_cache_length
 from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
 

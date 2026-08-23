@@ -45,6 +45,8 @@ import signal as _signal
 from pathlib import Path
 import numpy as np
 
+import gemma_chat.weight_shards  # noqa: F401  — caps blob files below 2 GiB
+
 
 def _inplace_bf16_to_f16(d: dict) -> None:
     """Recursively convert bfloat16 numpy leaves to float16 in-place."""
