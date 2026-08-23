@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from benchmarks.plot import plot_all
 from benchmarks.power import check_power_available
-from benchmarks.runner import BenchmarkConfig, RunResult, run_benchmark, save_results
+from benchmarks.runner import BenchmarkConfig, RunResult, run_benchmark
 
 
 # Default context lengths exercise both the short and long ends of the range.
@@ -90,13 +91,13 @@ def main() -> None:
         no_warmup=args.no_warmup,
     )
 
-    results = run_benchmark(config)
-
-    import time
     tag = time.strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir)
     json_path = output_dir / f"results-{tag}.json"
-    save_results(results, json_path, config)
+
+    results = run_benchmark(config, json_path)
+
+    print(f"\nsaved → {json_path}", flush=True)
     try:
         plot_all(json_path, output_dir / f"plots-{tag}")
     except ImportError:

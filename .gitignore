@@ -13,10 +13,13 @@ wheels/
 *.mlirbc
 *.mlpackage
 *.mlmodelc
+*.mlmodelc.src-sha256
 
 # IDE / editor
 .cursor/debug-*.log
 *.xcuserstate
+.swiftpm/
+xcuserdata/
 .DS_Store
 
 # Downloaded at build time (31 MB HuggingFace tokenizer vocab)

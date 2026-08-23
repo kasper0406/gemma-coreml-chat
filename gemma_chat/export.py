@@ -1,7 +1,10 @@
 """Export Gemma4-E2B chunk_prefill + decode_step as a CoreML .mlpackage.
 
 By default, both functions are merged into a single multifunction .mlpackage
-with shared (int4-quantized) weights, and the global KV caches are
+with shared quantized weights (per-channel int4 for matmul weights, since
+blockwise scales are not ANE-eligible; block-32 int4 for the CPU-side embedding
+tables; per-channel int8 for the logit projection — see
+``mil_passes/quantize_const_weights``), and the global KV caches are
 materialized into one concrete-shape function per size so the model runs on
 ANE / CPU as well as GPU.  Pass --no-materialize to keep RangeDim shapes for a
 single dynamic-shape function pair.
@@ -231,7 +234,7 @@ def _rename_model_io(
 
 
 def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
-    """Convert StableHLO to MIL with streaming int8/int4 quantization.
+    """Convert StableHLO to MIL with streaming int4/int8 weight quantization.
 
     ``states`` maps traced-argument indices to :class:`StateSpec` — see
     :func:`_kv_export_plan`.  Those arguments become Core ML state features and
@@ -247,8 +250,8 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     from coremltools.converters.mil import Builder as mb
 
     from gemma_chat.mil_passes.quantize_const_weights import (
-        _quantize_symmetric_blockwise,
-        _GROUP_SIZE,
+        _is_logit_projection,
+        _quantize_weight,
     )
     from gemma_chat.stablehlo_streaming_patch import (
         install_stablehlo_streaming_patch,
@@ -276,12 +279,16 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
         orig_dtype = arr.dtype
         if arr.dtype == np.float32:
             arr = arr.astype(np.float16)
-        nbits = 4
-        q_data, scale = _quantize_symmetric_blockwise(
-            arr, axis=0, group_size=_GROUP_SIZE, nbits=nbits,
-        )
+        # The logit projection is the one tensor int4 is too lossy for: it is
+        # read out as vocab-sized logits, and per-channel scales give it no
+        # grouping to fall back on.  Everything else stays int4.
+        nbits = 8 if _is_logit_projection(arr) else 4
+        q_data, scale = _quantize_weight(arr, nbits=nbits)
         del arr
-        _stream_counter[0] += 1
+        if nbits == 8:
+            _stream_counter[1] += 1
+        else:
+            _stream_counter[0] += 1
         _stream_counter[2] += q_data.nbytes * 2
         total = _stream_counter[0] + _stream_counter[1]
         if total % 20 == 0:
@@ -291,7 +298,7 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
                 f"({_stream_counter[2] / 1e9:.2f} GB)  RSS={_rss_mb():.0f} MB",
                 flush=True,
             )
-        suffix = "_int4"
+        suffix = f"_int{nbits}"
         result = mb.constexpr_blockwise_shift_scale(
             data=q_data, scale=scale, name=name + suffix,
         )
@@ -314,10 +321,12 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     finally:
         set_streaming_quantizer(None)
 
-    if _stream_counter[0]:
+    if _stream_counter[0] or _stream_counter[1]:
         print(
-            f"  StableHLO→MIL done — streaming-quantized {_stream_counter[0]} tensors "
-            f"({_stream_counter[1] / 1e9:.2f} GB fp16 → int4).",
+            f"  StableHLO→MIL done — streaming-quantized "
+            f"{_stream_counter[0] + _stream_counter[1]} tensors "
+            f"({_stream_counter[0]} int4 + {_stream_counter[1]} int8, "
+            f"{_stream_counter[2] / 1e9:.2f} GB fp16).",
             flush=True,
         )
     else:

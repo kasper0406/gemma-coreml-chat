@@ -231,7 +231,11 @@ struct GemmaBenchMain {
         if args.warmup {
             let primer = syntheticPrompt(length: 16, seed: -1)
             var warmedUp = 0
-            let stream = engine.generate(promptIDs: primer, maxNewTokens: 2)
+            // respectStopTokens: false — the synthetic prompt makes the model
+            // sample a stop token immediately, which would cut the run short.
+            let stream = engine.generate(
+                promptIDs: primer, maxNewTokens: 2, respectStopTokens: false
+            )
             do {
                 for try await _ in stream { warmedUp += 1 }
             } catch {
@@ -251,6 +255,8 @@ struct GemmaBenchMain {
             promptIDs: prompt,
             maxNewTokens: args.decodeTokens + 1,       // +1 because engine yields the sample
                                                        // from prefill logits before any decode.
+            respectStopTokens: false                   // keep decoding through stop tokens so
+                                                       // every cell measures the same step count.
         )
         do {
             var first = true

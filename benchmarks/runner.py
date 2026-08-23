@@ -11,6 +11,7 @@ does not do reliably.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import subprocess
 import time
@@ -213,7 +214,12 @@ def run_single(
 # ---------------------------------------------------------------------------
 
 
-def run_benchmark(config: BenchmarkConfig) -> list[RunResult]:
+def run_benchmark(config: BenchmarkConfig, output_path: Path) -> list[RunResult]:
+    """Run the full matrix, rewriting `output_path` after every completed run.
+
+    Results are persisted incrementally so a crash (or an OOM kill) loses at
+    most the run that was in flight.
+    """
     exe = ensure_swift_bench_built()
     results: list[RunResult] = []
     n_cfg = len(config.backends) * len(config.context_lengths) * config.num_runs
@@ -223,6 +229,7 @@ def run_benchmark(config: BenchmarkConfig) -> list[RunResult]:
         f"context lengths × {config.num_runs} runs)",
         flush=True,
     )
+    print(f"Results → {output_path} (rewritten after every run)", flush=True)
     i = 0
     for backend in config.backends:
         for context_length in config.context_lengths:
@@ -244,10 +251,12 @@ def run_benchmark(config: BenchmarkConfig) -> list[RunResult]:
                         flush=True,
                     )
                 results.append(r)
+                save_results(results, output_path, config)
     return results
 
 
 def save_results(results: list[RunResult], path: Path, config: BenchmarkConfig) -> None:
+    """Write the results JSON atomically (temp file in the same dir + rename)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     out = {
         "timestamp": time.strftime("%FT%T%z"),
@@ -259,5 +268,6 @@ def save_results(results: list[RunResult], path: Path, config: BenchmarkConfig) 
         "config": config.to_dict(),
         "results": [asdict(r) for r in results],
     }
-    path.write_text(json.dumps(out, indent=2))
-    print(f"  saved → {path}", flush=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(out, indent=2))
+    os.replace(tmp, path)
