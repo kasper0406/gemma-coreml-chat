@@ -10,7 +10,9 @@ MAX_SEQ_LEN = 65536
 # Number of tokens processed per chunked-prefill call.
 # Chosen to roughly balance compute and memory-bandwidth on A-series chips,
 # and to allow eager prefill as the user types.
-CHUNK_SIZE = 8
+# Every materialized cache size must be >= CHUNK_SIZE (a chunk has to fit in
+# the cache); `gemma-export` enforces that on --materialize-sizes.
+CHUNK_SIZE = 128
 
 # Full Gemma4-E2B architecture (35 layers: 7 × [SLIDING×4, GLOBAL])
 _ATTENTION_PATTERN = (

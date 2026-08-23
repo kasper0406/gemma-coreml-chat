@@ -9,7 +9,7 @@ outputs flow into attention masking — and those ops are **only supported by
 the GPU backend**.  CPU and ANE refuse to load the model.
 
 At runtime the KV cache is grown by a factor of 2 on exhaustion, so in
-practice only a handful of concrete sizes are ever observed: 8, 16, 32, …,
+practice only a handful of concrete sizes are ever observed: 512, 1024, …,
 65536.  This utility takes a dynamic-shape model and materializes one
 concrete-shape function per power of 2, via CoreML's built-in
 `materialize_symbolic_shape_program` MIL pass.  The resulting multifunction
@@ -18,6 +18,17 @@ model has:
 - **No** dynamic shape ops in any function (each is specialized to a concrete
   cache length, so the shape → range → mask chain folds to a constant).
 - Deduplicated constants — all sizes share the same int4 weights.
+- The global KV caches as Core ML **state** instead of I/O: concrete shapes are
+  exactly what state features were missing, so `global_kv_caches_to_states`
+  runs here, right after materialization.  Note this makes the state layout
+  size-dependent — a state made from `prefill_512` fits only the `*_512`
+  pair, and growing the cache means migrating contents into a new state.
+- The cache *length* folded in as a constant: JAX's dimension-variable argument
+  `N` is a value, not a shape, so materialization leaves it a runtime input and
+  the global attention mask symbolic.  `concretize_cache_length` replaces it,
+  which makes every shape concrete and drops `N` from the signature.  The
+  attention fusion is deliberately *not* re-run afterwards — see
+  `_concretize_cache_lengths` for the two Apple defects that keeps us clear of.
 
 The runtime picks the function whose size matches the current cache length.
 
@@ -45,6 +56,10 @@ from typing import Sequence
 
 import coremltools as ct
 
+import gemma_chat.weight_shards  # noqa: F401  — caps blob files below 2 GiB
+from gemma_chat.mil_passes.concretize_cache_length import concretize_cache_length
+from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
+
 
 # Default: powers of 2 from 512 to MAX_SEQ_LEN (65536).
 # Starting at 512 avoids compiling tiny functions that would never be used
@@ -52,6 +67,58 @@ import coremltools as ct
 DEFAULT_SIZES: tuple[int, ...] = tuple(
     2 ** k for k in range(9, 17)   # 512, 1024, 2048, ..., 65536
 )
+
+
+def _concretize_cache_lengths(prog, function_name_to_length: dict[str, int]) -> None:
+    """Fold each function's cache length in, then clean up.
+
+    Folding ``N`` in is load-bearing regardless of attention fusion: it is what
+    makes the global attention mask (``range_1d(end=N)``,
+    ``fill(shape=[1, H, 1, N])``) concrete, so no function keeps a symbolic
+    shape, and it is what removes ``N`` from the signature the Swift runtime
+    binds against.  ``dead_code_elimination`` then drops what folding it in made
+    unreachable (it keeps ``coreml_update_state`` explicitly, so the cache
+    writes survive).
+
+    **Why the attention fusion is deliberately NOT re-run here.**  Concrete
+    shapes would let ``common::fuse_attention_to_sdpa`` finally collect the
+    *global* attention sites it had to skip during export (it bails on symbolic
+    dimensions; the *sliding* sites were always concrete, are fused at convert
+    time, and stay fused — they are not affected by either defect below).
+    Fusing the global sites trips two Apple bugs, both on macOS 26.5:
+
+    1. **ANE partitioner.** Once a function holds two or more global SDPAs,
+       ANECCompile() fails on the segment containing the *deepest* one with
+       "live input tensor not used in network", and the whole model silently
+       drops off the Neural Engine.  Bisected on truncated exports: a 9-layer
+       model (one global layer) compiles every procedure; the 10-layer model
+       (two global layers) stops one procedure short and logs that message —
+       scratchpad artifacts ``bisect/L9.*`` vs ``bisect/L10.*``.
+    2. **BNNS.** A fused global SDPA SIGSEGVs when a CPU segment executes it
+       with query length >= 2 — i.e. every chunk-128 prefill, on ``cpu-only``
+       and on the CPU segments of ``cpu-and-ne``.  Minimal repro:
+       ``scratchpad/bisect/synth_sdpa3.py 8 128 512 512 mq`` (one fp16 SDPA at
+       the global site's shape, with the attention-scale ``mul`` feeding the
+       query) exits 139.  ``Lq=1`` passes and ``Lq=2`` crashes; the ``+f32``
+       and ``+decomp`` variants pass, and so does ``plain`` — the producer op
+       on the query is part of the trigger.
+
+    Leaving the global sites as the ``matmul → add(mask) → softmax → matmul``
+    they already are avoids both.  When Apple fixes either defect, re-running
+    ``common::fuse_attention_to_sdpa`` here (plus DCE) is all it takes to get
+    the fused form back — benchmark it against the decomposed form first.
+    """
+    from coremltools.converters.mil.mil.passes.pass_pipeline import (
+        PassPipelineManager as _PassPipelineManager,
+    )
+
+    pass_obj = concretize_cache_length()
+    pass_obj.function_name_to_length = function_name_to_length
+    pass_obj.apply(prog)
+
+    pipeline = ct.PassPipeline.EMPTY
+    pipeline.append_pass("common::dead_code_elimination")
+    _PassPipelineManager.apply_pipeline(prog, pipeline)
 
 
 def _function_inputs(spec, function_name: str):
@@ -156,7 +223,18 @@ def _materialize_single_function(
             "source_function_name": source_function_name,
         },
     )
+    kept_weight_ids = _weight_ids(prog)
     _PassPipelineManager.apply_pipeline(prog, pipeline)
+    _scope_auto_weight_ids(prog, source_function_name, target_prefix, kept_weight_ids)
+
+    # Now that every function has concrete shapes, the global KV caches can
+    # become Core ML state like the sliding ones already are.
+    global_kv_caches_to_states().apply(prog)
+
+    # The cache *length* is still a runtime input; fold it in.
+    _concretize_cache_lengths(
+        prog, {f"{target_prefix}_{size}": size for size in sizes}
+    )
 
     # After materialization, point the default at one of the new functions.
     # (The upstream helper hard-codes "main", which breaks for non-"main"
@@ -199,6 +277,57 @@ def _clear_weight_ids(prog) -> None:
         for op in fn.operations:
             if op.op_type == "const" and getattr(op, "weight_id", None) is not None:
                 op.weight_id = None
+
+
+def _weight_ids(prog) -> set[str]:
+    """Return the ``weight_id``s currently set on any const in the program."""
+    return {
+        op.weight_id
+        for fn in prog.functions.values()
+        for op in fn.operations
+        if op.op_type == "const" and getattr(op, "weight_id", None) is not None
+    }
+
+
+def _scope_auto_weight_ids(
+    prog, source_function_name: str, target_prefix: str, kept: set[str],
+) -> None:
+    """Make the materialize pass's invented ``weight_id``s unique per source fn.
+
+    ``materialize_symbolic_shape_program`` gives every const it clones that has
+    no ``weight_id`` one derived from the const's *name* alone
+    (``const_{name}_weight_id``).  Const names are only unique within a
+    function, so two source functions that each hold a differently-shaped const
+    of the same name — ``prefill``'s ``range_1d_0`` is ``int32[CHUNK_SIZE]``,
+    ``decode``'s is ``int32[sliding_window]`` — end up claiming one weight-blob
+    entry.  The blob then holds one of them and the other function declares a
+    shape the blob cannot supply, so the model fails to load with
+    *"Attribute val has incompatible type with operation output"*.
+
+    (Nothing caught this before CHUNK_SIZE grew: consts of fewer than 10
+    elements are stored inline in the proto and never reach the blob at all.)
+
+    Rewriting those ids to include the source function name keeps every clone of
+    one source const sharing a blob entry — all sizes of a phase are clones —
+    while separating the phases.  Ids in ``kept`` (assigned by
+    ``const_deduplication``, which groups by dtype + shape + value) are left
+    alone; those are the ones that must keep sharing across phases, and they are
+    the reason the artifact is the size of one weight set rather than two.
+    """
+    for fname, fn in prog.functions.items():
+        # The clones, plus the source itself when it survives to the save.
+        if fname != source_function_name and not fname.startswith(f"{target_prefix}_"):
+            continue
+        for op in fn.operations:
+            if op.op_type != "const":
+                continue
+            weight_id = getattr(op, "weight_id", None)
+            if weight_id is None or weight_id in kept:
+                continue
+            # The public setter is write-once (it asserts the id is unset), so
+            # clear the backing field before re-scoping.
+            op._weight_id = None
+            op.weight_id = f"{source_function_name}::{op.name}"
 
 
 def _materialize_multifunction_source(
@@ -264,6 +393,7 @@ def _materialize_multifunction_source(
             )
         src_specs.append((src_fn, flexibles))
 
+    kept_weight_ids = _weight_ids(prog)
     for src_fn, flexibles in src_specs:
         mat_map: dict[str, dict[str, tuple[int, ...]]] = {}
         for size in sizes:
@@ -278,10 +408,22 @@ def _materialize_multifunction_source(
         pass_obj.source_function_name = src_fn
         pass_obj.function_name_to_materialization_map = mat_map
         pass_obj.apply(prog)
+        _scope_auto_weight_ids(prog, src_fn, src_fn, kept_weight_ids)
 
     for src_fn, _ in src_specs:
         if src_fn in prog.functions:
             del prog.functions[src_fn]
+
+    # Concrete shapes everywhere now, so the global KV caches can become Core ML
+    # state like the sliding ones already are.  Must run after the source
+    # functions are dropped — those still carry symbolic cache lengths.
+    global_kv_caches_to_states().apply(prog)
+
+    # The cache *length* is still a runtime input; fold it in.
+    _concretize_cache_lengths(
+        prog,
+        {f"{src_fn}_{size}": size for src_fn, _ in src_specs for size in sizes},
+    )
 
     # Smallest decode (if present) as default — least work on load; matches
     # gemma-export's convention.

@@ -1,8 +1,9 @@
 /// Eager prefill manager: prefills prompt chunks in the background as the user types.
 ///
-/// When the tokenized input crosses a CHUNK_SIZE boundary, the newly-complete
-/// chunk is prefilled immediately, so by the time the user taps Send, most or
-/// all prefill work is already done.
+/// When the tokenized input crosses a chunk boundary, the newly-complete chunk
+/// is prefilled immediately, so by the time the user taps Send, most or all
+/// prefill work is already done. The chunk width is whatever the loaded model
+/// declares (``CoreMLModel/chunkSize``), never a constant of our own.
 ///
 /// Thread safety: this is a Swift actor, so all state mutation is serialized.
 
@@ -25,7 +26,7 @@ actor EagerPrefillManager {
 
     /// Tokens that have been prefilled so far.
     private var prefillTokens: [Int] = []
-    /// How many complete CHUNK_SIZE chunks have been prefilled.
+    /// How many complete chunks have been prefilled.
     private var completedChunks: Int = 0
     /// Current KV cache state after the last completed chunk.
     private var kvState: KVCacheState
@@ -41,19 +42,24 @@ actor EagerPrefillManager {
         self.engine = engine
         self.tokenizer = tokenizer
         self.model = model
-        // Initial empty state is a tiny allocation (no global size override) — safe to force.
+        // Smallest materialized pair, which `CoreMLModel.load` always brings
+        // up, so the state can be made without awaiting a load — safe to force.
         self.kvState = try! model.makeEmptyKVState()
     }
+
+    /// Tokens per prefill call, as the loaded artifact declares it. Never
+    /// assume a value here: a decode-only build prefills one token at a time,
+    /// a full build a whole chunk.
+    private var chunkSize: Int { model.chunkSize }
 
     /// Most tokens we may eagerly prefill: whole chunks only, and never past
     /// what the loaded model can hold.
     ///
-    /// `CoreMLModel.materializedSize` clamps to the largest size actually
-    /// loaded, so without this cap a long prompt would size the cache to that
-    /// clamped value and then chunk right past the end of it — the prefill path
-    /// has no per-position guard of its own the way the decode loop does.
+    /// `KVCacheSizePolicy` clamps to the largest size actually loaded, so
+    /// without this cap a long prompt would size the cache to that clamped
+    /// value and then chunk right past the end of it.
     private var maxEagerTokens: Int {
-        (model.effectiveMaxSeqLen / GemmaConfig.chunkSize) * GemmaConfig.chunkSize
+        (model.effectiveMaxSeqLen / chunkSize) * chunkSize
     }
 
     /// Called when the user's input text changes.
@@ -82,7 +88,7 @@ actor EagerPrefillManager {
         )
 
         // Check if existing prefill is still valid
-        let prefillBoundary = completedChunks * GemmaConfig.chunkSize
+        let prefillBoundary = completedChunks * chunkSize
         if prefillBoundary > 0 {
             let isValid = newTokens.count >= prefillBoundary
                 && newTokens.prefix(prefillBoundary).elementsEqual(prefillTokens.prefix(prefillBoundary))
@@ -98,7 +104,7 @@ actor EagerPrefillManager {
         if eagerTokens < newTokens.count {
             Log.info("[Perf] Eager prefill capped at \(eagerTokens)/\(newTokens.count) tokens (model max \(model.effectiveMaxSeqLen))")
         }
-        let totalChunks = eagerTokens / GemmaConfig.chunkSize
+        let totalChunks = eagerTokens / chunkSize
         if totalChunks > completedChunks {
             await prefillNewChunks(tokens: newTokens, upToChunk: totalChunks)
         }
@@ -137,7 +143,7 @@ actor EagerPrefillManager {
         let promptIDs = finalTokens.map { Int32($0) }
 
         // Check if our prefill is still valid for the final tokens
-        let prefillBoundary = completedChunks * GemmaConfig.chunkSize
+        let prefillBoundary = completedChunks * chunkSize
         let isValid = prefillBoundary > 0
             && finalTokens.count >= prefillBoundary
             && finalTokens.prefix(prefillBoundary).elementsEqual(prefillTokens.prefix(prefillBoundary))
@@ -181,7 +187,7 @@ actor EagerPrefillManager {
             return
         }
         prefillTokens = cached.map { Int($0) }
-        completedChunks = cached.count / GemmaConfig.chunkSize
+        completedChunks = cached.count / chunkSize
         kvState = kv
         lastLogits = nil
         isPrefilling = false
@@ -211,37 +217,30 @@ actor EagerPrefillManager {
         let batchStart = CFAbsoluteTimeGetCurrent()
 
         do {
-            // Size/grow global caches to fit all chunks we're about to process,
+            // Size/grow the caches to fit all chunks we're about to process,
             // via the model's own bucketing policy so the cache shape and the
-            // resolved `prefill_<N>` function agree.
-            if !model.globalKVInputNames.isEmpty {
-                let neededSize = upToChunk * GemmaConfig.chunkSize
-                let roundedSize = model.cacheSizePolicy.size(forNeeded: neededSize)
-                if startChunk == 0 {
-                    kvState = try model.makeEmptyKVState(initialGlobalSize: roundedSize)
-                } else {
-                    kvState = try kvState.grownToFit(
-                        needed: roundedSize, policy: model.cacheSizePolicy
-                    )
-                }
-                try await model.ensureLoaded(forGlobalCacheSize: roundedSize)
+            // resolved `prefill_<N>` function agree. The pair has to be loaded
+            // first: a cache's state buffers are made from its own handle.
+            let roundedSize = model.cacheSizePolicy.size(forNeeded: upToChunk * chunkSize)
+            try await model.ensureLoaded(forGlobalCacheSize: roundedSize)
+            if startChunk == 0 {
+                kvState = try model.makeEmptyKVState(size: roundedSize)
+            } else {
+                kvState = try await model.grownToFit(kvState, needed: roundedSize)
             }
             for chunkIdx in startChunk..<upToChunk {
                 let chunkStart = CFAbsoluteTimeGetCurrent()
-                let start = chunkIdx * GemmaConfig.chunkSize
-                let chunkTokens = Array(tokens[start..<(start + GemmaConfig.chunkSize)])
+                let start = chunkIdx * chunkSize
+                let chunkTokens = Array(tokens[start..<(start + chunkSize)])
                     .map { Int32($0) }
 
                 status = .prefilling(completed: chunkIdx, total: upToChunk)
 
-                let (logits, newKV) = try await engine.prefillSingleChunk(
+                lastLogits = try await engine.prefillSingleChunk(
                     chunkTokens: chunkTokens,
                     startPosition: start,
                     kvState: kvState
                 )
-
-                kvState = newKV
-                lastLogits = logits
                 completedChunks = chunkIdx + 1
                 prefillTokens = tokens
 

@@ -1,33 +1,51 @@
 /// KV cache state for Gemma4-E2B CoreML inference.
 ///
-/// Split in two, matching how the model declares its caches:
+/// Every KV cache is a CoreML **state** feature: the sliding-window caches and
+/// the global-attention ones (`k_4`/`v_4`, `k_9`/`v_9`, `k_14`/`v_14`) alike.
+/// The model reads them with `read_state` and writes them back with
+/// `coreml_update_state`, so no cache tensor crosses the prediction boundary —
+/// which is what makes decode cost independent of context length. The one
+/// exception is `sliding_pos_ring`: CoreML states must be floating point, so
+/// the int32 ring stays an ordinary input/output.
 ///
-/// - The 12 **sliding-window** caches are CoreML *state*. They never cross the
-///   model boundary: `MLState` owns the buffers, the model updates them in
-///   place, and all we carry is the handle. Nothing to copy per step.
-/// - The 3 **global** caches (symbolic dim 1) and the int32 `sliding_pos_ring`
-///   are ordinary inputs/outputs, held here as `MLMultiArray`s keyed by input
-///   name and deep-copied out of every prediction (CoreML reuses output
-///   buffers).
+/// A materialized function bakes its state shapes in, so an `MLState` belongs
+/// to exactly one size N: it is created from the `decode_N` / `prefill_N`
+/// handle and no other pair will accept it. Growing the context therefore means
+/// allocating a state on the *next* size's handle and migrating the contents —
+/// see ``CoreMLModel/grownToFit(_:needed:)``.
 ///
-/// A conversation reset means a *fresh* `MLState` as well as fresh arrays —
-/// reusing the state while resetting `sliding_pos_ring` would leave stale K/V
-/// in ring slots that later positions mark valid again.
+/// This object also owns the per-conversation prediction scratch: the ring
+/// double buffer, the reusable token/position input buffers, and the logits
+/// output backings. Keeping them here rather than on ``CoreMLModel`` is what
+/// lets two caches coexist (iOS runs an eager-prefill cache alongside the one
+/// the current generation is decoding into) without writing over each other.
+///
+/// A conversation reset means a *fresh* `KVCacheState`, never a reused one with
+/// a cleared ring: stale K/V left in a sliding slot becomes valid again the
+/// moment a re-populated `sliding_pos_ring` points at it.
 
 import CoreML
+import CoreVideo
 import Foundation
 
-/// Errors raised while building or updating a KV cache state.
+/// Errors raised while allocating, migrating, or feeding the KV cache.
 public enum KVCacheError: Error, LocalizedError {
-    case missingOutputTensor(String)
-    case missingShapeOrDtype(String)
+    /// A state can only be made from the function pair it belongs to, and that
+    /// pair has not been loaded yet.
+    case functionNotLoaded(size: Int)
+    /// Could not allocate a prediction buffer of the requested shape.
+    case bufferAllocationFailed(shape: [Int], dataType: MLMultiArrayDataType)
+    /// An MLMultiArray had a dtype/shape/stride we can't safely memcpy.
+    case unexpectedBufferLayout(String)
 
     public var errorDescription: String? {
         switch self {
-        case .missingOutputTensor(let name):
-            "Missing KV output tensor: \(name)"
-        case .missingShapeOrDtype(let name):
-            "Missing shape or dtype for KV input '\(name)'"
+        case .functionNotLoaded(let size):
+            "No loaded function for cache size \(size) — call ensureLoaded(forGlobalCacheSize:) first"
+        case .bufferAllocationFailed(let shape, let dataType):
+            "Could not allocate a \(shape) buffer of dtype \(dataType.rawValue)"
+        case .unexpectedBufferLayout(let reason):
+            "Unexpected MLMultiArray layout: \(reason)"
         }
     }
 }
@@ -35,25 +53,24 @@ public enum KVCacheError: Error, LocalizedError {
 /// The single source of truth for how big a global KV cache may be.
 ///
 /// A materialized model can only run the concrete sizes it was exported with,
-/// so **every** place that allocates or grows a global cache has to round
-/// through this one policy. Rounding independently — "next power of two" — is
-/// only accidentally correct for the default contiguous power-of-two export:
-/// with `--materialize-sizes 512,2048`, crossing 512 tokens grows the cache to
-/// 1024 while `CoreMLModel.functionName(prefix:cacheSize:)` resolves
-/// `decode_2048`, and every turn then fails on a shape mismatch.
+/// so **every** place that allocates or grows a cache has to round through this
+/// one policy. Rounding independently — "next power of two" — is only
+/// accidentally correct for the default contiguous power-of-two export: with
+/// `--materialize-sizes 512,2048`, crossing 512 tokens grows the cache to 1024
+/// while function resolution picks `decode_2048`, and every turn then fails on
+/// a shape mismatch.
 ///
-/// Vend one from ``CoreMLModel/cacheSizePolicy`` rather than constructing it
-/// ad hoc: the model wrapper is what knows the sizes that were actually loaded.
+/// Vend one from ``CoreMLModel/cacheSizePolicy`` rather than constructing it ad
+/// hoc: the model wrapper is what knows the sizes that were actually loaded.
 public struct KVCacheSizePolicy: Sendable {
-    /// Concrete materialized sizes in ascending order, or nil for standard
-    /// (RangeDim) models, which accept any dim-1.
-    public let materializedSizes: [Int]?
+    /// Concrete materialized sizes in ascending order.
+    public let materializedSizes: [Int]
 
     /// Largest cache size the loaded model can serve.
     public let maxLen: Int
 
-    public init(materializedSizes: [Int]?, maxLen: Int) {
-        self.materializedSizes = materializedSizes?.sorted()
+    public init(materializedSizes: [Int], maxLen: Int) {
+        self.materializedSizes = materializedSizes.sorted()
         self.maxLen = maxLen
     }
 
@@ -64,109 +81,327 @@ public struct KVCacheSizePolicy: Sendable {
     /// model — a clamped cache cannot hold every requested position.
     public func size(forNeeded needed: Int) -> Int {
         let clamped = min(max(needed, 1), maxLen)
-        if let sizes = materializedSizes, let largest = sizes.last {
-            return sizes.first { $0 >= clamped } ?? largest
-        }
-        var pow2 = 1
-        while pow2 < clamped { pow2 *= 2 }
-        return min(pow2, maxLen)
+        guard let largest = materializedSizes.last else { return clamped }
+        return materializedSizes.first { $0 >= clamped } ?? largest
     }
 }
 
-/// Immutable snapshot of the KV cache state.
-/// Each prediction returns a new KVCacheState with updated arrays; the sliding
-/// caches inside `slidingCaches` are mutated in place by the prediction itself.
-public struct KVCacheState: @unchecked Sendable {
-    /// Global KV caches and `sliding_pos_ring`, keyed by model input name.
-    public let arraysByName: [String: MLMultiArray]
+/// Live KV cache for one conversation, bound to one materialized size.
+///
+/// Predictions mutate it in place (the `MLState` buffers by the model itself,
+/// the ring by the double-buffer swap below), so callers hold one instance for
+/// as long as the conversation lives rather than threading snapshots around.
+public final class KVCacheState: @unchecked Sendable {
+    /// Materialized cache length this state is bound to. Only the
+    /// `decode_<size>` / `prefill_<size>` pair accepts it.
+    public let size: Int
 
-    /// Ordered input names (declaration order from model spec).
-    public let inputNames: [String]
+    /// All KV caches, sliding and global, updated in place by every prediction.
+    let caches: MLState
 
-    /// Names of KV inputs with flexible (RangeDim) shapes — the global caches.
-    public let globalNames: Set<String>
+    /// `sliding_pos_ring`, double-buffered: `ring` holds the live contents fed
+    /// to the next prediction and `ringSpare` is handed to CoreML as that same
+    /// prediction's output backing. One buffer cannot be both — CoreML would be
+    /// reading the ring while overwriting it.
+    private var ringBuffers: [MLMultiArray]
+    private var ringIndex = 0
 
-    /// CoreML state buffers holding the sliding-window KV caches.
-    ///
-    /// Shared across every function of the model — one `MLState` made on any
-    /// loaded instance is accepted by `decode_512`, `prefill_1024`, … and they
-    /// all see the same buffers, keyed by state name. Predictions using the
-    /// same state must be serialized, which the engine's loops already are.
-    public let slidingCaches: MLState
+    /// Reusable int32 scalars for the token and position inputs. Allocating
+    /// these per decode step showed up as pure overhead once the KV caches
+    /// stopped crossing the boundary.
+    let tokenScalar: MLMultiArray
+    let positionScalar: MLMultiArray
 
-    /// Current dim-1 size of global caches, or nil if none.
-    public var currentGlobalCacheSize: Int? {
-        for name in globalNames {
-            if let arr = arraysByName[name] {
-                return arr.shape[1].intValue
-            }
-        }
-        return nil
-    }
+    /// Reusable `[1, chunkSize]` int32 buffer for prefill token chunks.
+    let chunkTokens: MLMultiArray
 
-    public init(
-        arraysByName: [String: MLMultiArray],
-        inputNames: [String],
-        globalNames: Set<String>,
-        slidingCaches: MLState
-    ) {
-        self.arraysByName = arraysByName
-        self.inputNames = inputNames
-        self.globalNames = globalNames
-        self.slidingCaches = slidingCaches
-    }
+    /// Decode logits output backings, alternating so the array returned by step
+    /// N survives until step N+1 has been sampled. Allocated on first decode,
+    /// so a cache that only ever prefills never pays for them.
+    private var decodeLogitsBackings: [MLMultiArray] = []
+    private var decodeLogitsIndex = 0
 
-    /// Create an empty state from pre-extracted KV shapes/dtypes.
-    /// Global caches are sized to `initialGlobalSize` instead of the spec shape.
-    /// Float* arrays are zero-filled; Int32 arrays are filled with -1.
-    ///
-    /// `slidingCaches` must be a **fresh** `MLState` (`CoreMLModel.makeState()`)
-    /// unless the caller deliberately wants to keep the sliding caches — CoreML
-    /// zero-fills a newly made state. Prefer ``CoreMLModel/makeEmptyKVState(initialGlobalSize:)``,
-    /// which pairs the two correctly.
-    public static func empty(
-        kvInputNames: [String],
-        shapes: [String: [NSNumber]],
-        dtypes: [String: MLMultiArrayDataType],
-        globalNames: Set<String> = [],
-        initialGlobalSize: Int? = nil,
-        slidingCaches: MLState
-    ) throws -> KVCacheState {
-        var dict: [String: MLMultiArray] = [:]
-        for name in kvInputNames {
-            guard let specShape = shapes[name], let dtype = dtypes[name] else {
-                throw KVCacheError.missingOutputTensor(name)
-            }
-            var shape = specShape.map { $0.intValue }
-            // Override dim-1 for global caches when dynamic sizing is active
-            if let size = initialGlobalSize, globalNames.contains(name), shape.count == 4 {
-                shape[1] = size
-            }
-            let nsShape = shape.map { NSNumber(value: $0) }
-            dict[name] = try allocateZeroedKV(shape: nsShape, dtype: dtype)
-        }
-        return KVCacheState(
-            arraysByName: dict,
-            inputNames: kvInputNames,
-            globalNames: globalNames,
-            slidingCaches: slidingCaches
+    /// Prefill logits output backing (`[chunkSize, vocab]`), allocated on first
+    /// prefill. Single, not double: the caller copies the one row it wants out
+    /// before the next chunk runs.
+    private var prefillLogitsBacking: MLMultiArray?
+
+    /// Set once CoreML has been seen to ignore an output backing, so the
+    /// diagnostic is logged a single time per conversation instead of per step.
+    private var warnedAboutIgnoredBacking = false
+
+    init(
+        size: Int,
+        caches: MLState,
+        ringShape: [NSNumber],
+        ringDataType: MLMultiArrayDataType,
+        chunkSize: Int
+    ) throws {
+        self.size = size
+        self.caches = caches
+        // -1 is the "empty slot" sentinel: a zeroed ring would claim position 0
+        // is live in every sliding slot.
+        self.ringBuffers = [
+            try PredictionBuffer.make(shape: ringShape, dataType: ringDataType, fill: -1),
+            try PredictionBuffer.make(shape: ringShape, dataType: ringDataType, fill: -1),
+        ]
+        self.tokenScalar = try MLMultiArray(shape: [1], dataType: .int32)
+        self.positionScalar = try MLMultiArray(shape: [1], dataType: .int32)
+        self.chunkTokens = try MLMultiArray(
+            shape: [1, NSNumber(value: chunkSize)], dataType: .int32
         )
     }
 
-    /// Allocate an MLMultiArray and initialize it for KV-cache use.
-    /// MLMultiArray does NOT guarantee zero initialization, so we explicitly
-    /// zero float arrays and fill int32 arrays with -1 (the "empty slot" sentinel).
-    static func allocateZeroedKV(
-        shape: [NSNumber], dtype: MLMultiArrayDataType
+    // MARK: - Prediction scratch
+
+    /// The ring contents to feed the next prediction.
+    var ring: MLMultiArray { ringBuffers[ringIndex] }
+
+    /// The buffer to hand CoreML as the next prediction's ring output backing.
+    var ringSpare: MLMultiArray { ringBuffers[1 - ringIndex] }
+
+    /// Take `produced` — whatever the prediction actually returned for the ring
+    /// output — as the new live ring. When CoreML honoured our backing this is
+    /// a pointer swap; when it allocated its own buffer we copy into the spare,
+    /// because the framework's buffer may be recycled by the next prediction.
+    func adoptRing(_ produced: MLMultiArray) throws {
+        if produced !== ringSpare {
+            noteIgnoredBacking("sliding_pos_ring")
+            try PredictionBuffer.copyPrefix(from: produced, to: ringSpare, what: "sliding_pos_ring")
+        }
+        ringIndex = 1 - ringIndex
+    }
+
+    /// Next decode logits backing, alternating between two buffers.
+    func nextDecodeLogitsBacking(
+        shape: [NSNumber], dataType: MLMultiArrayDataType
     ) throws -> MLMultiArray {
-        let array = try MLMultiArray(shape: shape, dataType: dtype)
-        if dtype == .int32 {
-            let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: array.count)
-            for i in 0..<array.count { ptr[i] = -1 }
+        if decodeLogitsBackings.isEmpty {
+            decodeLogitsBackings = [
+                try PredictionBuffer.make(shape: shape, dataType: dataType),
+                try PredictionBuffer.make(shape: shape, dataType: dataType),
+            ]
+        }
+        decodeLogitsIndex = 1 - decodeLogitsIndex
+        return decodeLogitsBackings[decodeLogitsIndex]
+    }
+
+    /// The prefill logits backing, allocated on first use.
+    func prefillLogits(
+        shape: [NSNumber], dataType: MLMultiArrayDataType
+    ) throws -> MLMultiArray {
+        if let existing = prefillLogitsBacking { return existing }
+        let fresh = try PredictionBuffer.make(shape: shape, dataType: dataType)
+        prefillLogitsBacking = fresh
+        return fresh
+    }
+
+    /// Log once per conversation that CoreML declined a preallocated backing —
+    /// correctness is unaffected (we copy), but every step pays an allocation.
+    func noteIgnoredBacking(_ feature: String) {
+        guard !warnedAboutIgnoredBacking else { return }
+        warnedAboutIgnoredBacking = true
+        Log.info("[CoreML] Output backing for '\(feature)' was not used by the framework — predictions will allocate their own buffers")
+    }
+
+    /// Write a scalar into one of the reusable int32 inputs.
+    func setScalar(_ value: Int32, in array: MLMultiArray) {
+        array.withUnsafeMutableBufferPointer(ofType: Int32.self) { ptr, _ in
+            ptr[0] = value
+        }
+    }
+
+    /// Fill the reusable prefill token buffer. `tokens.count` must match the
+    /// model's chunk size, which the engine guarantees by padding.
+    func loadChunk(_ tokens: [Int32]) throws {
+        guard tokens.count == chunkTokens.count else {
+            throw KVCacheError.unexpectedBufferLayout(
+                "prefill chunk has \(tokens.count) tokens, model expects \(chunkTokens.count)"
+            )
+        }
+        chunkTokens.withUnsafeMutableBufferPointer(ofType: Int32.self) { ptr, _ in
+            for (i, t) in tokens.enumerated() { ptr[i] = t }
+        }
+    }
+
+    // MARK: - Growth
+
+    /// Copy every cache — and the ring — from `old` into `self`.
+    ///
+    /// State buffers are row-major `[1, length, …]`, so "the first N rows" is a
+    /// byte prefix: one `memcpy` of `min(oldBytes, newBytes)` handles both the
+    /// sliding caches (identical shape at every size, so a full copy) and the
+    /// global ones (length N content landing in the first N rows of the new
+    /// length-2N buffer). Rows past the copied prefix stay as CoreML made them
+    /// — zeroed, and masked out until the positions they hold are written.
+    func adoptContents(of old: KVCacheState, stateNames: [String]) throws {
+        for name in stateNames {
+            try old.caches.withMultiArray(for: name) { src in
+                try caches.withMultiArray(for: name) { dst in
+                    try PredictionBuffer.copyPrefix(from: src, to: dst, what: "state '\(name)'")
+                }
+            }
+        }
+        // The ring indexes sliding slots, not context positions: its shape is
+        // the same at every size and it has to survive growth intact.
+        try PredictionBuffer.copyPrefix(from: old.ring, to: ring, what: "sliding_pos_ring")
+    }
+}
+
+// MARK: - Prediction buffers
+
+/// Allocation and byte-level copying for the buffers we hand CoreML.
+enum PredictionBuffer {
+    /// Allocate a buffer suitable for `MLPredictionOptions.outputBackings`.
+    ///
+    /// fp16 buffers are IOSurface-backed (via `CVPixelBuffer`), so a GPU or ANE
+    /// prediction writes its result straight into memory we already own instead
+    /// of into a framework surface we then copy out of. Everything else — the
+    /// int32 ring, and fp32 logits from an export that hasn't moved to fp16 —
+    /// gets a page-aligned allocation, the layout CoreML documents for
+    /// user-allocated backings.
+    ///
+    /// Either way the result is tightly packed: an IOSurface whose row pitch
+    /// forced padding is rejected in favour of the aligned allocation, so the
+    /// copy helpers below can assume row-major contiguity.
+    static func make(
+        shape: [NSNumber], dataType: MLMultiArrayDataType, fill: Int32? = nil
+    ) throws -> MLMultiArray {
+        let dims = shape.map { $0.intValue }
+        let array = try makeSurfaceBacked(dims: dims, dataType: dataType)
+            ?? makePageAligned(dims: dims, dataType: dataType)
+        if let fill {
+            array.withUnsafeMutableBufferPointer(ofType: Int32.self) { ptr, _ in
+                for i in 0..<ptr.count { ptr[i] = fill }
+            }
         } else {
-            memset(array.dataPointer, 0, array.count * bytesPerElement(of: dtype))
+            array.withUnsafeMutableBytes { raw, _ in
+                if let base = raw.baseAddress { memset(base, 0, raw.count) }
+            }
         }
         return array
+    }
+
+    /// fp16 only: `kCVPixelFormatType_OneComponent16Half` is the sole 16-bit
+    /// float pixel format `MLMultiArray(pixelBuffer:shape:)` accepts. Returns
+    /// nil when the format doesn't apply or the surface came back padded.
+    private static func makeSurfaceBacked(
+        dims: [Int], dataType: MLMultiArrayDataType
+    ) -> MLMultiArray? {
+        guard dataType == .float16, let width = dims.last, width > 0 else { return nil }
+        let height = dims.dropLast().reduce(1, *)
+        guard height > 0 else { return nil }
+
+        var pixelBuffer: CVPixelBuffer?
+        let attributes = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault, width, height,
+            kCVPixelFormatType_OneComponent16Half, attributes, &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer else { return nil }
+
+        let array = MLMultiArray(
+            pixelBuffer: pixelBuffer, shape: dims.map { NSNumber(value: $0) }
+        )
+        guard isTightlyPacked(array) else { return nil }
+        return array
+    }
+
+    /// Page-aligned allocation, which CoreML documents as the fastest layout
+    /// for a user-allocated backing.
+    private static func makePageAligned(
+        dims: [Int], dataType: MLMultiArrayDataType
+    ) throws -> MLMultiArray {
+        let count = dims.reduce(1, *)
+        let bytes = count * bytesPerElement(of: dataType)
+        let alignment = Int(getpagesize())
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: bytes, alignment: alignment)
+
+        var strides = [Int](repeating: 1, count: dims.count)
+        for i in stride(from: dims.count - 2, through: 0, by: -1) {
+            strides[i] = strides[i + 1] * dims[i + 1]
+        }
+        do {
+            return try MLMultiArray(
+                dataPointer: buffer,
+                shape: dims.map { NSNumber(value: $0) },
+                dataType: dataType,
+                strides: strides.map { NSNumber(value: $0) },
+                deallocator: { $0.deallocate() }
+            )
+        } catch {
+            buffer.deallocate()
+            throw KVCacheError.bufferAllocationFailed(shape: dims, dataType: dataType)
+        }
+    }
+
+    /// Copy `min(source, destination)` bytes, front-aligned.
+    static func copyPrefix(
+        from src: MLMultiArray, to dst: MLMultiArray, what: String
+    ) throws {
+        guard src.dataType == dst.dataType else {
+            throw KVCacheError.unexpectedBufferLayout(
+                "\(what): dtype \(src.dataType.rawValue) → \(dst.dataType.rawValue)"
+            )
+        }
+        try requireTightlyPacked(src, what: "\(what) source")
+        try requireTightlyPacked(dst, what: "\(what) destination")
+        let bytes = min(
+            src.count * bytesPerElement(of: src.dataType),
+            dst.count * bytesPerElement(of: dst.dataType)
+        )
+        src.withUnsafeBytes { source in
+            dst.withUnsafeMutableBytes { destination, _ in
+                guard let s = source.baseAddress, let d = destination.baseAddress else { return }
+                memcpy(d, s, bytes)
+            }
+        }
+    }
+
+    /// Copy row `row` of a `[rows, width]` array into a fresh tightly-packed
+    /// `[width]` array of the same dtype.
+    static func extractRow(
+        _ row: Int, from array: MLMultiArray, what: String
+    ) throws -> MLMultiArray {
+        try requireTightlyPacked(array, what: what)
+        let shape = array.shape.map { $0.intValue }
+        let width = shape.last ?? array.count
+        let rows = array.count / max(width, 1)
+        guard row >= 0, row < rows else {
+            throw KVCacheError.unexpectedBufferLayout(
+                "\(what): row \(row) out of range for shape \(shape)"
+            )
+        }
+        let out = try MLMultiArray(shape: [NSNumber(value: width)], dataType: array.dataType)
+        let elementSize = bytesPerElement(of: array.dataType)
+        array.withUnsafeBytes { source in
+            out.withUnsafeMutableBytes { destination, _ in
+                guard let s = source.baseAddress, let d = destination.baseAddress else { return }
+                memcpy(d, s.advanced(by: row * width * elementSize), width * elementSize)
+            }
+        }
+        return out
+    }
+
+    /// Row-major with no padding, so byte-level copies are valid.
+    static func isTightlyPacked(_ array: MLMultiArray) -> Bool {
+        let shape = array.shape.map { $0.intValue }
+        let strides = array.strides.map { $0.intValue }
+        guard shape.count == strides.count else { return false }
+        var expected = 1
+        for i in stride(from: shape.count - 1, through: 0, by: -1) {
+            if strides[i] != expected { return false }
+            expected *= shape[i]
+        }
+        return true
+    }
+
+    static func requireTightlyPacked(_ array: MLMultiArray, what: String) throws {
+        guard isTightlyPacked(array) else {
+            throw KVCacheError.unexpectedBufferLayout(
+                "\(what) is not contiguous (shape \(array.shape), strides \(array.strides))"
+            )
+        }
     }
 
     /// Bytes per element for the dtypes this package uses.
@@ -178,97 +413,5 @@ public struct KVCacheState: @unchecked Sendable {
         case .int32:   return 4
         default:       return 2
         }
-    }
-
-    /// Extract updated KV state from a prediction result.
-    ///
-    /// Maps output names → input names by position, rebuilding
-    /// the name-keyed dictionary for the next call.
-    /// Deep-copies each array because CoreML reuses output buffers.
-    ///
-    /// Only the global caches and the position ring appear here; the sliding
-    /// caches were updated inside `slidingCaches`, which is carried forward
-    /// unchanged (it is a handle, not a snapshot).
-    static func from(
-        prediction: MLFeatureProvider,
-        outputNames: [String],
-        inputNames: [String],
-        globalNames: Set<String> = [],
-        slidingCaches: MLState
-    ) throws -> KVCacheState {
-        precondition(outputNames.count == inputNames.count,
-                     "KV output count (\(outputNames.count)) != input count (\(inputNames.count))")
-
-        var dict: [String: MLMultiArray] = [:]
-        dict.reserveCapacity(inputNames.count)
-
-        // Probe first name to decide matching strategy
-        let useNameMatching = !inputNames.isEmpty
-            && prediction.featureValue(for: inputNames[0])?.multiArrayValue != nil
-
-        if useNameMatching {
-            for name in inputNames {
-                guard let value = prediction.featureValue(for: name)?.multiArrayValue else {
-                    throw KVCacheError.missingOutputTensor(name)
-                }
-                dict[name] = try value.deepCopy()
-            }
-        } else {
-            // Positional: output[i] → input[i]
-            for (outName, inName) in zip(outputNames, inputNames) {
-                guard let value = prediction.featureValue(for: outName)?.multiArrayValue else {
-                    throw KVCacheError.missingOutputTensor(outName)
-                }
-                dict[inName] = try value.deepCopy()
-            }
-        }
-
-        return KVCacheState(
-            arraysByName: dict,
-            inputNames: inputNames,
-            globalNames: globalNames,
-            slidingCaches: slidingCaches
-        )
-    }
-
-    /// Grow global caches so dim-1 >= `needed`, using `policy` to pick the new
-    /// size. Returns self unchanged if no growth is required, if there are no
-    /// global caches, or if the policy cannot offer anything larger.
-    ///
-    /// The size MUST come from the policy: the resolved `{decode,prefill}_N`
-    /// function and the cache have to agree on dim-1, and only the model knows
-    /// which `N` were exported.
-    ///
-    /// Sliding caches are unaffected: their length is the sliding window, not
-    /// the context length, so the `MLState` is carried straight through.
-    public func grownToFit(needed: Int, policy: KVCacheSizePolicy) throws -> KVCacheState {
-        guard !globalNames.isEmpty else { return self }
-        guard let curSize = currentGlobalCacheSize, curSize < needed else { return self }
-
-        let newLen = policy.size(forNeeded: needed)
-        guard newLen > curSize else { return self }
-        Log.info("[KV] Growing global caches: \(curSize) → \(newLen) (needed \(needed))")
-
-        var newDict = arraysByName
-        for name in globalNames {
-            guard let old = arraysByName[name] else { continue }
-            let oldShape = old.shape.map { $0.intValue }
-            guard oldShape.count == 4 else { continue }
-
-            let newShape = [oldShape[0], newLen, oldShape[2], oldShape[3]]
-            let nsShape = newShape.map { NSNumber(value: $0) }
-            let grown = try Self.allocateZeroedKV(shape: nsShape, dtype: old.dataType)
-            memcpy(grown.dataPointer, old.dataPointer,
-                   old.count * Self.bytesPerElement(of: old.dataType))
-
-            newDict[name] = grown
-        }
-
-        return KVCacheState(
-            arraysByName: newDict,
-            inputNames: inputNames,
-            globalNames: globalNames,
-            slidingCaches: slidingCaches
-        )
     }
 }

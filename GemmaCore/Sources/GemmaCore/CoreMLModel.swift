@@ -1,88 +1,81 @@
-/// CoreML model wrapper for the multifunction Gemma4-E2B .mlpackage.
+/// CoreML model wrapper for the materialized multifunction Gemma4-E2B package.
 ///
-/// Supports two model layouts:
-/// - **Standard**: Two functions named `decode` and `prefill`, with optional
-///   RangeDim on global KV cache inputs.
-/// - **Materialized**: Concrete-shape functions named `decode_<N>` /
-///   `prefill_<N>`, one pair per size in the export's `--materialize-sizes`
-///   (powers of two by default, but any ascending set is legal, and a
-///   `--decode-only` export has no `prefill_<N>` at all). Each function is
-///   specialized to a specific global KV cache size (no dynamic shape ops).
-///   The runtime selects the function matching the current cache size — see
-///   ``KVCacheSizePolicy``, which is the only place that bucketing lives.
+/// The artifact exports concrete-shape function pairs `prefill_<N>` /
+/// `decode_<N>`, one per size in the export's `--materialize-sizes` (powers of
+/// two by default, but any ascending set is legal, and a `--decode-only` export
+/// has no `prefill_<N>` at all). Each function is specialized to one global KV
+/// cache length, with no dynamic shape ops, so it runs on every backend
+/// including ANE and iPhone. The runtime selects the pair matching the current
+/// cache size — see ``KVCacheSizePolicy``, the only place bucketing lives.
 ///
-/// Materialized models are produced by `gemma-materialize` and work on all
-/// backends including ANE and iPhone, whereas standard RangeDim models only
-/// work on GPU.
+/// **Every** KV cache is a CoreML state: the sliding-window caches and the
+/// global-attention ones alike. A prediction therefore takes the token,
+/// the position, and the int32 `sliding_pos_ring` (states must be floating
+/// point, so the ring cannot be one), and returns logits plus the updated ring.
+/// An artifact that still declares `k_<slot>` / `v_<slot>` as inputs predates
+/// that change and is rejected at load — re-run `gemma-export`.
 ///
-/// Every function declares the 12 sliding-window KV caches as CoreML **state**
-/// (`k_<slot>` / `v_<slot>`), so only the 3 global caches and the int32
-/// `sliding_pos_ring` are passed in and out per call. An artifact without those
-/// state features predates the change and is rejected at load — re-run
-/// `gemma-export`.
+/// State buffer shapes are baked into each function, so an `MLState` belongs to
+/// exactly one size: ``makeEmptyKVState(size:)`` creates it from that pair's
+/// model handle, and ``grownToFit(_:needed:)`` migrates the contents when the
+/// conversation outgrows it.
 
 import CoreML
 import CryptoKit
 import Foundation
 
 public final class CoreMLModel: @unchecked Sendable {
-    /// Logits output name for each function.
-    public let decodeLogitsName: String
-    public let prefillLogitsName: String
+    /// I/O names, shapes, and dtypes of one function, read from its description
+    /// once so predictions never re-derive them.
+    struct FunctionIO {
+        let logitsOutputName: String
+        let logitsShape: [NSNumber]
+        let logitsDataType: MLMultiArrayDataType
+        /// Token input, `[1, chunk]` for prefill and `[1]` for decode.
+        let tokenInputName: String
+        let tokenLength: Int
+        let positionInputName: String
+        let ringInputName: String
+        let ringOutputName: String
+        let ringShape: [NSNumber]
+        let ringDataType: MLMultiArrayDataType
+        /// Every KV cache, sliding and global, sorted for deterministic
+        /// migration order.
+        let stateNames: [String]
+    }
 
-    /// Token input name for each function.
-    public let decodeTokenInputName: String
-    public let prefillTokenInputName: String
+    let decodeIO: FunctionIO
+    let prefillIO: FunctionIO
 
-    /// Position input name for each function.
-    public let decodePositionInputName: String
-    public let prefillPositionInputName: String
+    /// Tokens per prefill call, read from the prefill function's token input.
+    ///
+    /// A decode-only artifact has no prefill function and prefills by looping
+    /// `decode`, so its chunk is 1: any larger value would only pad the prompt
+    /// out to a chunk boundary and spend real decode steps on the padding.
+    public let chunkSize: Int
 
-    /// "N" phantom input name (global cache dim), nil for materialized/fixed-shape models.
-    public let decodeNInputName: String?
-    public let prefillNInputName: String?
+    /// Available materialized sizes, ascending. If the caller passed
+    /// `maxContextSize`, this is the filtered list.
+    public let materializedSizes: [Int]
 
-    /// KV cache input/output names, in matched order.
-    public let decodeKVInputNames: [String]
-    public let decodeKVOutputNames: [String]
-    public let prefillKVInputNames: [String]
-    public let prefillKVOutputNames: [String]
-
-    /// Global KV input names (caches whose dim-1 varies with context length).
-    public let globalKVInputNames: Set<String>
-
-    /// Names of the sliding KV caches, which are CoreML state rather than I/O.
-    public let slidingStateNames: Set<String>
-
-    /// Shapes of each prefill KV input, extracted once so the prefill model
-    /// can be released without losing the metadata needed to re-seed KV caches.
-    public let prefillKVShapes: [String: [NSNumber]]
-    /// Dtypes of each prefill KV input (companion to `prefillKVShapes`).
-    public let prefillKVDtypes: [String: MLMultiArrayDataType]
-
-    /// Available materialized sizes (sorted ascending), or nil for standard models.
-    /// If the caller passed `maxContextSize`, this is the filtered list.
-    public let materializedSizes: [Int]?
-
-    /// Largest sequence length this model can actually handle. For standard
-    /// (RangeDim) models, `GemmaConfig.maxSeqLen`. For materialized models,
-    /// the largest retained size — either all sizes from the manifest or the
+    /// Largest sequence length this model can actually handle: the largest
+    /// retained size, either everything the manifest declared or the
     /// caller-imposed `maxContextSize` cap. The engine uses this instead of
-    /// `GemmaConfig.maxSeqLen` so KV growth never exceeds a size we actually
-    /// loaded a function for.
+    /// `GemmaConfig.maxSeqLen` so KV growth never exceeds a size we loaded a
+    /// function for.
     public let effectiveMaxSeqLen: Int
 
-    /// True when only decode functions are loaded. `prefill()` calls fall back
-    /// to running `decode()` per-token internally — slower (no chunked prefill
-    /// kernel), but halves resident-MLModel count, which is the difference
-    /// between fitting and OOM on tight devices like iPhone 12 Pro.
+    /// True when only decode functions are loaded. `prefill()` falls back to
+    /// running `decode()` per token — slower (no chunked prefill kernel), but
+    /// halves resident-MLModel count, which is the difference between fitting
+    /// and OOM on tight devices like iPhone 12 Pro.
     public let isDecodeOnly: Bool
 
     /// URL of the compiled .mlmodelc (for lazy function loading).
     private let modelURL: URL
-    /// URL the caller originally passed to `load(from:)` (.mlpackage or .mlmodelc).
-    /// Part of the warm-cache sentinel's identity, so two models that merely
-    /// share a basename don't share a sentinel.
+    /// URL the caller originally passed to `load(from:)` (.mlpackage or
+    /// .mlmodelc). Part of the warm-cache sentinel's identity, so two models
+    /// that merely share a basename don't share a sentinel.
     private let sourceURL: URL
     /// Content fingerprint of the artifact at `sourceURL` (spec + sampled
     /// weights), or nil when it couldn't be computed. Recorded in the warm
@@ -110,48 +103,32 @@ public final class CoreMLModel: @unchecked Sendable {
         case loading(id: UInt64, task: Task<SendableMLModel, Error>)
     }
 
-    /// Function state keyed by function name (e.g. "decode" or "decode_512").
+    /// Function state keyed by function name (e.g. "decode_512").
     private var functions: [String: LoadState]
+    /// Functions that have already run their throwaway specialization
+    /// prediction — see ``specialize(name:size:)``. Tracked separately from
+    /// `functions` because a bulk preload deliberately loads without
+    /// specializing.
+    private var specializedFunctions: Set<String> = []
     private var nextLoadID: UInt64 = 0
     private let cacheLock = NSLock()
 
-    /// The function instance `makeState()` allocates from. Any loaded instance
-    /// works — states are keyed by name and shared across every function of the
-    /// package — so this is just "one we know is loaded" (the bootstrap decode).
-    private let stateSourceModel: MLModel
-
     private init(
-        prefillIO: ClassifiedIO,
-        prefillKVShapes: [String: [NSNumber]],
-        prefillKVDtypes: [String: MLMultiArrayDataType],
-        decodeIO: ClassifiedIO,
-        globalKVInputNames: Set<String>,
-        materializedSizes: [Int]?,
+        prefillIO: FunctionIO,
+        decodeIO: FunctionIO,
+        chunkSize: Int,
+        materializedSizes: [Int],
         effectiveMaxSeqLen: Int,
         isDecodeOnly: Bool,
         modelURL: URL,
         sourceURL: URL,
         sourceFingerprint: String?,
         computeUnits: MLComputeUnits,
-        stateSourceModel: MLModel,
         initialFunctions: [String: MLModel]
     ) {
-        self.prefillLogitsName = prefillIO.logitsOutputName
-        self.decodeLogitsName = decodeIO.logitsOutputName
-        self.prefillTokenInputName = prefillIO.tokenInputName
-        self.decodeTokenInputName = decodeIO.tokenInputName
-        self.prefillPositionInputName = prefillIO.positionInputName
-        self.decodePositionInputName = decodeIO.positionInputName
-        self.prefillNInputName = prefillIO.nInputName
-        self.decodeNInputName = decodeIO.nInputName
-        self.prefillKVInputNames = prefillIO.kvInputNames
-        self.prefillKVOutputNames = prefillIO.kvOutputNames
-        self.decodeKVInputNames = decodeIO.kvInputNames
-        self.decodeKVOutputNames = decodeIO.kvOutputNames
-        self.prefillKVShapes = prefillKVShapes
-        self.prefillKVDtypes = prefillKVDtypes
-        self.globalKVInputNames = globalKVInputNames
-        self.slidingStateNames = decodeIO.stateNames
+        self.prefillIO = prefillIO
+        self.decodeIO = decodeIO
+        self.chunkSize = chunkSize
         self.materializedSizes = materializedSizes
         self.effectiveMaxSeqLen = effectiveMaxSeqLen
         self.isDecodeOnly = isDecodeOnly
@@ -159,60 +136,76 @@ public final class CoreMLModel: @unchecked Sendable {
         self.sourceURL = sourceURL
         self.sourceFingerprint = sourceFingerprint
         self.computeUnits = computeUnits
-        self.stateSourceModel = stateSourceModel
         self.functions = initialFunctions.mapValues { .loaded($0) }
     }
 
-    /// Allocate a fresh, zero-filled set of sliding KV cache buffers.
-    ///
-    /// One `MLState` serves every function in the package: `decode_512`,
-    /// `prefill_1024`, … all bind the same named state buffers, so the runtime
-    /// can switch sizes mid-conversation without touching the sliding caches.
-    /// Make a new one per conversation — reusing one across a reset would leave
-    /// stale K/V that a re-populated `sliding_pos_ring` marks valid again.
-    public func makeState() -> MLState {
-        stateSourceModel.makeState()
-    }
+    // MARK: - KV cache lifecycle
 
-    /// A zeroed KV state: fresh global caches, fresh `sliding_pos_ring`, and a
-    /// fresh `MLState` for the sliding caches.
-    public func makeEmptyKVState(initialGlobalSize: Int? = nil) throws -> KVCacheState {
-        try KVCacheState.empty(
-            kvInputNames: prefillKVInputNames,
-            shapes: prefillKVShapes,
-            dtypes: prefillKVDtypes,
-            globalNames: globalKVInputNames,
-            initialGlobalSize: initialGlobalSize,
-            slidingCaches: makeState()
+    /// A zeroed cache for `size` (rounded up through ``cacheSizePolicy``),
+    /// defaulting to the smallest materialized pair.
+    ///
+    /// The `MLState` is made from that pair's own model handle: state buffer
+    /// shapes are baked into each materialized function, so a state made at one
+    /// size is meaningless at another. The pair must already be loaded —
+    /// `ensureLoaded(forGlobalCacheSize:)` first for anything but the bootstrap
+    /// size, which `load` brings up.
+    ///
+    /// Make a new one per conversation. Reusing one across a reset would leave
+    /// stale K/V that a re-populated `sliding_pos_ring` marks valid again.
+    public func makeEmptyKVState(size requested: Int? = nil) throws -> KVCacheState {
+        let target = cacheSizePolicy.size(forNeeded: requested ?? materializedSizes[0])
+        guard let model = loadedFunction(named: functionName(prefix: "decode", size: target)) else {
+            throw KVCacheError.functionNotLoaded(size: target)
+        }
+        return try KVCacheState(
+            size: target,
+            caches: model.makeState(),
+            ringShape: decodeIO.ringShape,
+            ringDataType: decodeIO.ringDataType,
+            chunkSize: chunkSize
         )
     }
 
-    /// Bucketing policy for this model's global KV caches. Hand this to
-    /// ``KVCacheState/grownToFit(needed:policy:)`` and anything else that needs
-    /// to size a cache, so cache shape and resolved function never disagree.
+    /// Return a cache big enough for `needed` tokens, migrating `kv` into a
+    /// larger pair's state when it no longer fits.
+    ///
+    /// Returns `kv` untouched in the common case. When growth is required the
+    /// next pair is loaded first (state buffers can only be made from a loaded
+    /// handle) and every cache is copied across — see
+    /// ``KVCacheState/adoptContents(of:stateNames:)``.
+    public func grownToFit(_ kv: KVCacheState, needed: Int) async throws -> KVCacheState {
+        let target = cacheSizePolicy.size(forNeeded: needed)
+        guard target > kv.size else { return kv }
+        try await ensureLoaded(forGlobalCacheSize: target)
+        let grown = try makeEmptyKVState(size: target)
+        try grown.adoptContents(of: kv, stateNames: decodeIO.stateNames)
+        Log.info("[KV] Grew caches \(kv.size) → \(target) (needed \(needed))")
+        return grown
+    }
+
+    /// Bucketing policy for this model's caches. Hand this to anything that
+    /// needs to size a cache, so cache shape and resolved function never
+    /// disagree.
     public var cacheSizePolicy: KVCacheSizePolicy {
         KVCacheSizePolicy(materializedSizes: materializedSizes, maxLen: effectiveMaxSeqLen)
     }
 
+    // MARK: - Loading
+
     /// Load the multifunction model from a .mlpackage or .mlmodelc URL.
-    ///
-    /// Auto-detects whether the model uses standard (`decode`/`prefill`)
-    /// or materialized (`decode_64`/`prefill_64`/…) function names.
     ///
     /// For .mlpackage files, the model is compiled and cached as .mlmodelc
     /// next to the source for fast subsequent loads (E5RT cache reuse).
     /// For .mlmodelc files, loads directly without recompilation.
     ///
-    /// - Parameter maxContextSize: For materialized models, only retain function
-    ///   pairs ≤ this size. Loading fewer functions is critical on memory-
-    ///   constrained devices like iPhone, where loading all 16 pairs OOMs.
-    ///   Ignored for standard models.
-    /// - Parameter decodeOnly: For materialized models, skip loading prefill
-    ///   functions entirely. `prefill()` falls back to per-token `decode()`
-    ///   internally — slower but halves resident MLModel count, which is the
-    ///   only way the model fits on iPhone 12 Pro / 6 GB devices. Ignored for
-    ///   standard models; forced on for `--decode-only` artifacts, which
-    ///   export no prefill functions to load.
+    /// - Parameter maxContextSize: Only retain function pairs ≤ this size.
+    ///   Loading fewer functions is critical on memory-constrained devices like
+    ///   iPhone, where loading all 16 pairs OOMs.
+    /// - Parameter decodeOnly: Skip loading prefill functions entirely.
+    ///   `prefill()` falls back to per-token `decode()` internally — slower but
+    ///   halves resident MLModel count, which is the only way the model fits on
+    ///   iPhone 12 Pro / 6 GB devices. Forced on for `--decode-only` artifacts,
+    ///   which export no prefill functions to load.
     /// - Parameter backgroundPreload: Kick off a detached load of every
     ///   retained function pair once the bootstrap pair is up. Right for
     ///   interactive apps (later size transitions become instant), wrong for
@@ -279,8 +272,8 @@ public final class CoreMLModel: @unchecked Sendable {
     ///
     /// Invalidates via `artifactFingerprint(of:)` stored in a sidecar. Mtime
     /// comparison is unreliable here: swapping in a different `.mlpackage`
-    /// build (e.g. non-materialized ↔ materialized) can leave the source older
-    /// than an existing cache, masking a real change.
+    /// build can leave the source older than an existing cache, masking a real
+    /// change.
     private static func compileAndCache(
         source: URL, cached: URL, fingerprint: String?
     ) async throws -> URL {
@@ -428,11 +421,16 @@ public final class CoreMLModel: @unchecked Sendable {
 
     /// Load a pre-compiled multifunction .mlmodelc.
     ///
-    /// The layout is decided from `model.mil` — a text parse, no `MLModel.load`
-    /// — rather than by trial-loading. An artifact that declares `decode_<N>`
-    /// functions goes straight down the materialized path and is never probed
-    /// with parallel loads, which is exactly the multi-MLModel memory spike the
-    /// serial bootstrap exists to avoid.
+    /// The function set comes from `model.mil` — a text parse, no
+    /// `MLModel.load` — rather than from trial loads, so the bootstrap is never
+    /// the multi-MLModel memory spike that OOMs an iPhone. Only when the
+    /// manifest is unreadable does this fall back to probing.
+    ///
+    /// Strategy, tuned for memory-constrained devices:
+    ///   1. Take the declared function set from `model.mil`.
+    ///   2. Load `decode_{smallest}` and `prefill_{smallest}` SERIALLY. Peak
+    ///      live MLModel count is 1 during bootstrap.
+    ///   3. Optionally background-preload the remaining retained sizes.
     private static func loadCompiled(
         from url: URL,
         sourceURL: URL,
@@ -444,170 +442,13 @@ public final class CoreMLModel: @unchecked Sendable {
     ) async throws -> CoreMLModel {
         Log.info("[CoreML] Loading decode\(decodeOnly ? "" : " + prefill") functions from \(url.lastPathComponent)...")
 
-        let declared = enumerateMaterializedFunctions(compiledURL: url)
-        if let declared, !declared.decodeSizes.isEmpty {
-            return try await loadMaterialized(
-                from: url,
-                sourceURL: sourceURL,
-                sourceFingerprint: sourceFingerprint,
-                computeUnits: computeUnits,
-                maxContextSize: maxContextSize,
-                decodeOnly: decodeOnly,
-                backgroundPreload: backgroundPreload,
-                declared: declared
-            )
-        }
-
-        // Not a materialized artifact, or `model.mil` was unreadable. Standard
-        // models have no meaningful decode-only mode — there is one `decode`
-        // function and one `prefill` function — so `decodeOnly` is ignored
-        // rather than making the load impossible.
-        if decodeOnly && declared != nil {
-            Log.info("[CoreML] decodeOnly requested but \(url.lastPathComponent) declares no materialized functions — loading decode + prefill")
-        }
-        do {
-            return try await loadStandard(
-                from: url,
-                sourceURL: sourceURL,
-                sourceFingerprint: sourceFingerprint,
-                computeUnits: computeUnits
-            )
-        } catch let standardError {
-            // Reached when `model.mil` was unreadable (layout genuinely
-            // unknown) or when it declared no materialized functions but the
-            // standard load still failed — including a `.mil` parse that
-            // missed real declarations due to format drift. Probe for
-            // materialized functions as a desktop-only safety net; on a truly
-            // standard artifact the probe fails fast on unknown function
-            // names. If it fails too, surface BOTH errors —
-            // the standard one is usually the real cause (corrupt bundle,
-            // unsupported compute units) and used to be demoted to a log line
-            // and replaced by an unrelated `.modelNotFound`.
-            Log.info("[CoreML] Standard function load failed (\(standardError.localizedDescription)), probing for materialized functions...")
-            do {
-                return try await loadMaterialized(
-                    from: url,
-                    sourceURL: sourceURL,
-                    sourceFingerprint: sourceFingerprint,
-                    computeUnits: computeUnits,
-                    maxContextSize: maxContextSize,
-                    decodeOnly: decodeOnly,
-                    backgroundPreload: backgroundPreload,
-                    declared: nil
-                )
-            } catch let materializedError {
-                throw CoreMLModelError.loadFailed(
-                    standard: standardError, materialized: materializedError
-                )
-            }
-        }
-    }
-
-    /// Load a standard two-function model (decode + prefill).
-    private static func loadStandard(
-        from url: URL,
-        sourceURL: URL,
-        sourceFingerprint: String?,
-        computeUnits: MLComputeUnits
-    ) async throws -> CoreMLModel {
-        let decodeConfig = MLModelConfiguration()
-        decodeConfig.computeUnits = computeUnits
-        decodeConfig.functionName = "decode"
-
-        let prefillConfig = MLModelConfiguration()
-        prefillConfig.computeUnits = computeUnits
-        prefillConfig.functionName = "prefill"
-
-        async let decodeTask = MLModel.load(contentsOf: url, configuration: decodeConfig)
-        async let prefillTask = MLModel.load(contentsOf: url, configuration: prefillConfig)
-
-        let decodeModel = try await decodeTask
-        let prefillModel = try await prefillTask
-        Log.info("[CoreML] Both functions loaded (standard mode).")
-
-        let decodeIO = classifyIO(model: decodeModel)
-        let prefillIO = classifyIO(model: prefillModel)
-        try requireStatefulKV(decodeIO, function: "decode")
-        try requireStatefulKV(prefillIO, function: "prefill")
-        let (prefillKVShapes, prefillKVDtypes) = extractKVMetadata(
-            model: prefillModel, kvInputNames: prefillIO.kvInputNames
-        )
-        logIOSummary(decodeIO: decodeIO, prefillIO: prefillIO)
-
-        let globalNames = detectFlexibleGlobalKV(
-            model: decodeModel, kvInputNames: decodeIO.kvInputNames
-        )
-        if !globalNames.isEmpty {
-            Log.info("[CoreML] Flexible global KV caches: \(globalNames.sorted())")
-        }
-
-        return CoreMLModel(
-            prefillIO: prefillIO,
-            prefillKVShapes: prefillKVShapes,
-            prefillKVDtypes: prefillKVDtypes,
-            decodeIO: decodeIO,
-            globalKVInputNames: globalNames,
-            materializedSizes: nil,
-            effectiveMaxSeqLen: GemmaConfig.maxSeqLen,
-            isDecodeOnly: false,
-            modelURL: url,
-            sourceURL: sourceURL,
-            sourceFingerprint: sourceFingerprint,
-            computeUnits: computeUnits,
-            stateSourceModel: decodeModel,
-            initialFunctions: ["decode": decodeModel, "prefill": prefillModel]
-        )
-    }
-
-    /// Reject artifacts exported before the sliding KV caches became state.
-    ///
-    /// Such a model takes all 30 caches as inputs, so it would load and then
-    /// fail per-prediction on missing features — or worse, silently run with
-    /// whatever the runtime defaulted them to. Fail at load with the fix.
-    private static func requireStatefulKV(
-        _ io: ClassifiedIO, function: String
-    ) throws {
-        guard io.stateNames.isEmpty else { return }
-        throw CoreMLModelError.modelPredatesStatefulKVCaches(
-            function: function, kvInputCount: io.kvInputNames.count
-        )
-    }
-
-    /// Load a materialized model with concrete function names.
-    ///
-    /// Strategy tuned for memory-constrained devices (iPhone OOMs on parallel
-    /// loads of 2–3 concurrent `MLModel` instances):
-    ///   1. Take the declared function set from `model.mil` (text parse, no
-    ///      MLModel.load), supplied by the caller as `declared`.
-    ///   2. Classify globals vs. slidings by comparing decode function
-    ///      signatures in `model.mil` text — also no MLModel.load. This
-    ///      replaces the prior "probe-load decode_{second}" classifier which
-    ///      was the memory spike that killed the iPhone path.
-    ///   3. Load decode_{smallest} and prefill_{smallest} SERIALLY. Peak
-    ///      live MLModel count is 1 during bootstrap.
-    ///   4. Optionally background-preload the remaining retained sizes.
-    ///
-    /// `declared == nil` means the manifest was unreadable, and only then does
-    /// this fall back to a parallel probe (desktop-only safety net).
-    private static func loadMaterialized(
-        from url: URL,
-        sourceURL: URL,
-        sourceFingerprint: String?,
-        computeUnits: MLComputeUnits,
-        maxContextSize: Int?,
-        decodeOnly: Bool,
-        backgroundPreload: Bool,
-        declared: MaterializedFunctions?
-    ) async throws -> CoreMLModel {
-        let sizes: [Int]
-        let globalNames: Set<String>
         var effectiveDecodeOnly = decodeOnly
+        let sizes: [Int]
 
-        if let declared {
+        if let declared = enumerateMaterializedFunctions(compiledURL: url) {
             // A `gemma-export --decode-only` artifact has decode_<N> and no
             // prefill_<N>. Insisting on the decode∩prefill intersection there
-            // yields no sizes at all, which used to drop us into the parallel
-            // probe and then fail loading a `prefill_<N>` that never existed.
+            // yields no sizes at all.
             if declared.prefillSizes.isEmpty && !effectiveDecodeOnly {
                 Log.info("[CoreML] Artifact exports no prefill functions — switching to decode-only mode")
                 effectiveDecodeOnly = true
@@ -620,67 +461,10 @@ public final class CoreMLModel: @unchecked Sendable {
                 )
             }
             Log.info("[CoreML] Materialized sizes (from manifest): \(sizes)")
-            if sizes.count >= 2 {
-                // A failed parse must NOT degrade to "no global caches":
-                // globalKVInputNames would be empty, growth a no-op, decode
-                // forever pinned to the smallest function, and every
-                // conversation silently truncated. Fail loudly instead.
-                guard let g = detectGlobalsFromMil(
-                    compiledURL: url, sizeA: sizes[0], sizeB: sizes[1]
-                ) else {
-                    throw CoreMLModelError.globalKVDetectionFailed(
-                        "could not parse the decode_\(sizes[0]) / decode_\(sizes[1]) signatures out of model.mil"
-                    )
-                }
-                globalNames = g
-                Log.info("[CoreML] Global KV caches (from .mil, \(g.count)): \(g.sorted())")
-            } else {
-                // Exactly one size: growth is a no-op, so an empty global set
-                // is correct rather than a degraded guess.
-                globalNames = []
-                Log.info("[CoreML] Only one materialized size; no classification needed")
-            }
         } else {
             Log.info("[CoreML] Manifest enumeration unavailable; falling back to parallel probe")
-            let candidateSizes = (6...16).map { 1 << $0 }  // 64..65536
-            let probeResults: [(size: Int, model: SendableMLModel?)] = await withTaskGroup(
-                of: (Int, SendableMLModel?).self
-            ) { group in
-                for s in candidateSizes {
-                    group.addTask {
-                        let config = MLModelConfiguration()
-                        config.computeUnits = computeUnits
-                        config.functionName = "decode_\(s)"
-                        let model = try? await MLModel.load(contentsOf: url, configuration: config)
-                        return (s, model.map { SendableMLModel(model: $0) })
-                    }
-                }
-                var out: [(size: Int, model: SendableMLModel?)] = []
-                for await r in group { out.append(r) }
-                return out
-            }
-            let loaded = probeResults
-                .compactMap { r in r.model.map { (size: r.size, model: $0.model) } }
-                .sorted { $0.size < $1.size }
-            guard !loaded.isEmpty else { throw CoreMLModelError.modelNotFound }
-            sizes = loaded.map { $0.size }
-            // Fallback classifier: use the probed MLModels since we already have them.
-            let decodeIO0 = classifyIO(model: loaded[0].model)
-            if loaded.count >= 2 {
-                let g = detectGlobalsByShape(
-                    modelA: loaded[0].model,
-                    modelB: loaded[1].model,
-                    kvInputNames: decodeIO0.kvInputNames
-                )
-                guard !g.isEmpty else {
-                    throw CoreMLModelError.globalKVDetectionFailed(
-                        "no KV input changes dim-1 between decode_\(sizes[0]) and decode_\(sizes[1])"
-                    )
-                }
-                globalNames = g
-            } else {
-                globalNames = []
-            }
+            sizes = await probeMaterializedSizes(url: url, computeUnits: computeUnits)
+            guard !sizes.isEmpty else { throw CoreMLModelError.notMaterialized(url.lastPathComponent) }
         }
 
         // Restrict retained sizes to `maxContextSize` before any heavy load,
@@ -697,61 +481,64 @@ public final class CoreMLModel: @unchecked Sendable {
         }
 
         let bootSize = retainedSizes[0]
+        let decodeName = "decode_\(bootSize)"
         let prefillName = "prefill_\(bootSize)"
 
         // Serial loads keep peak live-MLModel count at 1 during bootstrap.
-        let decodeModel = try await Self.loadFunction(
-            url: url, computeUnits: computeUnits, function: "decode_\(bootSize)"
+        let decodeModel = try await loadFunction(
+            url: url, computeUnits: computeUnits, function: decodeName
         )
         let prefillModel: MLModel?
         if effectiveDecodeOnly {
             prefillModel = nil
-            Log.info("[CoreML] Loaded decode_\(bootSize) (decode-only; prefill skipped)")
+            Log.info("[CoreML] Loaded \(decodeName) (decode-only; prefill skipped)")
         } else {
-            prefillModel = try await Self.loadFunction(
+            prefillModel = try await loadFunction(
                 url: url, computeUnits: computeUnits, function: prefillName
             )
-            Log.info("[CoreML] Loaded decode_\(bootSize) + \(prefillName) (serial)")
+            Log.info("[CoreML] Loaded \(decodeName) + \(prefillName) (serial)")
         }
 
-        let decodeIO = classifyIO(model: decodeModel)
+        let decodeIO = try classifyIO(model: decodeModel, function: decodeName)
         // In decode-only mode, prefill metadata is borrowed from decode: the
-        // KV cache layout (input names, shapes, dtypes) is identical between
-        // the two functions, and the per-token loop in `decodeOnlyPrefill`
-        // doesn't use prefill's own token/position input names.
-        let prefillIO = prefillModel.map { classifyIO(model: $0) } ?? decodeIO
-        try requireStatefulKV(decodeIO, function: "decode_\(bootSize)")
+        // per-token loop in `decodeOnlyPrefill` runs the decode function, so
+        // those are the names and shapes it needs.
+        let prefillIO = try prefillModel.map { try classifyIO(model: $0, function: prefillName) }
+            ?? decodeIO
+        // Decode-only prefills one token at a time, so a chunk larger than 1
+        // would only pad the prompt and spend real decode steps on padding.
+        let chunkSize = prefillModel == nil ? 1 : prefillIO.tokenLength
         if prefillModel != nil {
-            try requireStatefulKV(prefillIO, function: prefillName)
+            // The engine reads the row of the last *real* token out of the
+            // chunk, so a prefill that emits fewer rows than it consumes tokens
+            // cannot serve a padded final chunk. Fail here rather than at the
+            // first prompt that isn't a chunk multiple.
+            let rows = prefillIO.logitsShape.dropLast().map { $0.intValue }.reduce(1, *)
+            guard rows == chunkSize else {
+                throw CoreMLModelError.unexpectedSignature(
+                    function: prefillName,
+                    detail: "takes \(chunkSize) tokens but emits \(rows) logits row(s); the runtime needs one row per chunk position"
+                )
+            }
         }
-        let prefillSourceModel = prefillModel ?? decodeModel
-        let (prefillKVShapes, prefillKVDtypes) = extractKVMetadata(
-            model: prefillSourceModel, kvInputNames: prefillIO.kvInputNames
-        )
-        logIOSummary(decodeIO: decodeIO, prefillIO: prefillIO)
+        logIOSummary(decodeIO: decodeIO, prefillIO: prefillIO, chunkSize: chunkSize)
 
-        var initialFunctions: [String: MLModel] = [
-            "decode_\(bootSize)": decodeModel
-        ]
+        var initialFunctions: [String: MLModel] = [decodeName: decodeModel]
         if let p = prefillModel {
             initialFunctions[prefillName] = p
         }
 
-        let effectiveMax = retainedSizes.last ?? sizes.last ?? GemmaConfig.maxSeqLen
         let instance = CoreMLModel(
             prefillIO: prefillIO,
-            prefillKVShapes: prefillKVShapes,
-            prefillKVDtypes: prefillKVDtypes,
             decodeIO: decodeIO,
-            globalKVInputNames: globalNames,
+            chunkSize: chunkSize,
             materializedSizes: retainedSizes,
-            effectiveMaxSeqLen: effectiveMax,
+            effectiveMaxSeqLen: retainedSizes[retainedSizes.count - 1],
             isDecodeOnly: effectiveDecodeOnly,
             modelURL: url,
             sourceURL: sourceURL,
             sourceFingerprint: sourceFingerprint,
             computeUnits: computeUnits,
-            stateSourceModel: decodeModel,
             initialFunctions: initialFunctions
         )
         if backgroundPreload {
@@ -760,68 +547,30 @@ public final class CoreMLModel: @unchecked Sendable {
         return instance
     }
 
-    /// Identify global KV inputs by parsing two decode function signatures out
-    /// of `model.mil` and comparing each parameter's dim-1. A parameter whose
-    /// dim-1 scales with the materialized size is a global cache; one that
-    /// stays fixed (= sliding window) is a sliding cache. Pure text parse —
-    /// avoids an `MLModel.load` just to read shapes, which is the peak-memory
-    /// hotspot on iPhone.
-    ///
-    /// Returns nil on any parse failure so the caller can decide how to
-    /// degrade (fallback probe load, or an empty-globals assumption).
-    static func detectGlobalsFromMil(
-        compiledURL: URL, sizeA: Int, sizeB: Int
-    ) -> Set<String>? {
-        let milURL = compiledURL.appendingPathComponent("model.mil")
-        guard let text = try? String(contentsOf: milURL, encoding: .utf8) else {
-            return nil
-        }
-        guard let dimsA = parseDecodeDim1(text: text, size: sizeA),
-              let dimsB = parseDecodeDim1(text: text, size: sizeB) else {
-            return nil
-        }
-        var globals = Set<String>()
-        for (name, a) in dimsA {
-            if let b = dimsB[name], a != b {
-                globals.insert(name)
+    /// Last-resort size discovery when `model.mil` can't be parsed: try loading
+    /// `decode_<N>` for every plausible N and keep the ones that succeed. The
+    /// probed models are dropped — this only answers "which sizes exist"; the
+    /// bootstrap reloads what it needs.
+    private static func probeMaterializedSizes(
+        url: URL, computeUnits: MLComputeUnits
+    ) async -> [Int] {
+        let candidateSizes = (6...16).map { 1 << $0 }  // 64..65536
+        return await withTaskGroup(of: Int?.self) { group in
+            for size in candidateSizes {
+                group.addTask {
+                    let config = MLModelConfiguration()
+                    config.computeUnits = computeUnits
+                    config.functionName = "decode_\(size)"
+                    let model = try? await MLModel.load(contentsOf: url, configuration: config)
+                    return model == nil ? nil : size
+                }
             }
-        }
-        return globals
-    }
-
-    /// Return `[param-name: dim-1]` for every tensor parameter of `decode_<size>`
-    /// in the supplied `.mil` text, or nil if the function or its signature
-    /// can't be found.
-    private static func parseDecodeDim1(text: String, size: Int) -> [String: Int]? {
-        let sigPattern = #"func\s+decode_\#(size)\b[^(]*\(([^)]*)\)"#
-        guard let sigRe = try? NSRegularExpression(pattern: sigPattern) else { return nil }
-        let full = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let m = sigRe.firstMatch(in: text, range: full),
-              m.numberOfRanges >= 2,
-              let r = Range(m.range(at: 1), in: text) else {
-            return nil
-        }
-        let sig = String(text[r])
-
-        // Each tensor param is `tensor<dtype, [d0, d1, ...]> name`. The sliding
-        // KV caches are state params, spelled `state<tensor<…>> name`, and the
-        // trailing `>>` makes them fall out of this pattern — which is what we
-        // want: their length is the sliding window, never the context size.
-        let paramPattern = #"tensor<[^,]+,\s*\[([^\]]+)\]>\s*([A-Za-z_][A-Za-z0-9_]*)"#
-        guard let paramRe = try? NSRegularExpression(pattern: paramPattern) else { return nil }
-        var result: [String: Int] = [:]
-        let sigRange = NSRange(sig.startIndex..<sig.endIndex, in: sig)
-        paramRe.enumerateMatches(in: sig, range: sigRange) { match, _, _ in
-            guard let m = match, m.numberOfRanges >= 3,
-                  let shapeRange = Range(m.range(at: 1), in: sig),
-                  let nameRange = Range(m.range(at: 2), in: sig) else { return }
-            let dims = sig[shapeRange].split(separator: ",").compactMap {
-                Int($0.trimmingCharacters(in: .whitespaces))
+            var found: [Int] = []
+            for await size in group {
+                if let size { found.append(size) }
             }
-            guard dims.count >= 2 else { return }
-            result[String(sig[nameRange])] = dims[1]
+            return found.sorted()
         }
-        return result.isEmpty ? nil : result
     }
 
     /// Load a single function by name (used at bootstrap).
@@ -832,25 +581,6 @@ public final class CoreMLModel: @unchecked Sendable {
         config.computeUnits = computeUnits
         config.functionName = function
         return try await MLModel.load(contentsOf: url, configuration: config)
-    }
-
-    /// Identify global KV inputs by comparing dim-1 across two sizes.
-    /// Globals scale (different dim-1); slidings stay fixed.
-    private static func detectGlobalsByShape(
-        modelA: MLModel, modelB: MLModel, kvInputNames: [String]
-    ) -> Set<String> {
-        let descsA = modelA.modelDescription.inputDescriptionsByName
-        let descsB = modelB.modelDescription.inputDescriptionsByName
-        var globals = Set<String>()
-        for name in kvInputNames {
-            guard let ca = descsA[name]?.multiArrayConstraint,
-                  let cb = descsB[name]?.multiArrayConstraint else { continue }
-            let sa = ca.shape.map { $0.intValue }
-            let sb = cb.shape.map { $0.intValue }
-            guard sa.count >= 2, sb.count >= 2 else { continue }
-            if sa[1] != sb[1] { globals.insert(name) }
-        }
-        return globals
     }
 
     /// The `{decode,prefill}_<N>` function sets a compiled artifact declares.
@@ -903,78 +633,48 @@ public final class CoreMLModel: @unchecked Sendable {
         )
     }
 
-    /// Extract KV shape/dtype metadata from a model's input descriptions.
-    private static func extractKVMetadata(
-        model: MLModel, kvInputNames: [String]
-    ) -> ([String: [NSNumber]], [String: MLMultiArrayDataType]) {
-        let inputDescs = model.modelDescription.inputDescriptionsByName
-        var shapes: [String: [NSNumber]] = [:]
-        var dtypes: [String: MLMultiArrayDataType] = [:]
-        for name in kvInputNames {
-            guard let c = inputDescs[name]?.multiArrayConstraint else { continue }
-            shapes[name] = c.shape
-            dtypes[name] = c.dataType
-        }
-        return (shapes, dtypes)
-    }
-
     /// Log I/O classification summary.
-    private static func logIOSummary(decodeIO: ClassifiedIO, prefillIO: ClassifiedIO) {
-        Log.info("[CoreML] Decode: logits=\(decodeIO.logitsOutputName), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), kvIn=\(decodeIO.kvInputNames.count), kvOut=\(decodeIO.kvOutputNames.count), slidingStates=\(decodeIO.stateNames.count)")
-        Log.info("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName), token=\(prefillIO.tokenInputName), pos=\(prefillIO.positionInputName), kvIn=\(prefillIO.kvInputNames.count), kvOut=\(prefillIO.kvOutputNames.count), slidingStates=\(prefillIO.stateNames.count)")
-        if decodeIO.nInputName != nil {
-            Log.info("[CoreML] Dynamic context: N input detected (decode=\(decodeIO.nInputName!), prefill=\(prefillIO.nInputName ?? "none"))")
-        }
+    private static func logIOSummary(
+        decodeIO: FunctionIO, prefillIO: FunctionIO, chunkSize: Int
+    ) {
+        Log.info("[CoreML] Decode: logits=\(decodeIO.logitsOutputName)\(decodeIO.logitsShape.map { $0.intValue }) dtype=\(decodeIO.logitsDataType.rawValue), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), ring=\(decodeIO.ringInputName)→\(decodeIO.ringOutputName), caches=\(decodeIO.stateNames.count) states")
+        Log.info("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName)\(prefillIO.logitsShape.map { $0.intValue }) dtype=\(prefillIO.logitsDataType.rawValue), chunk=\(chunkSize)")
     }
 
     // MARK: - Function Resolution
 
-    /// Round a cache size up to the nearest materialized size, clamped to the
-    /// largest size this model actually loaded. Returns nil for standard
-    /// (non-materialized) models.
-    ///
-    /// Delegates to ``cacheSizePolicy`` so this and `KVCacheState.grownToFit`
-    /// can never disagree. Note the clamp: asking for more than
-    /// `effectiveMaxSeqLen` yields `effectiveMaxSeqLen`, which is *smaller*
-    /// than requested — callers must cap their own token counts too.
-    public func materializedSize(forCacheSize cacheSize: Int) -> Int? {
-        guard materializedSizes != nil else { return nil }
-        return cacheSizePolicy.size(forNeeded: cacheSize)
+    /// Name of the function serving `size`, which callers get from a
+    /// ``KVCacheState`` and is therefore always one of `materializedSizes`.
+    private func functionName(prefix: String, size: Int) -> String {
+        "\(prefix)_\(size)"
     }
 
-    /// Resolve the function name for a given prefix and cache size.
-    /// For materialized models, always picks a concrete `{prefix}_{size}` —
-    /// even when the caller passes no cache-size hint — because `prefix`
-    /// alone (e.g. `"decode"`) isn't an exported function.
-    private func functionName(prefix: String, cacheSize: Int?) -> String {
-        if let sizes = materializedSizes {
-            if let cacheSize, let size = materializedSize(forCacheSize: cacheSize) {
-                return "\(prefix)_\(size)"
-            }
-            return "\(prefix)_\(sizes[0])"
-        }
-        return prefix
-    }
-
-    /// Get a loaded model by function name. Crashes if not loaded.
-    private func getFunction(_ name: String) -> MLModel {
+    /// The loaded model for `name`, or nil if it hasn't been loaded yet.
+    private func loadedFunction(named name: String) -> MLModel? {
         cacheLock.lock()
         defer { cacheLock.unlock() }
-        guard case .loaded(let model) = functions[name] else {
-            fatalError("[CoreML] Function '\(name)' not loaded. Call ensureLoaded(forGlobalCacheSize:) first.")
+        if case .loaded(let model) = functions[name] { return model }
+        return nil
+    }
+
+    /// The loaded model for a prediction, or a clear error naming the call the
+    /// caller skipped.
+    private func function(prefix: String, size: Int) throws -> MLModel {
+        let name = functionName(prefix: prefix, size: size)
+        guard let model = loadedFunction(named: name) else {
+            throw KVCacheError.functionNotLoaded(size: size)
         }
         return model
     }
 
-    /// Pre-load decode and prefill functions for a given global cache size.
-    ///
-    /// For standard models this is a no-op. For materialized models, loads the
-    /// function pair matching the given cache size (if not already cached).
-    /// Call from an async context before sync `prefill()`/`decode()` calls.
+    /// Pre-load *and specialize* the decode and prefill functions for a given
+    /// cache size. Call from an async context before sync `prefill()`/`decode()`
+    /// calls; every path that is about to predict at a new size goes through
+    /// here, which is what keeps ``specialize(name:size:)`` off the token loop.
     public func ensureLoaded(forGlobalCacheSize cacheSize: Int) async throws {
-        guard materializedSizes != nil else { return }
-        let decodeName = functionName(prefix: "decode", cacheSize: cacheSize)
-        let prefillName = functionName(prefix: "prefill", cacheSize: cacheSize)
+        let size = cacheSizePolicy.size(forNeeded: cacheSize)
+        let decodeName = functionName(prefix: "decode", size: size)
+        let prefillName = functionName(prefix: "prefill", size: size)
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask { _ = try await self.loadIfNeeded(name: decodeName) }
@@ -983,6 +683,60 @@ public final class CoreMLModel: @unchecked Sendable {
             }
             try await group.waitForAll()
         }
+
+        // Serial, deliberately: a specialization transiently allocates tens of
+        // GB (MPSGraph materializes the dequantized embedding tables), so two
+        // at once exhausts memory on machines that comfortably run one.
+        try specialize(name: decodeName, size: size)
+        if !isDecodeOnly {
+            try specialize(name: prefillName, size: size)
+        }
+    }
+
+    /// Run one throwaway prediction on a freshly loaded function, into a
+    /// scratch `MLState` that no conversation owns.
+    ///
+    /// A GPU-backed CoreML function does not finish compiling when it loads:
+    /// `MLModel.load` only builds the E5RT plan, and MPSGraph specializes the
+    /// executable lazily inside the *first* `predictionFromFeatures:`. For this
+    /// model that first call costs ~17 s of single-threaded MLIR work, almost
+    /// all of it constant-folding the block-32 int4 embedding tables that feed
+    /// `gather` (`LowerDequantizeND` → `foldCastAttribute`, one LLVM `APFloat`
+    /// per weight element), with a ~27 GB transient peak. Nothing caches it:
+    /// it is redone in every process, for every materialized function.
+    ///
+    /// So pay it here — at load, or at the moment a conversation grows into a
+    /// new size — instead of inside the first token the user is waiting on.
+    /// The scratch state matters: predictions mutate KV caches in place, so
+    /// warming through the live cache would write a phantom token 0 into it.
+    private func specialize(name: String, size: Int) throws {
+        cacheLock.lock()
+        let alreadyDone = !specializedFunctions.insert(name).inserted
+        cacheLock.unlock()
+        guard !alreadyDone else { return }
+
+        guard let model = loadedFunction(named: name) else {
+            throw KVCacheError.functionNotLoaded(size: size)
+        }
+        let start = CFAbsoluteTimeGetCurrent()
+        try autoreleasepool {
+            let scratch = try KVCacheState(
+                size: size,
+                caches: model.makeState(),
+                ringShape: decodeIO.ringShape,
+                ringDataType: decodeIO.ringDataType,
+                chunkSize: chunkSize
+            )
+            if name.hasPrefix("decode") {
+                _ = try decode(token: 0, position: 0, kvState: scratch)
+            } else {
+                _ = try prefill(
+                    tokens: [Int32](repeating: 0, count: chunkSize),
+                    startPosition: 0, logitsRow: 0, kvState: scratch
+                )
+            }
+        }
+        Log.info("[CoreML] Specialized '\(name)' in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start))s")
     }
 
     /// Result of checking the cache for `name`: an already-loaded model, or a
@@ -1062,13 +816,11 @@ public final class CoreMLModel: @unchecked Sendable {
     /// ascending size order. Non-blocking: later calls to `ensureLoaded` join
     /// in-flight tasks rather than issuing duplicate loads.
     public func preloadAllSizes(concurrency: Int = 2) {
-        guard let sizes = materializedSizes else { return }
-        let names = sizes.flatMap {
-            isDecodeOnly ? ["decode_\($0)"] : ["decode_\($0)", "prefill_\($0)"]
-        }
         Task.detached { [self] in
             let start = CFAbsoluteTimeGetCurrent()
-            let allOK = await self.drainLoads(names: names, concurrency: concurrency, progress: nil)
+            let allOK = await self.drainLoads(
+                names: self.allFunctionNames, concurrency: concurrency, progress: nil
+            )
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             Log.info("[CoreML] Background preload complete (\(String(format: "%.1f", elapsed))s, ok=\(allOK))")
             if allOK { self.markWarmed() }
@@ -1084,16 +836,17 @@ public final class CoreMLModel: @unchecked Sendable {
         concurrency: Int = 4,
         progress: @Sendable @escaping (_ completed: Int, _ total: Int) -> Void
     ) async {
-        guard let sizes = materializedSizes else {
-            progress(1, 1)
-            markWarmed()
-            return
-        }
-        let names = sizes.flatMap {
+        let allOK = await drainLoads(
+            names: allFunctionNames, concurrency: concurrency, progress: progress
+        )
+        if allOK { markWarmed() }
+    }
+
+    /// Every function this load retains, in ascending size order.
+    private var allFunctionNames: [String] {
+        materializedSizes.flatMap {
             isDecodeOnly ? ["decode_\($0)"] : ["decode_\($0)", "prefill_\($0)"]
         }
-        let allOK = await drainLoads(names: names, concurrency: concurrency, progress: progress)
-        if allOK { markWarmed() }
     }
 
     /// Core worker used by both `preloadAllSizes` and `warmSynchronously`:
@@ -1198,14 +951,11 @@ public final class CoreMLModel: @unchecked Sendable {
 
     /// Digest of everything that makes this load's warm-up distinct.
     private var warmScopeKey: String {
-        let sizes = materializedSizes.map {
-            $0.map(String.init).joined(separator: ",")
-        } ?? "standard"
         let scope = [
             sourceURL.standardizedFileURL.path,
             Self.computeUnitsTag(computeUnits),
             "decodeOnly=\(isDecodeOnly)",
-            "sizes=\(sizes)",
+            "sizes=\(materializedSizes.map(String.init).joined(separator: ","))",
         ].joined(separator: "|")
         return String(Self.hexString(SHA256.hash(data: Data(scope.utf8))).prefix(16))
     }
@@ -1222,399 +972,287 @@ public final class CoreMLModel: @unchecked Sendable {
 
     // MARK: - Prediction
 
-    /// Run one prefill chunk.
+    /// Run one prefill chunk and return the logits row for `logitsRow`.
+    ///
+    /// `tokens.count` must equal ``chunkSize``; the engine pads the prompt to a
+    /// chunk boundary. Only one row of the `[chunk, vocab]` output is ever
+    /// wanted (the last *real* token of the chunk), so the row is copied out
+    /// and the big output buffer is reused for the next chunk.
     public func prefill(
-        tokens: MLMultiArray,
-        seqLen: Int32,
-        kvState: KVCacheState,
-        globalCacheSize: Int32? = nil
-    ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
+        tokens: [Int32],
+        startPosition: Int32,
+        logitsRow: Int,
+        kvState: KVCacheState
+    ) throws -> MLMultiArray {
+        // This chunk writes cache rows startPosition ..< +count, so every one
+        // of them has to fit. The real prefill kernel would fault; the
+        // per-token loop would silently scribble past the end.
+        guard Int(startPosition) + tokens.count <= kvState.size else {
+            throw CoreMLModelError.positionOutOfRange(
+                position: Int(startPosition) + tokens.count - 1, cacheSize: kvState.size
+            )
+        }
+        guard logitsRow >= 0, logitsRow < tokens.count else {
+            throw KVCacheError.unexpectedBufferLayout(
+                "prefill logits row \(logitsRow) outside chunk of \(tokens.count)"
+            )
+        }
         if isDecodeOnly {
             return try decodeOnlyPrefill(
-                tokens: tokens, seqLen: seqLen,
-                kvState: kvState, globalCacheSize: globalCacheSize
+                tokens: tokens, startPosition: startPosition,
+                logitsRow: logitsRow, kvState: kvState
             )
         }
-        let activeModel = getFunction(
-            functionName(prefix: "prefill", cacheSize: globalCacheSize.map { Int($0) })
-        )
 
-        var features: [String: MLMultiArray] = [:]
-        features[prefillTokenInputName] = tokens
-        features[prefillPositionInputName] = MLMultiArray.int32Scalar(seqLen)
-        if let nName = prefillNInputName, let nValue = globalCacheSize {
-            features[nName] = MLMultiArray.int32Scalar(nValue)
-        }
+        let model = try function(prefix: "prefill", size: kvState.size)
+        try kvState.loadChunk(tokens)
+        kvState.setScalar(startPosition, in: kvState.positionScalar)
 
-        let provider = try CoreMLInputProvider(
-            features: features,
-            kvNames: prefillKVInputNames,
-            kvState: kvState
+        let inputs: [String: MLMultiArray] = [
+            prefillIO.tokenInputName: kvState.chunkTokens,
+            prefillIO.positionInputName: kvState.positionScalar,
+            prefillIO.ringInputName: kvState.ring,
+        ]
+
+        let logitsBacking = try kvState.prefillLogits(
+            shape: prefillIO.logitsShape, dataType: prefillIO.logitsDataType
         )
-        // The sliding caches are updated in place inside `slidingCaches`.
-        let result = try activeModel.prediction(from: provider, using: kvState.slidingCaches)
-        let logits = result.featureValue(for: prefillLogitsName)!.multiArrayValue!
-        let newKV = try KVCacheState.from(
-            prediction: result,
-            outputNames: prefillKVOutputNames,
-            inputNames: prefillKVInputNames,
-            globalNames: kvState.globalNames,
-            slidingCaches: kvState.slidingCaches
+        let logits = try predict(
+            model: model, io: prefillIO, inputs: inputs,
+            logitsBacking: logitsBacking, kvState: kvState
         )
-        return (logits, newKV)
+        return try PredictionBuffer.extractRow(logitsRow, from: logits, what: "prefill logits")
     }
 
-    /// Per-token prefill via repeated `decode()` calls — the fallback used
-    /// when only decode functions are loaded. Synthesizes a chunk-shaped
-    /// `[chunkSize, vocabSize]` logits buffer by stacking each step's
-    /// logits[0:vocabSize] row, so the engine's downstream
-    /// `extractLogitsAt(position:)` math works unchanged.
+    /// Per-token prefill via repeated `decode()` calls — the fallback used when
+    /// only decode functions are loaded. Slower than a real prefill function
+    /// (no fused chunk kernel), but keeps the resident MLModel count at 1
+    /// instead of 2, the only way to fit on iPhone 12 Pro / 6 GB.
     ///
-    /// Slower than a real prefill function (no fused chunk kernel), but
-    /// keeps the resident MLModel count at 1 instead of 2 — the only way
-    /// to fit on iPhone 12 Pro / 6 GB.
+    /// The chunk is 1 token in this mode, so in practice this runs one decode
+    /// and copies its logits — the loop is here for symmetry with a chunked
+    /// caller, not because a decode-only artifact ever gets a wide chunk.
     private func decodeOnlyPrefill(
-        tokens: MLMultiArray,
-        seqLen: Int32,
-        kvState: KVCacheState,
-        globalCacheSize: Int32?
-    ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
-        let chunkSize = tokens.count
-        let vocabSize = GemmaConfig.vocabSize
-
-        guard tokens.dataType == .int32, tokens.strides.last?.intValue == 1 else {
-            throw CoreMLModelError.unexpectedBufferLayout(
-                "prefill tokens are \(tokens.dataType) with strides \(tokens.strides); expected contiguous int32"
-            )
-        }
-        // This chunk writes KV rows seqLen ..< seqLen+chunkSize, so every one
-        // of them has to fit the global cache. The real prefill kernel would
-        // fault; the per-token loop would silently scribble past the end.
-        if let gc = globalCacheSize, Int(seqLen) + chunkSize > Int(gc) {
-            throw CoreMLModelError.positionOutOfRange(
-                position: Int(seqLen) + chunkSize - 1, cacheSize: Int(gc)
-            )
-        }
-
-        // Copy the token IDs out up front: `dataPointer` is only guaranteed
-        // valid inside the accessor, and chunkSize is 8.
-        var tokenIDs = [Int32](repeating: 0, count: chunkSize)
-        tokens.withUnsafeBufferPointer(ofType: Int32.self) { src in
-            for i in 0..<chunkSize { tokenIDs[i] = src[i] }
-        }
-
-        let result = try MLMultiArray(
-            shape: [NSNumber(value: chunkSize), NSNumber(value: vocabSize)],
-            dataType: .float32
-        )
-
-        var currentKV = kvState
-        for i in 0..<chunkSize {
+        tokens: [Int32],
+        startPosition: Int32,
+        logitsRow: Int,
+        kvState: KVCacheState
+    ) throws -> MLMultiArray {
+        var row: MLMultiArray?
+        for (i, token) in tokens.enumerated() {
             // autoreleasepool: without this, Metal-backed prediction temporaries
             // (IOSurface buffers, intermediate MLMultiArrays) accumulate across
-            // the 8 inner decodes — small per call, large enough cumulatively to
+            // the inner decodes — small per call, large enough cumulatively to
             // OOM on iPhone 12 Pro the moment the user starts typing.
-            currentKV = try autoreleasepool {
-                let (stepLogits, newKV) = try decode(
-                    token: tokenIDs[i],
-                    position: seqLen + Int32(i),
-                    kvState: currentKV,
-                    globalCacheSize: globalCacheSize
+            try autoreleasepool {
+                let logits = try decode(
+                    token: token, position: startPosition + Int32(i), kvState: kvState
                 )
-                try Self.copyLogitsRow(
-                    from: stepLogits, into: result, row: i, vocabSize: vocabSize
-                )
-                return newKV
+                if i == logitsRow {
+                    // Copy: the decode logits live in a backing that the next
+                    // step overwrites.
+                    row = try PredictionBuffer.extractRow(0, from: logits, what: "decode logits")
+                }
             }
         }
-        return (result, currentKV)
+        guard let row else {
+            throw KVCacheError.unexpectedBufferLayout("prefill chunk produced no logits row")
+        }
+        return row
     }
 
-    /// Copy one decode step's next-token distribution into row `row` of a
-    /// `[chunkSize, vocabSize]` Float32 buffer.
-    ///
-    /// Decode logits arrive as `[1, vocabSize]` (or `[vocabSize]`), so the
-    /// distribution occupies the first `vocabSize` elements. Everything is
-    /// validated before any raw-memory access: a dtype, length or stride
-    /// mismatch here is an out-of-bounds copy, not a crash.
-    private static func copyLogitsRow(
-        from stepLogits: MLMultiArray,
-        into destination: MLMultiArray,
-        row: Int,
-        vocabSize: Int
-    ) throws {
-        guard stepLogits.dataType == .float32 else {
-            throw CoreMLModelError.unexpectedBufferLayout(
-                "decode logits have dtype \(stepLogits.dataType), expected float32"
-            )
-        }
-        guard stepLogits.count >= vocabSize else {
-            throw CoreMLModelError.unexpectedBufferLayout(
-                "decode logits hold \(stepLogits.count) elements, expected at least \(vocabSize)"
-            )
-        }
-        guard stepLogits.strides.last?.intValue == 1 else {
-            throw CoreMLModelError.unexpectedBufferLayout(
-                "decode logits are not contiguous (strides \(stepLogits.strides))"
-            )
-        }
-        stepLogits.withUnsafeBufferPointer(ofType: Float32.self) { src in
-            destination.withUnsafeMutableBufferPointer(ofType: Float32.self) { dst, _ in
-                guard let srcBase = src.baseAddress, let dstBase = dst.baseAddress else { return }
-                dstBase.advanced(by: row * vocabSize).update(from: srcBase, count: vocabSize)
-            }
-        }
-    }
-
-    /// Run one decode step.
+    /// Run one decode step. The returned logits live in a double-buffered
+    /// backing: they stay valid across the *next* decode and are overwritten by
+    /// the one after, which is exactly the lifetime the sampling loop needs.
     public func decode(
         token: Int32,
         position: Int32,
-        kvState: KVCacheState,
-        globalCacheSize: Int32? = nil
-    ) throws -> (logits: MLMultiArray, kvState: KVCacheState) {
-        let activeModel = getFunction(
-            functionName(prefix: "decode", cacheSize: globalCacheSize.map { Int($0) })
-        )
-
-        var features: [String: MLMultiArray] = [:]
-        features[decodeTokenInputName] = MLMultiArray.int32Scalar(token)
-        features[decodePositionInputName] = MLMultiArray.int32Scalar(position)
-        if let nName = decodeNInputName, let nValue = globalCacheSize {
-            features[nName] = MLMultiArray.int32Scalar(nValue)
+        kvState: KVCacheState
+    ) throws -> MLMultiArray {
+        guard Int(position) < kvState.size else {
+            throw CoreMLModelError.positionOutOfRange(
+                position: Int(position), cacheSize: kvState.size
+            )
         }
+        let model = try function(prefix: "decode", size: kvState.size)
+        kvState.setScalar(token, in: kvState.tokenScalar)
+        kvState.setScalar(position, in: kvState.positionScalar)
 
-        let provider = try CoreMLInputProvider(
-            features: features,
-            kvNames: decodeKVInputNames,
-            kvState: kvState
+        let inputs: [String: MLMultiArray] = [
+            decodeIO.tokenInputName: kvState.tokenScalar,
+            decodeIO.positionInputName: kvState.positionScalar,
+            decodeIO.ringInputName: kvState.ring,
+        ]
+
+        let logitsBacking = try kvState.nextDecodeLogitsBacking(
+            shape: decodeIO.logitsShape, dataType: decodeIO.logitsDataType
         )
-        // The sliding caches are updated in place inside `slidingCaches`.
-        let result = try activeModel.prediction(from: provider, using: kvState.slidingCaches)
-        let logits = result.featureValue(for: decodeLogitsName)!.multiArrayValue!
-        let newKV = try KVCacheState.from(
-            prediction: result,
-            outputNames: decodeKVOutputNames,
-            inputNames: decodeKVInputNames,
-            globalNames: kvState.globalNames,
-            slidingCaches: kvState.slidingCaches
+        return try predict(
+            model: model, io: decodeIO, inputs: inputs,
+            logitsBacking: logitsBacking, kvState: kvState
         )
-        return (logits, newKV)
+    }
+
+    /// Shared prediction body: hand CoreML our preallocated output buffers, run
+    /// the stateful prediction, take the new ring, and return the logits.
+    ///
+    /// The KV caches never appear here — they are state, mutated in place
+    /// inside `kvState.caches`.
+    private func predict(
+        model: MLModel,
+        io: FunctionIO,
+        inputs: [String: MLMultiArray],
+        logitsBacking: MLMultiArray,
+        kvState: KVCacheState
+    ) throws -> MLMultiArray {
+        let options = MLPredictionOptions()
+        options.outputBackings = [
+            io.logitsOutputName: logitsBacking,
+            io.ringOutputName: kvState.ringSpare,
+        ]
+        let result = try model.prediction(
+            from: CoreMLInputProvider(values: inputs),
+            using: kvState.caches,
+            options: options
+        )
+        guard let ring = result.featureValue(for: io.ringOutputName)?.multiArrayValue else {
+            throw CoreMLModelError.missingOutput(io.ringOutputName)
+        }
+        guard let logits = result.featureValue(for: io.logitsOutputName)?.multiArrayValue else {
+            throw CoreMLModelError.missingOutput(io.logitsOutputName)
+        }
+        try kvState.adoptRing(ring)
+        if logits !== logitsBacking {
+            kvState.noteIgnoredBacking(io.logitsOutputName)
+        }
+        return logits
     }
 
     // MARK: - I/O Classification
 
-    /// Classified I/O names for a model function.
-    struct ClassifiedIO {
-        let logitsOutputName: String
-        let tokenInputName: String
-        let positionInputName: String
-        let nInputName: String?
-        /// KV features passed per call: the global caches plus `sliding_pos_ring`.
-        let kvInputNames: [String]
-        let kvOutputNames: [String]
-        /// CoreML state features: the sliding KV caches. Empty only for an
-        /// artifact exported before they became state.
-        let stateNames: Set<String>
-    }
-
-    /// Classify model I/O using name matching with positional fallback.
+    /// Read one function's I/O names, shapes, and dtypes, rejecting artifacts
+    /// that predate stateful KV caches.
     ///
-    /// The sliding KV caches are state, so they appear in neither
-    /// `inputDescriptionsByName` nor `outputDescriptionsByName`; what remains to
-    /// pair up is the global caches (`k_<slot>` ↔ `k_<slot>_out`) and
-    /// `sliding_pos_ring`.
-    static func classifyIO(model: MLModel) -> ClassifiedIO {
+    /// With every cache declared as state, the signature is small and rigid:
+    /// inputs are the token, the position, the int32 `sliding_pos_ring`, and
+    /// (on exports that keep it) the cache-length `N`; outputs are the
+    /// float logits and the updated ring. Anything named `k_<n>` / `v_<n>` on
+    /// the signature means the caches still cross the boundary.
+    static func classifyIO(model: MLModel, function: String) throws -> FunctionIO {
         let description = model.modelDescription
-        let stateNames = Set(description.stateDescriptionsByName.keys)
-        let outputDescs = description.outputDescriptionsByName
-        // Defensive: keep state features out of the input classification even
-        // if a future CoreML release starts listing them there too.
-        let inputDescs = description.inputDescriptionsByName
-            .filter { !stateNames.contains($0.key) }
+        let stateNames = description.stateDescriptionsByName.keys.sorted()
+        let inputs = description.inputDescriptionsByName
+        let outputs = description.outputDescriptionsByName
 
-        // Outputs: float32 = logits, everything else = KV
-        var logitsName = ""
-        var kvOutputs: [String] = []
-        for (name, desc) in outputDescs {
-            if let c = desc.multiArrayConstraint, c.dataType == .float32 {
-                logitsName = name
-            } else {
-                kvOutputs.append(name)
-            }
-        }
-        kvOutputs.sort { naturalCompare($0, $1) }
-
-        // Try name matching: input name ∈ output names → KV
-        let stateOutputSet = Set(kvOutputs)
-        var controlInputs: [String] = []
-        var kvInputs: [String] = []
-        for name in inputDescs.keys {
-            if stateOutputSet.contains(name) || stateOutputSet.contains(name + "_out") {
-                kvInputs.append(name)
-            } else {
-                controlInputs.append(name)
-            }
+        let cacheIO = (Array(inputs.keys) + Array(outputs.keys)).filter(isCacheName).sorted()
+        guard cacheIO.isEmpty, !stateNames.isEmpty else {
+            throw CoreMLModelError.modelPredatesCacheStates(
+                function: function, cacheFeatures: cacheIO
+            )
         }
 
-        // Fallback: if name matching found no state inputs, use positional split
-        if kvInputs.isEmpty && !kvOutputs.isEmpty {
-            let allInputs = Array(inputDescs.keys).sorted { naturalCompare($0, $1) }
-            let stateCount = kvOutputs.count
-            let controlCount = allInputs.count - stateCount
-            controlInputs = Array(allInputs.prefix(controlCount))
-            kvInputs = Array(allInputs.suffix(stateCount))
-        } else {
-            controlInputs.sort { naturalCompare($0, $1) }
-            kvInputs.sort { naturalCompare($0, $1) }
+        // Outputs: one float tensor (logits) and one int32 tensor (the ring).
+        var logitsName: String?
+        var ringOutputName: String?
+        for (name, desc) in outputs {
+            guard let c = desc.multiArrayConstraint else { continue }
+            if c.dataType == .int32 { ringOutputName = name } else { logitsName = name }
+        }
+        guard let logitsName, let logitsConstraint = outputs[logitsName]?.multiArrayConstraint else {
+            throw CoreMLModelError.unexpectedSignature(
+                function: function, detail: "no float logits output among \(outputs.keys.sorted())"
+            )
+        }
+        guard let ringOutputName else {
+            throw CoreMLModelError.unexpectedSignature(
+                function: function, detail: "no int32 ring output among \(outputs.keys.sorted())"
+            )
         }
 
-        assert(!logitsName.isEmpty, "No Float32 output found (logits)")
-        assert(kvInputs.count == kvOutputs.count,
-               "KV input count (\(kvInputs.count)) != output count (\(kvOutputs.count))")
+        // The ring input is the same feature one step earlier, so the exporter
+        // names it either identically or with the `_out` suffix stripped.
+        var ringCandidates = [ringOutputName]
+        if ringOutputName.hasSuffix("_out") {
+            ringCandidates.append(String(ringOutputName.dropLast("_out".count)))
+        }
+        let ringInputName = ringCandidates.first { inputs[$0] != nil }
+        guard let ringInputName, let ringConstraint = inputs[ringInputName]?.multiArrayConstraint else {
+            throw CoreMLModelError.unexpectedSignature(
+                function: function,
+                detail: "no input matching ring output '\(ringOutputName)' among \(inputs.keys.sorted())"
+            )
+        }
 
-        let (tokenName, posName, nName) = identifyControlInputs(
-            controlInputs, inputDescs: inputDescs
-        )
+        // Token and position are all that is left: the caches are state, and
+        // `concretize_cache_length` folds each function's own cache length into
+        // the graph, so nothing else crosses the boundary.
+        let control = inputs.keys.filter { $0 != ringInputName }.sorted()
+        guard control.count == 2 else {
+            throw CoreMLModelError.unexpectedSignature(
+                function: function,
+                detail: "expected token + position inputs, got \(control)"
+            )
+        }
+        let (tokenName, positionName) = identifyTokenAndPosition(control, inputs: inputs)
+        let tokenLength = inputs[tokenName]?.multiArrayConstraint?.shape
+            .map { $0.intValue }.reduce(1, *) ?? 1
 
-        return ClassifiedIO(
+        return FunctionIO(
             logitsOutputName: logitsName,
+            logitsShape: logitsConstraint.shape,
+            logitsDataType: logitsConstraint.dataType,
             tokenInputName: tokenName,
-            positionInputName: posName,
-            nInputName: nName,
-            kvInputNames: kvInputs,
-            kvOutputNames: kvOutputs,
+            tokenLength: tokenLength,
+            positionInputName: positionName,
+            ringInputName: ringInputName,
+            ringOutputName: ringOutputName,
+            ringShape: ringConstraint.shape,
+            ringDataType: ringConstraint.dataType,
             stateNames: stateNames
         )
     }
 
-    /// Distinguish token, position, and optional N inputs among control inputs.
-    private static func identifyControlInputs(
-        _ names: [String],
-        inputDescs: [String: MLFeatureDescription]
-    ) -> (tokenName: String, positionName: String, nInputName: String?) {
-        precondition(names.count == 2 || names.count == 3,
-                     "Expected 2 or 3 control inputs, got \(names.count): \(names)")
-
-        var nName: String? = nil
-        var remaining = names
-        if let idx = names.firstIndex(of: "N") {
-            nName = names[idx]
-            remaining.remove(at: idx)
-        }
-        precondition(remaining.count == 2,
-                     "After removing N, expected 2 control inputs, got \(remaining.count)")
-
-        // By element count: token input has more elements (prefill: 8 vs 1)
-        let count0 = inputDescs[remaining[0]]?.multiArrayConstraint?.shape
-            .map { $0.intValue }.reduce(1, *) ?? 1
-        let count1 = inputDescs[remaining[1]]?.multiArrayConstraint?.shape
-            .map { $0.intValue }.reduce(1, *) ?? 1
-        if count0 != count1 {
-            return count0 > count1
-                ? (remaining[0], remaining[1], nName)
-                : (remaining[1], remaining[0], nName)
-        }
-
-        // By name: "token" in name → token input
-        if remaining[0].contains("token") { return (remaining[0], remaining[1], nName) }
-        if remaining[1].contains("token") { return (remaining[1], remaining[0], nName) }
-
-        // Fallback: first naturally-sorted name is token
-        let sorted = remaining.sorted { naturalCompare($0, $1) }
-        return (sorted[0], sorted[1], nName)
+    /// `k_<n>` / `v_<n>`: a KV cache tensor on the function signature.
+    private static func isCacheName(_ name: String) -> Bool {
+        guard name.count >= 3 else { return false }
+        var chars = Array(name)
+        guard chars[0] == "k" || chars[0] == "v", chars[1] == "_" else { return false }
+        chars.removeFirst(2)
+        // `k_4_out` counts too — it is the same cache leaving the function.
+        let digits = chars.prefix { $0.isNumber }
+        guard !digits.isEmpty else { return false }
+        let rest = String(chars.dropFirst(digits.count))
+        return rest.isEmpty || rest == "_out"
     }
 
-    /// Detect KV inputs with flexible shapes (RangeDim) on dim 1.
-    private static func detectFlexibleGlobalKV(
-        model: MLModel,
-        kvInputNames: [String]
-    ) -> Set<String> {
-        var flex: Set<String> = []
-        for name in kvInputNames {
-            guard let desc = model.modelDescription.inputDescriptionsByName[name],
-                  let constraint = desc.multiArrayConstraint else { continue }
-            if constraint.shapeConstraint.type == .range {
-                flex.insert(name)
-            }
+    /// Tell the token input from the position input. Prefill's token input is
+    /// `[1, chunk]` so element count settles it; decode's are both `[1]`, where
+    /// the name does.
+    private static func identifyTokenAndPosition(
+        _ names: [String], inputs: [String: MLFeatureDescription]
+    ) -> (token: String, position: String) {
+        func count(_ name: String) -> Int {
+            inputs[name]?.multiArrayConstraint?.shape.map { $0.intValue }.reduce(1, *) ?? 1
         }
-        return flex
-    }
-
-    /// Natural string comparison: numeric segments are compared by value.
-    static func naturalCompare(_ a: String, _ b: String) -> Bool {
-        let aComponents = splitNumeric(a)
-        let bComponents = splitNumeric(b)
-        for (ac, bc) in zip(aComponents, bComponents) {
-            switch (ac, bc) {
-            case let (.text(at), .text(bt)):
-                if at != bt { return at < bt }
-            case let (.number(an), .number(bn)):
-                if an != bn { return an < bn }
-            case (.number, .text):
-                return true
-            case (.text, .number):
-                return false
-            }
+        let (a, b) = (names[0], names[1])
+        if count(a) != count(b) {
+            return count(a) > count(b) ? (a, b) : (b, a)
         }
-        return aComponents.count < bComponents.count
-    }
-
-    private enum NameComponent {
-        case text(String)
-        case number(Int)
-    }
-
-    private static func splitNumeric(_ s: String) -> [NameComponent] {
-        var result: [NameComponent] = []
-        var current = ""
-        var inDigits = false
-        for ch in s {
-            if ch.isNumber {
-                if !inDigits && !current.isEmpty {
-                    result.append(.text(current)); current = ""
-                }
-                inDigits = true
-                current.append(ch)
-            } else {
-                if inDigits && !current.isEmpty {
-                    result.append(.number(Int(current)!)); current = ""
-                }
-                inDigits = false
-                current.append(ch)
-            }
-        }
-        if !current.isEmpty {
-            result.append(inDigits ? .number(Int(current)!) : .text(current))
-        }
-        return result
+        if a.contains("token") { return (a, b) }
+        if b.contains("token") { return (b, a) }
+        return (a, b)
     }
 }
 
 // MARK: - Input Provider
 
-/// Custom MLFeatureProvider that combines token/position inputs with KV cache arrays.
+/// Minimal `MLFeatureProvider` over a name → array dictionary.
 final class CoreMLInputProvider: MLFeatureProvider {
     let featureNames: Set<String>
-    private var values: [String: MLFeatureValue]
+    private let values: [String: MLFeatureValue]
 
-    init(
-        features: [String: MLMultiArray],
-        kvNames: [String],
-        kvState: KVCacheState
-    ) throws {
-        var values: [String: MLFeatureValue] = [:]
-        values.reserveCapacity(features.count + kvNames.count)
-        for (name, array) in features {
-            values[name] = MLFeatureValue(multiArray: array)
-        }
-        for name in kvNames {
-            guard let array = kvState.arraysByName[name] else {
-                throw CoreMLModelError.missingKVInput(name)
-            }
-            values[name] = MLFeatureValue(multiArray: array)
-        }
-        self.values = values
+    init(values: [String: MLMultiArray]) {
+        self.values = values.mapValues { MLFeatureValue(multiArray: $0) }
         self.featureNames = Set(values.keys)
     }
 
@@ -1623,77 +1261,38 @@ final class CoreMLInputProvider: MLFeatureProvider {
     }
 }
 
-// MARK: - MLMultiArray Helpers
-
-extension MLMultiArray {
-    /// Create a single-element Int32 MLMultiArray.
-    public static func int32Scalar(_ value: Int32) -> MLMultiArray {
-        let array = try! MLMultiArray(shape: [1], dataType: .int32)
-        array[0] = NSNumber(value: value)
-        return array
-    }
-
-    /// Create an Int32 array of shape (1, length) from a Swift array.
-    public static func int32Row(_ values: [Int32]) -> MLMultiArray {
-        let array = try! MLMultiArray(shape: [1, NSNumber(value: values.count)], dataType: .int32)
-        let ptr = array.dataPointer.bindMemory(to: Int32.self, capacity: values.count)
-        for (i, v) in values.enumerated() { ptr[i] = v }
-        return array
-    }
-
-    /// Deep-copy an MLMultiArray to a new, independent buffer.
-    ///
-    /// CoreML reuses output MLMultiArray buffers across predictions.
-    /// Without copying, passing prediction N's outputs as prediction N+1's
-    /// inputs causes silent data corruption (aliased read/write).
-    public func deepCopy() throws -> MLMultiArray {
-        let copy = try MLMultiArray(shape: self.shape, dataType: self.dataType)
-        memcpy(copy.dataPointer, self.dataPointer,
-               self.count * KVCacheState.bytesPerElement(of: self.dataType))
-        return copy
-    }
-}
-
 // MARK: - Errors
 
 public enum CoreMLModelError: Error, LocalizedError {
-    case modelNotFound
-    case missingKVInput(String)
+    /// The artifact declares no materialized function pairs at all.
+    case notMaterialized(String)
     /// The artifact declares materialized functions, but none usable in the
     /// requested mode (e.g. prefill wanted, only `decode_<N>` exported).
     case noUsableMaterializedFunctions(decodeSizes: [Int], prefillSizes: [Int])
-    /// Could not work out which KV caches are global. Fatal rather than
-    /// degraded: an empty global set silently caps every conversation.
-    case globalKVDetectionFailed(String)
-    /// An MLMultiArray had a dtype/shape/stride we can't safely memcpy.
-    case unexpectedBufferLayout(String)
-    /// The artifact declares no CoreML state features, i.e. it was exported
-    /// before the sliding KV caches moved into state.
-    case modelPredatesStatefulKVCaches(function: String, kvInputCount: Int)
-    /// A token position doesn't fit the allocated global KV cache.
+    /// A KV cache still crosses the function signature, i.e. the artifact was
+    /// exported before the caches became CoreML state.
+    case modelPredatesCacheStates(function: String, cacheFeatures: [String])
+    /// The function's inputs/outputs are not the shape this runtime expects.
+    case unexpectedSignature(function: String, detail: String)
+    /// A declared output was missing from a prediction result.
+    case missingOutput(String)
+    /// A token position doesn't fit the allocated KV cache.
     case positionOutOfRange(position: Int, cacheSize: Int)
-    /// Both load strategies failed; both causes are kept because the standard
-    /// one is usually the real diagnosis.
-    case loadFailed(standard: Error, materialized: Error)
 
     public var errorDescription: String? {
         switch self {
-        case .modelNotFound:
-            "Model not found at the specified path"
-        case .missingKVInput(let name):
-            "KV cache is missing the array for input '\(name)'"
+        case .notMaterialized(let name):
+            "\(name) declares no `decode_<N>` functions — run `uv run gemma-materialize` on the exported package"
         case .noUsableMaterializedFunctions(let decodeSizes, let prefillSizes):
             "No usable materialized function pairs (decode sizes: \(decodeSizes), prefill sizes: \(prefillSizes))"
-        case .globalKVDetectionFailed(let reason):
-            "Could not identify the global KV cache inputs: \(reason)"
-        case .unexpectedBufferLayout(let reason):
-            "Unexpected MLMultiArray layout: \(reason)"
-        case .modelPredatesStatefulKVCaches(let function, let kvInputCount):
-            "Function '\(function)' declares no CoreML state features (it takes \(kvInputCount) KV inputs) — this model predates stateful KV caches. Re-run `uv run gemma-export`."
+        case .modelPredatesCacheStates(let function, let cacheFeatures):
+            "Function '\(function)' passes KV caches through its signature (\(cacheFeatures.isEmpty ? "no state features at all" : cacheFeatures.joined(separator: ", "))) — this model predates global-cache states. Re-run `uv run gemma-export`."
+        case .unexpectedSignature(let function, let detail):
+            "Function '\(function)' has an unexpected signature: \(detail)"
+        case .missingOutput(let name):
+            "Prediction result is missing output '\(name)'"
         case .positionOutOfRange(let position, let cacheSize):
-            "Token position \(position) does not fit a global KV cache of size \(cacheSize)"
-        case .loadFailed(let standard, let materialized):
-            "Model load failed. Standard (decode/prefill): \(standard.localizedDescription). Materialized (decode_N/prefill_N): \(materialized.localizedDescription)"
+            "Token position \(position) does not fit a KV cache of size \(cacheSize)"
         }
     }
 }

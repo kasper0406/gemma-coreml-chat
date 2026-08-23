@@ -41,7 +41,28 @@ The first CLI launch compiles `.mlpackage` → `.mlmodelc` next to the source (c
 
 `--no-materialize` still emits a single dynamic-shape function pair, but that artifact **no longer loads on any backend**: a `RangeDim` program that also declares CoreML states fails with E5RT/BNNS errors. It is useful only for inspecting the converted program.
 
-**KV caches: half state, half I/O.** Of the 15 cache slots, the 12 sliding-window ones are exported as CoreML **state** — the model owns those buffers and updates them in place, so they never cross the model boundary and the Swift runtime never copies them. The 3 global caches stay ordinary inputs/outputs because their dim 1 is symbolic (states must be static-shaped), and so does the int32 `sliding_pos_ring` (states must be floating point). The sliding writes are built from a whole-tensor `jnp.where` rather than `dynamic_update_slice`: on macOS 26 a state update fed by `slice_update` is applied to a freshly zeroed buffer instead of the live one, while a `select`-shaped update persists correctly.
+**Weights sharded below 2 GiB.** An `.mlpackage` stores every constant in `Data/com.apple.CoreML/weights/`, and coremltools writes all of them into one `weight.bin`. Once that single file crosses **2 GiB**, Core ML stops offering the model to the Neural Engine *entirely* — not op by op. On a synthetic chain of int4 per-channel matmuls, 1.61 GB of weights leaves all 96 ops ANE-eligible and ANE-scheduled, 2.15 GB leaves **zero** of 128, and the same 3.22 GB model spread over four ~1 GB files is back to 192 of 192. `gemma_chat/weight_shards.py` overrides the one coremltools hook that picks a constant's blob file and rolls over to `weight_1.bin`, `weight_2.bin`, … before the budget is spent; nothing else changes — same weights, same quantization, same cross-function deduplication.
+
+That is necessary but **not yet sufficient for this model**: with the blob capped at 2.03 GB, `--compute-units cpu-and-ne` still puts all 3935 `decode_512` ops on the CPU, because the ANE compiler rejects the graph for a second reason. A 5-layer export compiles for the ANE (455 of 728 ops eligible, 185 scheduled there); a 15-layer one already fails with
+
+```
+(ANECompiler) Error: live input tensor <private> not used in network
+(ANECompiler) Function call to BuildLayerGraph() failed in ZinCompilerCoreClassic.cpp:302
+```
+
+and the full 35-layer model takes `ANECompilerService` down with it (the XPC service exits mid-compile and Core ML falls back to CPU without reporting anything). `cpu-and-gpu` is unaffected and remains the shipping configuration.
+
+**KV caches: all state.** All 15 cache slots are exported as CoreML **state** — the model owns those buffers and updates them in place, so no cache ever crosses the model boundary and the Swift runtime never copies one. Only the int32 `sliding_pos_ring` stays ordinary I/O, because states must be floating point.
+
+The two halves get there differently. The 12 sliding-window caches are static-shaped from the start and are bound to state during StableHLO→MIL conversion. The 3 global caches carry a symbolic dim 1 through conversion (a state cannot have a flexible shape) and only become state afterwards, in the post-materialization MIL pass `gemma_chat/mil_passes/global_cache_states.py`, once every function has a concrete cache length. **Consequence for the runtime:** the state layout is now size-dependent — a state made from the `*_512` pair does not fit the `*_1024` pair, so growing the cache means making a new state and copying the old contents into it.
+
+Both halves have to dodge the same runtime trap: on macOS 26 a state update fed by `slice_update` is applied to a freshly zeroed buffer instead of the live one, while an update that produces a tensor of its own persists correctly. Every cache write is therefore a whole-tensor `jnp.where` rather than `dynamic_update_slice`, and `global_cache_states.py` wraps the result in a `fill_like` + `add`.
+
+Dropping `slice_update` also buys back decode time. Its `begin` is a runtime index, and MPSGraph reads that back to the CPU mid-encode — six global-cache writes per step, each draining the GPU pipeline, was ~17 ms of a ~79 ms decode step on `cpu-and-gpu`. A select costs one more whole-cache elementwise op instead (~0.02 ms at 512 tokens, ~2.8 ms at 65536) and never stalls.
+
+**Cache length folded in.** JAX passes the symbolic global cache length as an extra `N` argument, and since it is a value rather than a shape, materialization leaves it a runtime input — which keeps the global attention mask (`range_1d(end=N)`, `fill(shape=[1, 8, 1, N])`) symbolic even in a function specialized to one concrete cache size. `gemma_chat/mil_passes/concretize_cache_length.py` replaces `N` with each function's own constant and drops it from the signature, so no shape anywhere is symbolic and the masks fold to constants.
+
+**Global attention stays decomposed.** Concrete shapes would also let `fuse_attention_to_sdpa` fuse the 7 global attention sites it had to skip during export, but that fusion is deliberately not re-run: two Apple defects (macOS 26.5) make a global `scaled_dot_product_attention` unusable. The ANE partitioner fails `ANECCompile()` with *"live input tensor not used in network"* once a function holds two or more of them — the whole model then silently falls back off the Neural Engine — and BNNS SIGSEGVs executing a fused global SDPA with query length ≥ 2, which kills chunk-128 prefill on `cpu-only` and `cpu-and-ne`. The global sites therefore stay `matmul → add(mask) → softmax → matmul`, which passes both. The 12 sliding sites are fused at convert time and stay fused; neither defect touches them. See `materialize._concretize_cache_lengths` for the bisection artifacts and when this can be reverted.
 
 > **Re-export required.** The Swift runtime expects those state features. Loading a `.mlpackage` exported before this change fails with *"this model predates stateful KV caches"* — re-run `uv run gemma-export`.
 
@@ -49,7 +70,7 @@ The first CLI launch compiles `.mlpackage` → `.mlmodelc` next to the source (c
 
 All inference runs through native Swift for ~20x faster model loading vs Python coremltools:
 
-- **`GemmaCore/`** — Shared SPM library: model loading (`CoreMLModel`), KV cache (`KVCacheState` — global caches plus the shared `MLState` holding the sliding caches), tokenization (`GemmaTokenizer`), sampling, and the inference engine (`InferenceEngine`). One `MLState` is made per conversation via `CoreMLModel.makeState()` and passed to every function of the package, so switching between `decode_512`, `prefill_1024`, … mid-conversation keeps the same sliding caches.
+- **`GemmaCore/`** — Shared SPM library: model loading (`CoreMLModel`), KV cache (`KVCacheState` — the `MLState` holding every cache), tokenization (`GemmaTokenizer`), sampling, and the inference engine (`InferenceEngine`). One `MLState` is made per conversation *per cache size* via `CoreMLModel.makeState()`: it is shared by the `prefill_N`/`decode_N` pair, and on growth to `2N` a new state is made and the old cache contents are migrated into it.
 - **`cli/`** — Readline-based Swift CLI chat with streaming output.
 - **`ios/GemmaChat/`** — SwiftUI chat app. Uses eager prefill (prefills prompt chunks as the user types) for a snappy first token.
 
@@ -108,6 +129,7 @@ benchmarks/     Standalone Swift benchmark for model loading / first prediction
 - **Tokenizer errors** — re-run `uv run gemma-export`; it embeds the tokenizer inside the `.mlpackage` (the CLI falls back to downloading from Hugging Face if missing).
 - **`this model predates stateful KV caches`** — the `.mlpackage` was exported before the sliding KV caches became CoreML state. Re-run `uv run gemma-export`.
 - **Slow first load with `--compute-units all`** — ANE compilation can take 10–30 minutes, but is cached in `.mlmodelc` for subsequent runs.
+- **`cpu-and-ne` runs entirely on the CPU (0 mW ANE), then segfaults in prefill** — known and unfixed for the full 35-layer model; see the export section. `--compute-units cpu-only` fails the same way, so the segfault is BNNS executing this graph, not the ANE partitioning. Use `cpu-and-gpu`.
 
 ## License
 

@@ -14,10 +14,13 @@ placement, and the graph shapes this project actually produces.
 import numpy as np
 import jax
 import jax.numpy as jnp
+import jax.scipy.special
 import coremltools as ct
+from coremltools.converters.mil.mil import types as mil_types
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
 from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
+from gemma_chat.model import _embed_lookup
 
 # Kept in sync with gemma_chat/export.py:_mil_to_mlpackage.
 _REMOVED_PASSES = [
@@ -132,8 +135,8 @@ def rmsnorm(x, scale):
 
 
 def exact_gelu(x):
-    """The FFN activation from ``decode_coreml._ffn``."""
-    return jax.nn.gelu(x.astype(jnp.float32), approximate=False).astype(jnp.float16)
+    """The FFN activation from ``decode_coreml._gelu_exact`` — fp16, erf spelling."""
+    return x * 0.5 * (1.0 + jax.scipy.special.erf(x * float(1.0 / np.sqrt(2.0))))
 
 
 def logit_softcap(x):
@@ -253,35 +256,62 @@ def test_logit_softcap_fuses_to_scaled_tanh():
     assert abs(float(op.inputs["beta"].val) - 1.0 / 30.0) < 1e-4
 
 
-def test_rmsnorm_uses_reduce_mean():
-    """``fuse_reduce_keep_dims`` + coremltools' ``fuse_reduce_mean`` cover this."""
-    x = jnp.ones((1, 8, 256), jnp.float16)
-    scale = jnp.ones((256,), jnp.float16)
-    _, prog = _convert(rmsnorm, x, scale)
-
-    assert _count(prog, "reduce_mean") == 1
-    assert _count(prog, "reduce_sum") == 0
-    mean = next(op for op in _ops(prog) if op.op_type == "reduce_mean")
-    # fuse_reduce_keep_dims folded the rank-restoring reshape into the reduction.
-    assert bool(mean.inputs["keep_dims"].val) is True
+def _rmsnorm_const_scale(x):
+    """``rmsnorm`` with the scale as a weight constant, as in the real graph."""
+    return rmsnorm(x, jnp.asarray(np.full((x.shape[-1],), 0.5, np.float16)))
 
 
-def test_exact_gelu_fuses_to_one_op():
-    """``chlo.erfc`` is mapped natively and fused by ``fuse_gelu_erfc``."""
+def test_rmsnorm_fuses_to_l2_norm():
+    """``fuse_rmsnorm`` — the eight-op chain becomes ``l2_norm`` + one ``mul``.
+
+    ``(1, 1, D)`` needs no reshape: ``l2_norm`` normalizes over the last three
+    dims, which for that shape is exactly the last one.
+    """
+    x = jnp.ones((1, 1, 256), jnp.float16)
+    _, prog = _convert(_rmsnorm_const_scale, x)
+
+    assert _count(prog, "l2_norm") == 1
+    for op_type in ("reduce_mean", "reduce_sum", "rsqrt", "reshape"):
+        assert _count(prog, op_type) == 0, f"unfused RMSNorm leftover: {op_type}"
+    # eps' = d * eps, so that l2_norm's sum-of-squares matches mean + 1e-6.
+    l2 = next(op for op in _ops(prog) if op.op_type == "l2_norm")
+    assert abs(float(l2.inputs["epsilon"].val) - 256 * 1e-6) < 1e-9
+    # cast(fp32) -> l2_norm -> mul(sqrt(d)*scale) -> cast(fp16), nothing else.
+    assert sum(1 for op in _ops(prog) if op.op_type != "const") == 4
+
+
+def test_rmsnorm_off_canonical_shape_is_left_alone():
+    """``l2_norm`` reduces the last three dims, so a ``(1, L, H, hd)`` q-norm
+    would need reshaping around it — measurably a loss, so the pass skips it."""
+    for shape in ((1, 4, 8, 256), (1, 128, 256)):
+        _, prog = _convert(_rmsnorm_const_scale, jnp.ones(shape, jnp.float16))
+        assert _count(prog, "l2_norm") == 0, shape
+        assert _count(prog, "reduce_mean") == 1, shape
+        assert _count(prog, "rsqrt") == 1, shape
+
+
+def test_exact_gelu_fuses_to_one_fp16_op():
+    """``chlo.erf`` is mapped natively and fused by ``fuse_gelu_exact``.
+
+    No cast pair: the fused op runs in the fp16 activation dtype.
+    """
     _, prog = _convert(exact_gelu, jnp.ones((1, 8, 256), jnp.float16))
 
     assert _count(prog, "gelu") == 1
+    assert _count(prog, "cast") == 0
     for op_type in ("erf", "erfc", "tanh", "pow"):
         assert _count(prog, op_type) == 0, f"unfused gelu leftover: {op_type}"
+    gelu = next(op for op in _ops(prog) if op.op_type == "gelu")
+    assert gelu.outputs[0].dtype == mil_types.fp16
 
 
 def test_adjacent_rmsnorms_have_no_cast_roundtrip():
     """``collapse_cast_chains`` — coremltools keeps lossy downcast→upcast pairs."""
-    x = jnp.ones((1, 8, 256), jnp.float16)
+    x = jnp.ones((1, 1, 256), jnp.float16)
     scale = jnp.ones((256,), jnp.float16)
     _, prog = _convert(double_rmsnorm, x, scale, scale)
 
-    assert _count(prog, "reduce_mean") == 2
+    assert _count(prog, "l2_norm") == 2
     assert _cast_roundtrips(prog) == 0
 
 
@@ -349,3 +379,55 @@ def test_numerical_rmsnorm_and_gelu():
     ref_gelu = np.array(exact_gelu(jnp.array(x)))
     model, _ = _convert(exact_gelu, jnp.array(x), load=True)
     np.testing.assert_allclose(_predict(model, x), ref_gelu, atol=1e-2, rtol=1e-2)
+
+
+# ── weight quantization: what gets a constexpr and what does not ─────────
+
+def test_logit_projection_stays_unquantized_fp16():
+    """The [dim, vocab] logit projection must reach the model as a plain const.
+
+    Quantizing it at all is a trap in both directions.  int4 cannot carry the
+    logits (per-channel scales leave it no grouping to fall back on), and int8
+    — the width that could — is what MPSGraph's ``LowerDequantizeND`` pass
+    constant-folds on the *first* prediction of every function in every
+    process: measured at 16.7 s and an 18 GB transient for the real
+    [1536, 262144] tensor on CPU_AND_GPU, never cached to disk.  A plain fp16
+    const has no dequantize op for anything to fold.
+
+    The gather table in the same graph is the control: it is the same size and
+    over the same threshold, and it *does* get quantized.
+    """
+    rng = np.random.RandomState(5)
+    vocab = 262144
+    # Distinct embedding/logit dims, so neither tensor can be mistaken for the
+    # other's transpose when the converter picks a matmul orientation.
+    table = (rng.randn(vocab, 32) * 0.05).astype(np.float16)
+    hidden = (rng.randn(32, 64) * 0.1).astype(np.float16)
+    logit_w = (rng.randn(64, vocab) * 0.02).astype(np.float16)
+
+    def fn(tokens):
+        embedded = _embed_lookup(jnp.asarray(table), tokens)
+        return jnp.matmul(jnp.matmul(embedded, jnp.asarray(hidden)),
+                          jnp.asarray(logit_w))
+
+    _, prog = _convert(fn, jnp.zeros((1, 4), jnp.int32))
+
+    def _shapes(op_type):
+        return {tuple(op.outputs[0].shape)
+                for op in _ops(prog) if op.op_type == op_type}
+
+    quantized = _shapes("constexpr_blockwise_shift_scale")
+    assert not ({logit_w.shape, logit_w.T.shape} & quantized), (
+        f"the logit projection was quantized (constexprs: {quantized}); "
+        "MPSGraph folds int8 dequantizes and int4 is too lossy here"
+    )
+    assert table.shape in quantized, "the embedding table stopped being quantized"
+
+    # It reaches the model as a plain fp16 const instead.
+    logit_consts = [
+        op for op in _ops(prog)
+        if op.op_type == "const"
+        and tuple(op.outputs[0].shape) in (logit_w.shape, logit_w.T.shape)
+    ]
+    assert len(logit_consts) == 1, [op.name for op in logit_consts]
+    assert logit_consts[0].outputs[0].dtype == mil_types.fp16

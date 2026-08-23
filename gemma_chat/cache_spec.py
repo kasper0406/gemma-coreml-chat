@@ -10,10 +10,13 @@ pre-GQA-expansion, matching what `return_kv=True` returns from GemmaAttention.
 
 The JAX-traceable functions in `decode_coreml` take and return all 30 arrays
 (`[k_0, v_0, ..., k_14, v_14]`, one k/v pair per spec in `build_cache_specs`
-order), but the exported CoreML model does not: `export.py` binds the sliding
-pairs to CoreML **state** (static shape, float16) and keeps only the global
-pairs as inputs/outputs (their dim 1 is symbolic, which state cannot be).
-`sliding_pos_ring` stays I/O too, because CoreML states must be floating point.
+order), but the exported CoreML model does not: all 15 pairs are CoreML
+**state** (static shape, float16) there.  The sliding pairs are bound to state
+during StableHLO→MIL conversion by `export.py`; the global pairs cannot be
+(their dim 1 is symbolic, which state cannot be) and are converted by
+`mil_passes.global_cache_states` once materialization has made every function's
+cache length concrete.  `sliding_pos_ring` stays I/O, because CoreML states
+must be floating point.
 """
 
 from __future__ import annotations

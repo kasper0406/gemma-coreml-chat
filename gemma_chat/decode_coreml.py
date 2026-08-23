@@ -27,22 +27,63 @@ caches keep their symbolic dim-1 and stay ordinary inputs/outputs, and
 ``sliding_pos_ring`` stays I/O because it is int32 (states must be floating
 point).
 
-That is why every sliding-cache write below is a whole-tensor ``jnp.where``
-rather than ``jax.lax.dynamic_update_slice``: on macOS 26 a Core ML state write
-whose value comes from ``slice_update`` is applied to a freshly zeroed buffer
-instead of the persisted one, while a ``select``-shaped write persists
-correctly.  Global writes are unaffected and keep using
-``dynamic_update_slice``.
+That is why every cache write below is a whole-tensor ``jnp.where`` rather than
+``jax.lax.dynamic_update_slice``.  Two independent reasons, one per cache kind:
+
+* *Correctness* (sliding): on macOS 26 a Core ML state write whose value comes
+  from ``slice_update`` is applied to a freshly zeroed buffer instead of the
+  persisted one, while a ``select``-shaped write persists correctly.
+* *Speed* (global): ``slice_update`` with a runtime ``begin`` makes MPSGraph
+  read that index back to the CPU mid-encode
+  (``GPURegionRuntime::waitAndReadIntTensorData`` → ``waitUntilCompleted``),
+  draining the pipeline once per write — 6 times per decode step, ~17 ms.  A
+  select is one more whole-cache elementwise op (~0.02 ms at 512 tokens,
+  ~2.8 ms at 65536) and never stalls.
+
+Since materialization turns the global caches into state too (see
+``mil_passes.global_cache_states``), the first reason now applies to them as
+well: there is no ``slice_update`` left anywhere on a cache path.
 
 Tokens: right-padded — real tokens at positions 0..T-1, zeros at T..L-1.
+
+Numeric precision
+-----------------
+Every *stored* activation is fp16 — the residual stream, the attention
+inputs/outputs, the KV caches, the MLP activations.  fp32 is used only where an
+accumulation or a range genuinely needs it, mirroring how the HF and JAX Gemma
+references run bf16 storage with fp32 norms:
+
+* **RMSNorm statistics** (``_rmsnorm``, ``_rmsnorm_noscale``): the square, the
+  mean over the 1536/256-wide axis and the rsqrt run in fp32 — the sum of
+  squares reaches ~1e7 and would overflow fp16, and eps=1e-6 underflows to 0 in
+  fp16.  The normalized result is cast straight back to fp16.
+* **RoPE angles** (``model._apply_rope``): positions run to 65535, which fp16
+  cannot represent exactly; the sinusoid argument, ``sin`` and ``cos`` are
+  computed in fp32 and cast to fp16 before the rotation itself.
+* **The prefill ring-position scatter**, for the same range reason — see the
+  comment at its ``jnp.dot``.
+* **The logits**, from the output matmul onward: fp16 dot against the fp16
+  embedding table, fp32 out (upcasting the *weight* instead would put a 1.6 GB
+  fp32 constant in the graph — see the note in :func:`decode_step`).
+
+Everything else stays fp16 end to end, which matters because the decode graph is
+dispatch-bound: any op that returns fp32 drags its consumers up with it.  A
+single fp32 leak in ``_apply_rope`` used to promote q, and through it SDPA, the
+attention output and o_proj — which forced the 35 o_proj weights to be
+re-materialized as fp32 constants at runtime (528 MB) and put ~1 GB of fp32
+attention intermediates in every step.  Long-axis sums inside `matmul` and the
+fused ``scaled_dot_product_attention`` are left to the backend, which
+accumulates them in fp32.
 """
 
 from __future__ import annotations
 
+import math
 from typing import List, Tuple
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.special
 
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN
 from gemma_chat.model import AttentionType, Gemma4Config, _apply_rope, _embed_lookup
@@ -86,24 +127,79 @@ def empty_pos_ring(cfg: Gemma4Config = E2B_CONFIG) -> jnp.ndarray:
     return jnp.full((1, cfg.sliding_window_size), -1, dtype=jnp.int32)
 
 
-def _sliding_ring_write(cache, value, position, window: int):
-    """Write ``value`` into ring slot ``position % window`` of ``cache``.
+def _row_write(cache, value, slot):
+    """Write the single row ``value`` into row ``slot`` of ``cache``.
 
-    ``cache`` is ``(1, window, nkv, hd)``, ``value`` is ``(1, 1, nkv, hd)`` and
-    broadcasts across the window; the mask selects the one live slot.  Equivalent
-    to ``jax.lax.dynamic_update_slice(cache, value, (0, position % window, 0, 0))``
-    but built from a whole-tensor select, which is what a CoreML state update
-    needs — see the module docstring.
+    ``cache`` is ``(1, L, nkv, hd)``, ``value`` is ``(1, 1, nkv, hd)`` and
+    broadcasts across the length axis; the mask selects the one live row.
+    Equivalent to ``jax.lax.dynamic_update_slice(cache, value, (0, slot, 0, 0))``
+    but built from a whole-tensor select — see the module docstring.
+
+    ``L`` may be a symbolic dimension (the global caches trace with one).
     """
+    length = cache.shape[1]
     mask = (
-        jnp.arange(window, dtype=jnp.int32) == (position % window)
-    )[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]  # (1, window, 1, 1)
+        jnp.arange(length, dtype=jnp.int32) == slot
+    )[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]  # (1, L, 1, 1)
     return jnp.where(mask, value, cache)
+
+
+def _sliding_ring_write(cache, value, position, window: int):
+    """Write ``value`` into ring slot ``position % window`` of ``cache``."""
+    return _row_write(cache, value, position % window)
+
+
+def _chunk_write(cache, value, slots):
+    """Scatter the C rows of ``value`` into rows ``slots`` of ``cache``.
+
+    ``cache`` is ``(1, L, nkv, hd)``, ``value`` ``(1, C, nkv, hd)`` and ``slots``
+    ``(C,)`` int32 — the destination row of each chunk token.  The one-hot
+    matmul places every row at once and the select keeps the rows no token
+    claimed, so the whole thing is one whole-tensor write — see the module
+    docstring.
+
+    Rows outside ``0 .. L-1`` are simply dropped, where the
+    ``dynamic_update_slice`` this replaced would have clamped the whole block
+    back inside and written it at the wrong offset.
+    """
+    length = cache.shape[1]
+    # write_mask[l, c] = True iff token c belongs in row l.
+    write_mask = (
+        jnp.arange(length, dtype=jnp.int32)[:, None] == slots[None, :]
+    )  # (L, C)
+    gathered = jnp.einsum('lc,bchd->blhd', write_mask.astype(value.dtype), value)
+    any_written = write_mask.any(axis=1)[None, :, None, None]  # (1, L, 1, 1)
+    return jnp.where(any_written, gathered, cache)
 
 
 # ---------------------------------------------------------------------------
 # Shared utilities
 # ---------------------------------------------------------------------------
+
+_INV_SQRT2 = float(1.0 / math.sqrt(2.0))
+
+
+def _gelu_exact(x):
+    """Exact GELU in ``x``'s own dtype, spelled so the converter emits one op.
+
+    ``jax.nn.gelu(x, approximate=False)`` writes this as ``0.5 * x * erfc(-x/√2)``,
+    and stablehlo-coreml's ``chlo.erfc`` handler builds ``1 - erf(...)`` from an
+    fp32 Python literal, which fails to type-check against an fp16 operand.  The
+    algebraically identical ``0.5 * x * (1 + erf(x/√2))`` spelling goes through
+    the ``chlo.erf`` handler — a bare ``mb.erf`` — and is exactly the form
+    coremltools' ``fuse_gelu_exact`` matches, so the chain collapses to a single
+    native ``gelu(mode="EXACT")``.
+
+    That op runs in the activation dtype, which is why this is called on fp16
+    directly.  The fp32 round-trip it replaces existed to keep the erf
+    *polynomial* out of fp16; there is no polynomial left to protect once the
+    whole thing is one op, and the cast pair around it cost two dispatches per
+    GELU (140 in the full decode graph).  The cancellation in ``1 + erf`` for
+    very negative ``x`` never reaches the runtime either — the fused op computes
+    the tail itself.
+    """
+    return x * 0.5 * (1.0 + jax.scipy.special.erf(x * _INV_SQRT2))
+
 
 def _rmsnorm(x, scale):
     x32 = x.astype(jnp.float32)
@@ -150,17 +246,14 @@ def _ffn(lp, x, hidden_dim: int):
     """GeLU-gated FFN. x: (..., D) → (..., D)."""
     gate = jnp.dot(x, lp['mlp']['gate_proj']['kernel'])
     up   = jnp.dot(x, lp['mlp']['up_proj']['kernel'])
-    # GELU in float32 so the erf polynomial stays scalar (avoids constexpr quantization)
-    gate = jax.nn.gelu(gate.astype(jnp.float32), approximate=False).astype(jnp.float16)
+    gate = _gelu_exact(gate)
     return jnp.dot(gate * up, lp['mlp']['down_proj']['kernel'])
 
 
 def _ple_gate(lp, x, ple_slice):
     """Per-layer input gate block. x: (..., D), ple_slice: (..., d) → (..., D)."""
     gate_proj = jnp.dot(x, lp['per_layer_input_gate']['kernel'])
-    gate = jax.nn.gelu(
-        gate_proj.astype(jnp.float32), approximate=False,
-    ).astype(jnp.float16) * ple_slice
+    gate = _gelu_exact(gate_proj) * ple_slice
     proj = jnp.dot(gate, lp['per_layer_projection']['kernel'])
     proj = _rmsnorm(proj, lp['post_per_layer_input_norm']['scale'])
     return x + proj
@@ -215,17 +308,16 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
         v_new = _rmsnorm_noscale(v_new)
         k_new = _apply_rope(k_new, pos_arr, base_freq, rope_frac)
 
-        k_new_f16 = k_new.astype(jnp.float16)
-        v_new_f16 = v_new.astype(jnp.float16)
+        # k_new/v_new are already fp16 — the norms and `_apply_rope` are both
+        # dtype-preserving — so they go straight into the fp16 caches.
         if is_sliding:
             W = cfg.sliding_window_size
-            k_updated = _sliding_ring_write(k_cache, k_new_f16, position, W)
-            v_updated = _sliding_ring_write(v_cache, v_new_f16, position, W)
+            k_updated = _sliding_ring_write(k_cache, k_new, position, W)
+            v_updated = _sliding_ring_write(v_cache, v_new, position, W)
         else:
-            # Global caches stay ordinary I/O tensors — linear write at the
-            # absolute position.
-            k_updated = jax.lax.dynamic_update_slice(k_cache, k_new_f16, (0, position, 0, 0))
-            v_updated = jax.lax.dynamic_update_slice(v_cache, v_new_f16, (0, position, 0, 0))
+            # Global: linear write, row index = absolute position.
+            k_updated = _row_write(k_cache, k_new, position)
+            v_updated = _row_write(v_cache, v_new, position)
         k_full, v_full = k_updated, v_updated
 
     # Attention validity mask
@@ -350,8 +442,13 @@ def decode_step(
         x = x * lp['layer_scalar']
 
     x = _rmsnorm(x, params['norm']['scale'])
-    logits = jnp.dot(x[0, 0].astype(jnp.float32),
-                     params['embed_tokens'].T.astype(jnp.float32))  # (vocab,)
+    # fp16 matmul, fp32 only from the logits onward.  Upcasting the weight
+    # instead would put a [dim, vocab] *fp32* constant in the graph — 1.6 GB
+    # that no pass can shrink, since the export leaves this tensor unquantized
+    # (see ``mil_passes/quantize_const_weights``: int4 cannot carry the logits
+    # and int8 is what MPSGraph constant-folds on every first prediction).
+    logits = jnp.dot(x[0, 0],
+                     params['embed_tokens'].T).astype(jnp.float32)  # (vocab,)
     if cfg.final_logit_softcap is not None:
         cap = cfg.final_logit_softcap
         logits = jnp.tanh(logits / cap) * cap
@@ -370,13 +467,12 @@ def decode_step(
 # Chunked-prefill attention (for chunk_prefill_step)
 # ---------------------------------------------------------------------------
 
-def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
+def _attn_chunk(lp, x, positions, cfg: Gemma4Config, attn_type: str,
                 k_cache, v_cache, pos_ring=None):
     """Chunk attention with KV cache read/write.
 
     x: (1, C, D)  — C = CHUNK_SIZE tokens
     positions: (1, C) int32  — absolute positions
-    start_pos: () int32  — absolute position of first token in chunk
     k_cache, v_cache: (1, cache_len, nkv, hd)
     pos_ring: (1, W) int32 — ring position tracker (required for sliding layers)
 
@@ -405,29 +501,13 @@ def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
     q = _apply_rope(q, positions, base_freq, rope_frac)
     k_new = _apply_rope(k_new, positions, base_freq, rope_frac)
 
-    k_new_f16 = k_new.astype(jnp.float16)
-    v_new_f16 = v_new.astype(jnp.float16)
-
-    if is_sliding:
-        # Ring-buffer write via einsum scatter.  Already a whole-tensor select,
-        # which is what the Core ML state update needs (see module docstring).
-        W = cfg.sliding_window_size
-        abs_pos = positions[0]  # (C,)
-        ring_slots = abs_pos % W  # (C,)
-        # write_mask[w, c] = True iff ring_slots[c] == w
-        write_mask = (jnp.arange(W, dtype=jnp.int32)[:, None]
-                      == ring_slots[None, :])  # (W, C)
-        wm_f16 = write_mask.astype(jnp.float16)
-        # Scatter chunk values into ring positions.
-        k_gathered = jnp.einsum('wc,bchd->bwhd', wm_f16, k_new_f16)
-        v_gathered = jnp.einsum('wc,bchd->bwhd', wm_f16, v_new_f16)
-        any_written = write_mask.any(axis=1)[None, :, None, None]  # (1, W, 1, 1)
-        k_updated = jnp.where(any_written, k_gathered, k_cache)
-        v_updated = jnp.where(any_written, v_gathered, v_cache)
-    else:
-        # Global: linear write via dynamic_update_slice.
-        k_updated = jax.lax.dynamic_update_slice(k_cache, k_new_f16, (0, start_pos, 0, 0))
-        v_updated = jax.lax.dynamic_update_slice(v_cache, v_new_f16, (0, start_pos, 0, 0))
+    abs_pos = positions[0]  # (C,)
+    # Sliding layers wrap into the ring; global layers write at the absolute
+    # position.  Either way one whole-tensor scatter (see module docstring).
+    # k_new/v_new are already fp16 (the norms and `_apply_rope` preserve dtype).
+    slots = abs_pos % cfg.sliding_window_size if is_sliding else abs_pos
+    k_updated = _chunk_write(k_cache, k_new, slots)
+    v_updated = _chunk_write(v_cache, v_new, slots)
 
     # GQA repeat for attention
     kv_rep = num_heads // num_kv_heads
@@ -459,7 +539,7 @@ def _attn_chunk(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
     return out, k_updated, v_updated
 
 
-def _attn_chunk_shared(lp, x, positions, start_pos, cfg: Gemma4Config, attn_type: str,
+def _attn_chunk_shared(lp, x, positions, cfg: Gemma4Config, attn_type: str,
                        shared_kv, pos_ring=None):
     """Chunk attention using K/V from a source (KV-shared) layer.
 
@@ -554,9 +634,18 @@ def chunk_prefill_step(
     write_mask = (jnp.arange(W, dtype=jnp.int32)[:, None]
                   == ring_slots[None, :])  # (W, C)
     any_written = write_mask.any(axis=1)  # (W,)
-    # Use float16 dot — MPS does not support int32 matmul.
+    # MPS has no int32 matmul, so the scatter runs as a float dot — but it has
+    # to be **fp32**, not fp16: these are absolute positions running up to
+    # max_seq_len-1 = 65535, and fp16 only represents integers exactly below
+    # 2048.  In fp16 every position past 2048 lands in the ring rounded (off by
+    # 2 at 4096), and 65535 rounds to 65536 — past fp16's 65504 max — so the
+    # top size bucket writes inf and the int32 cast turns the whole ring to
+    # garbage.  Either way the `pk <= pos_q` validity test is corrupted.  fp32
+    # is exact for every position (integers are exact below 2^24).  This is the
+    # one deliberately-fp32 tensor left in the graph; it is a single
+    # [W, C] x [C] product per prefill call.
     new_ring_vals = jnp.dot(
-        write_mask.astype(jnp.float16), abs_pos.astype(jnp.float16)
+        write_mask.astype(jnp.float32), abs_pos.astype(jnp.float32)
     ).astype(jnp.int32)  # (W,)
     sliding_pos_ring = jnp.where(any_written[None, :], new_ring_vals[None, :],
                                  sliding_pos_ring)
@@ -587,14 +676,13 @@ def chunk_prefill_step(
             src = shared_sources[i]
             k_src, v_src = kv_own[src]
             pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
-            attn_out = _attn_chunk_shared(lp, x_ln, positions, start_position,
-                                          cfg, attn_type, (k_src, v_src),
-                                          pos_ring=pr)
+            attn_out = _attn_chunk_shared(lp, x_ln, positions, cfg, attn_type,
+                                          (k_src, v_src), pos_ring=pr)
         else:
             k_old, v_old = kv_own[i]
             pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
-            attn_out, k_new, v_new = _attn_chunk(lp, x_ln, positions, start_position,
-                                                  cfg, attn_type, k_old, v_old,
+            attn_out, k_new, v_new = _attn_chunk(lp, x_ln, positions, cfg,
+                                                  attn_type, k_old, v_old,
                                                   pos_ring=pr)
             kv_own[i] = (k_new, v_new)
 
@@ -614,8 +702,10 @@ def chunk_prefill_step(
         x = x * lp['layer_scalar']
 
     x = _rmsnorm(x, params['norm']['scale'])
-    logits = jnp.dot(x[0].astype(jnp.float32),
-                     params['embed_tokens'].T.astype(jnp.float32))  # (C, vocab)
+    # fp16 matmul, fp32 from the logits onward — see the note in
+    # :func:`decode_step` on why the weight must not be upcast.
+    logits = jnp.dot(x[0],
+                     params['embed_tokens'].T).astype(jnp.float32)  # (C, vocab)
     if cfg.final_logit_softcap is not None:
         cap = cfg.final_logit_softcap
         logits = jnp.tanh(logits / cap) * cap
