@@ -329,21 +329,27 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
         # Global linear mask: slot index == absolute position.
         valid = jnp.arange(max_len, dtype=jnp.int32) <= position
 
+    # GQA without replicating the cache.  ``jnp.repeat(k, kv_rep, axis=2)``
+    # would materialize kv_rep copies of the *entire* cache per layer per token
+    # — (1, max_len, H, hd) fp16, which the exporter emits as expand_dims+tile:
+    # ~75 MB/step at max_len 512 and ~805 MB/step at 65536, all of it pure
+    # memory traffic.  Instead, group the query heads: head h attends to kv
+    # head h // kv_rep, so reshaping q to (1, num_kv_heads, kv_rep, hd) makes
+    # the batch dims line up with k/v as (1, num_kv_heads, max_len, hd) and the
+    # matmul needs no broadcast at all.
     kv_rep = num_heads // num_kv_heads
-    if kv_rep > 1:
-        k_full = jnp.repeat(k_full, kv_rep, axis=2)
-        v_full = jnp.repeat(v_full, kv_rep, axis=2)
 
-    qt = jnp.transpose(q, (0, 2, 1, 3))                    # (1, H, 1, hd)
-    kt = jnp.transpose(k_full, (0, 2, 1, 3))               # (1, H, max_len, hd)
+    qg = jnp.transpose(q, (0, 2, 1, 3))                    # (1, H, 1, hd)
+    qg = qg.reshape(1, num_kv_heads, kv_rep, hd)           # (1, G, R, hd)
+    kt = jnp.transpose(k_full, (0, 2, 1, 3))               # (1, G, max_len, hd)
     vt = jnp.transpose(v_full, (0, 2, 1, 3))
 
-    w = jnp.matmul(qt, jnp.swapaxes(kt, -2, -1))           # (1, H, 1, max_len)
+    w = jnp.matmul(qg, jnp.swapaxes(kt, -2, -1))           # (1, G, R, max_len)
     w = jnp.where(valid[jnp.newaxis, jnp.newaxis, jnp.newaxis], w, -10000.0)
     w = jax.nn.softmax(w, axis=-1)
 
-    out = jnp.matmul(w, vt)                                 # (1, H, 1, hd)
-    out = jnp.transpose(out, (0, 2, 1, 3)).reshape(1, 1, num_heads * hd)
+    out = jnp.matmul(w, vt)                                 # (1, G, R, hd)
+    out = out.reshape(1, 1, num_heads * hd)
     out = jnp.dot(out[0, 0], sa['o_proj']['kernel'])[None, None, :]
     return out, k_updated, v_updated
 
