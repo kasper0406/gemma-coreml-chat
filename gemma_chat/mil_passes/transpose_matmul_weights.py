@@ -135,6 +135,22 @@ def _rewrite_block(block) -> int:
             before_op=op,
             name=cx.name + "_t",
         )
+        # Carry the weight ids across.  In a multifunction program every size
+        # shares one weight blob, and that sharing is expressed by ``weight_id``
+        # on the backing consts (see materialize._scope_auto_weight_ids).  A
+        # freshly built constexpr has none, and ``const_deduplication`` cannot
+        # re-derive them this late -- it refuses to run once any const already
+        # carries an id.  So each function would serialize its own copy of every
+        # rewritten weight: 16 copies in the shipped export, 14 GB instead of
+        # 3.3 GB.  Deriving the new id from the old one reproduces exactly the
+        # sharing the original had, without comparing values.
+        for _param in ("data", "scale"):
+            src_c = cx.inputs[_param].op
+            dst_c = new_w.op.inputs[_param].op
+            src_id = getattr(src_c, "weight_id", None) if src_c is not None else None
+            if src_id is not None and dst_c is not None and dst_c.op_type == "const":
+                dst_c.weight_id = f"{src_id}_t"
+
         new_mm = mb.matmul(
             x=op.x,
             y=new_w,
