@@ -59,6 +59,7 @@ import coremltools as ct
 import gemma_chat.weight_shards  # noqa: F401  — caps blob files below 2 GiB
 from gemma_chat.mil_passes.concretize_cache_length import concretize_cache_length
 from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
+from gemma_chat.mil_passes.transpose_matmul_weights import transpose_matmul_weights
 
 
 # Default: powers of 2 from 512 to MAX_SEQ_LEN (65536).
@@ -115,6 +116,17 @@ def _concretize_cache_lengths(prog, function_name_to_length: dict[str, int]) -> 
     pass_obj = concretize_cache_length()
     pass_obj.function_name_to_length = function_name_to_length
     pass_obj.apply(prog)
+
+    pipeline = ct.PassPipeline.EMPTY
+    pipeline.append_pass("common::dead_code_elimination")
+    _PassPipelineManager.apply_pipeline(prog, pipeline)
+
+
+def _run_dce(prog) -> None:
+    """Run dead_code_elimination on *prog* (keeps ``coreml_update_state``)."""
+    from coremltools.converters.mil.mil.passes.pass_pipeline import (
+        PassPipelineManager as _PassPipelineManager,
+    )
 
     pipeline = ct.PassPipeline.EMPTY
     pipeline.append_pass("common::dead_code_elimination")
@@ -235,6 +247,15 @@ def _materialize_single_function(
     _concretize_cache_lengths(
         prog, {f"{target_prefix}_{size}": size for size in sizes}
     )
+
+    # Last, on the final graph: put every quantized matmul weight back in the
+    # [N, K] / transpose_y=True orientation, then drop the dead originals.
+    # ``common::fuse_transpose_matmul`` (in PassPipeline.DEFAULT, above) folds
+    # the converter's explicit transpose into the matmul flag and leaves the
+    # weight as [K, N] with transpose_y=False -- an orientation the GPU backend
+    # runs ~2.2x slower.  See the pass docstring.
+    transpose_matmul_weights().apply(prog)
+    _run_dce(prog)
 
     # After materialization, point the default at one of the new functions.
     # (The upstream helper hard-codes "main", which breaks for non-"main"
@@ -424,6 +445,19 @@ def _materialize_multifunction_source(
         prog,
         {f"{src_fn}_{size}": size for src_fn, _ in src_specs for size in sizes},
     )
+
+    # Last, on the final graph: put every quantized matmul weight back in the
+    # [N, K] / transpose_y=True orientation.  ``common::fuse_transpose_matmul``
+    # (in PassPipeline.DEFAULT, above) folds the converter's explicit transpose
+    # into the matmul flag and leaves the weight as [K, N] with
+    # transpose_y=False -- an orientation the GPU backend runs ~2.2x slower.
+    # See the pass docstring.
+    transpose_matmul_weights().apply(prog)
+
+    # ...then drop the [K, N] originals.  They are unreachable after the
+    # rewrite, but nothing else runs dce this late (``skip_all_passes`` is set
+    # below), so without this every rewritten weight is serialized twice.
+    _run_dce(prog)
 
     # Smallest decode (if present) as default — least work on load; matches
     # gemma-export's convention.
