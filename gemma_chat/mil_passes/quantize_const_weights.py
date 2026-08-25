@@ -21,24 +21,29 @@ consumes the tensor (see :func:`_quantize_weight`):
   feed ``gather``, which never runs on the ANE anyway, so there is nothing to
   gain from per-channel scales and real accuracy to lose: one block would span
   all 262144 vocab rows.  Scale shape stays [V, D/32].
-* **Not quantized at all** — plain fp16 — for the [dim, VOCAB_SIZE] logit
-  projection.  int4 is more than it can carry (it emits the logits directly and
-  per-channel scales leave it no grouping to fall back on), and int8, which
-  would carry it, is exactly what MPSGraph cannot lower: its
-  ``LowerDequantizeND`` pass constant-folds an **int8**
-  constexpr_blockwise_shift_scale feeding a matmul on the *first* prediction of
-  every function in every process, element-at-a-time through
-  ``llvm::APFloat``, and never caches the result.  Measured on this tensor
-  ([1536, 262144]) on CPU_AND_GPU: 16.7 s and an 18 GB transient for int8
-  per-channel, 17.8 s for int8 block-32, versus 0.09 s for int4 per-channel and
-  0.06 s for a plain fp16 const.  int4 never folds and neither does fp16, so the
-  choice is between int4's accuracy loss and fp16's +402 MB; fp16 wins.
-  Vocab sits on the *last* axis there, so the leading-dim check keeps it off the
-  gather-table path.
+* **Block-32 int8** for the [dim, VOCAB_SIZE] logit projection.  This used to
+  be left as plain fp16, for two reasons that no longer hold now that weights
+  reach the matmul as [N, K] with ``transpose_y=True`` (see
+  ``mil_passes.transpose_matmul_weights``):
 
-This pass runs early in the pipeline so that coremltools' ~95 optimization
-passes work on a compressed model instead of a full ~17GB fp32 model,
-which prevents OOM crashes on memory-constrained machines during ct.convert.
+  - *"int8 makes MPSGraph constant-fold on every first prediction."*  That is
+    specific to the old [K, N] / ``transpose_y=False`` orientation.  Measured on
+    a fresh process at N=262144: int8 per-channel takes **16.3 s** to first
+    predict in the old orientation and **0.06 s** in the new one, the same as
+    fp16.  There is nothing left to avoid.
+  - *"int4 is too lossy for logits."*  Still true, and int4 is no faster here:
+    2.02 vs 2.11 ms at M=1 and 43.2 vs 43.1 ms at M=128.  int8 it is.
+
+  Block-32 rather than per-channel is **load-bearing for correctness**, not a
+  performance choice: in the [N, K] / ``transpose_y=True`` orientation Core ML's
+  int8 *per-channel* matmul returns uncorrelated garbage once N >= 65536 and
+  M >= 5 (measured relRMS 1.0 against fp16 at N=65536 for M=5 and M=128; correct
+  at M <= 4, at N <= 49152, and for block-32 at every M).  Prefill runs this head
+  at M = CHUNK_SIZE = 128, so per-channel would silently corrupt every prompt
+  while looking ~5x faster.  Block-32 is unaffected.
+
+  Cost: the head shrinks 805 MB -> 403 MB and gets *faster* in both phases —
+  3.58 -> 2.11 ms at M=1, 55.5 -> 43.1 ms at M=128.
 """
 
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
@@ -66,6 +71,10 @@ _VOCAB_SIZE = 262144
 # Module-level counters shared between _quantize_consts_in_block and apply().
 # Reset by apply() before each run.
 _counter_int4: list = [0, 0]   # [count, total_bytes_original]
+
+# Set per program in ``apply``: True while quantizing a decode graph, False for
+# prefill.  The logit head is int8 only for decode -- see ``_classify_quantize``.
+_quantize_logit_head: list = [False]
 _counter_skip: list = [0]      # [count] — skipped (already constexpr)
 
 
@@ -111,7 +120,12 @@ def _classify_quantize(op):
     # what makes the first prediction of every function cost ~17 s under
     # MPSGraph (int8) or the logits inaccurate (int4).  See module docstring.
     if _is_logit_projection(val):
-        return None
+        # Decode only.  In situ the int8 head is worth ~+4% decode but costs
+        # ~22% of prefill (measured 1117 -> 870 tok/s at ctx 400), because
+        # prefill runs it at M = CHUNK_SIZE while decode runs it at M = 1.
+        # Prefill therefore keeps the plain fp16 const.  The two phases are
+        # converted separately, so they simply end up with different weights.
+        return "int8_logit" if _quantize_logit_head[0] else None
     # Don't re-compress what is already feeding a constexpr_* op
     for child_op in op.outputs[0].child_ops:
         if child_op.op_type.startswith("constexpr_"):
@@ -177,9 +191,9 @@ def _quantize_symmetric_per_channel(val: np.ndarray):
     return quantized, scale
 
 
-def _quantize_symmetric_embedding_blocks(val: np.ndarray):
+def _quantize_symmetric_embedding_blocks(val: np.ndarray, bits: int = 4):
     """
-    Symmetric block-wise int4 quantization for the [VOCAB_SIZE, dim] tables.
+    Symmetric block-wise int4 (or int8) quantization, 32 elements per group.
 
     One scale per group of 32 elements along the row (embedding-dim) axis, so
     the scale is [V, D/32].  Deliberately *not* per-channel: these tensors feed
@@ -195,8 +209,10 @@ def _quantize_symmetric_embedding_blocks(val: np.ndarray):
     """
     _GROUP = 32
     if val.ndim != 2:
-        raise ValueError(f"embedding table must be rank 2, got shape {val.shape}")
-    max_val = 7
+        raise ValueError(f"table must be rank 2, got shape {val.shape}")
+    if bits not in (4, 8):
+        raise ValueError(f"bits must be 4 or 8, got {bits}")
+    max_val = 7 if bits == 4 else 127
 
     n_rows, n_cols = val.shape
     pad = (-n_cols) % _GROUP
@@ -224,7 +240,8 @@ def _quantize_symmetric_embedding_blocks(val: np.ndarray):
 
     scale = scale_f32.astype(val.dtype)
     del scale_f32
-    quantized = quantized.view(_INT4_NP_DTYPE)
+    if bits == 4:
+        quantized = quantized.view(_INT4_NP_DTYPE)
     return quantized, scale
 
 
@@ -237,6 +254,15 @@ def _quantize_weight(val: np.ndarray):
     Always int4 — callers must keep the logit projection away from here (see
     :func:`_is_logit_projection`).
     """
+    if _is_logit_projection(val):
+        # int8, block-32 along the contraction axis.  NOT per-channel: with the
+        # weight in its final [N, K] / transpose_y=True orientation, Core ML's
+        # int8 per-channel matmul returns uncorrelated garbage once N >= 65536
+        # and M >= 5 (measured: relRMS 1.0 vs fp16 at N=65536/M=5 and M=128,
+        # correct at M<=4, at N<=49152, and for block-32 at every M).  Prefill
+        # runs this head at M = CHUNK_SIZE = 128, so per-channel would silently
+        # corrupt every prompt.
+        return _quantize_symmetric_embedding_blocks(val, bits=8)
     if _is_embedding(val):
         return _quantize_symmetric_embedding_blocks(val)
     return _quantize_symmetric_per_channel(val)
@@ -261,7 +287,7 @@ def _quantize_consts_in_block(block):
                 f"shape={val.shape}  dtype={val.dtype}  consumers={child_types}",
                 flush=True,
             )
-        elif cls == "int4":
+        elif cls in ("int4", "int8_logit"):
             ops_to_quantize.append(op)
 
     if not ops_to_quantize:
@@ -347,6 +373,16 @@ class quantize_const_weights(AbstractGraphPass):
     def apply(self, prog):
         _counter_int4[0] = _counter_int4[1] = 0
         _counter_skip[0] = 0
+        # A decode graph takes a single token, prefill takes a chunk -- that is
+        # the only signal here, since both phases convert as "main".  Match on a
+        # prefix: at this point in the pipeline the inputs still carry their
+        # pre-rename names (`token_id_1d`, `position_1d` for decode;
+        # `tokens`, `start_pos_1d` for prefill), so an exact match silently
+        # never fires and the head quietly stays fp16 in both phases.
+        _quantize_logit_head[0] = any(
+            name.startswith("token_id")
+            for f in prog.functions.values() for name in f.inputs
+        )
         for f in prog.functions.values():
             _quantize_consts_in_block(f)
         if _counter_int4[0] or _counter_skip[0]:
