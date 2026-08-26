@@ -40,12 +40,20 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
     """
     import gemma_chat.mil_passes.quantize_const_weights  # noqa: F401
     import gemma_chat.mil_passes.collapse_cast_chains  # noqa: F401
+    import gemma_chat.mil_passes.broadcast_select_operands  # noqa: F401
 
     _patch_backend_pipeline()
 
     pipeline = build_pass_pipeline()
     # First: weights must be quantized before any pass materializes them.
     pipeline.insert_pass(0, "common::quantize_const_weights")
+    # After ``remove_broadcast_tiles``: give any ``select`` operand that would
+    # broadcast into a symbolic dim the full output shape, or E5RT cannot infer
+    # shapes through it (only reachable in a --no-materialize export).
+    pipeline.insert_pass(
+        pipeline.passes.index("common::remove_broadcast_tiles") + 1,
+        "common::broadcast_select_operands",
+    )
     # Just before the fusion group, so the fusion passes see fewer casts and
     # the dce entries interleaved with them clean up what this pass orphans.
     pipeline.insert_pass(
