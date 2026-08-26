@@ -383,19 +383,30 @@ def test_numerical_rmsnorm_and_gelu():
 
 # ── weight quantization: what gets a constexpr and what does not ─────────
 
-def test_logit_projection_stays_unquantized_fp16():
-    """The [dim, vocab] logit projection must reach the model as a plain const.
+def test_logit_projection_int8_for_decode_fp16_for_prefill():
+    """The [dim, vocab] logit projection is quantized to int8 with block-32 scales.
 
-    Quantizing it at all is a trap in both directions.  int4 cannot carry the
-    logits (per-channel scales leave it no grouping to fall back on), and int8
-    — the width that could — is what MPSGraph's ``LowerDequantizeND`` pass
-    constant-folds on the *first* prediction of every function in every
-    process: measured at 16.7 s and an 18 GB transient for the real
-    [1536, 262144] tensor on CPU_AND_GPU, never cached to disk.  A plain fp16
-    const has no dequantize op for anything to fold.
+    Both historical reasons for leaving it fp16 are tied to the old
+    [K, N] / ``transpose_y=False`` layout and no longer hold:
 
-    The gather table in the same graph is the control: it is the same size and
-    over the same threshold, and it *does* get quantized.
+    * MPSGraph's ``LowerDequantizeND`` constant-fold (~16 s on the first
+      prediction of every process) only happens in that orientation.  Measured
+      fresh-process first predict at N=262144: 16.3 s for [K,N]/ty=False vs
+      0.06 s for [N,K]/ty=True, the same as fp16.
+    * int4 is still too lossy for logits, and buys no speed over int8 here
+      (2.02 vs 2.11 ms at M=1; 43.2 vs 43.1 ms at M=128).
+
+    Block-32 rather than per-channel is a **correctness** requirement, not a
+    tuning choice: Core ML's int8 per-channel matmul in the
+    [N,K]/``transpose_y=True`` orientation returns uncorrelated garbage for
+    N >= 65536 once M >= 5 (relRMS 1.0 vs fp16), and prefill runs this head at
+    M = CHUNK_SIZE = 128.  This test pins the grouping.
+
+    Decode only: in situ the int8 head is worth ~+4% decode but costs ~22% of
+    prefill, which runs it at M = CHUNK_SIZE rather than M = 1.  The two phases
+    convert separately, so they simply get different weights.
+
+    The gather table in the same graph is the control: it stays int4 block-32.
     """
     rng = np.random.RandomState(5)
     vocab = 262144
@@ -405,29 +416,45 @@ def test_logit_projection_stays_unquantized_fp16():
     hidden = (rng.randn(32, 64) * 0.1).astype(np.float16)
     logit_w = (rng.randn(64, vocab) * 0.02).astype(np.float16)
 
-    def fn(tokens):
+    def decode_fn(token_id):
+        embedded = _embed_lookup(jnp.asarray(table), token_id)
+        return jnp.matmul(jnp.matmul(embedded, jnp.asarray(hidden)),
+                          jnp.asarray(logit_w))
+
+    def prefill_fn(tokens):
         embedded = _embed_lookup(jnp.asarray(table), tokens)
         return jnp.matmul(jnp.matmul(embedded, jnp.asarray(hidden)),
                           jnp.asarray(logit_w))
 
-    _, prog = _convert(fn, jnp.zeros((1, 4), jnp.int32))
+    _, prog = _convert(decode_fn, jnp.zeros((1, 1), jnp.int32))
 
-    def _shapes(op_type):
-        return {tuple(op.outputs[0].shape)
-                for op in _ops(prog) if op.op_type == op_type}
+    constexprs = [op for op in _ops(prog)
+                  if op.op_type == "constexpr_blockwise_shift_scale"]
+    by_shape = {tuple(op.outputs[0].shape): op for op in constexprs}
 
-    quantized = _shapes("constexpr_blockwise_shift_scale")
-    assert not ({logit_w.shape, logit_w.T.shape} & quantized), (
-        f"the logit projection was quantized (constexprs: {quantized}); "
-        "MPSGraph folds int8 dequantizes and int4 is too lossy here"
+    head = by_shape.get(logit_w.shape) or by_shape.get(logit_w.T.shape)
+    assert head is not None, (
+        f"the logit projection was not quantized (constexprs: {list(by_shape)})"
     )
-    assert table.shape in quantized, "the embedding table stopped being quantized"
 
-    # It reaches the model as a plain fp16 const instead.
-    logit_consts = [
-        op for op in _ops(prog)
-        if op.op_type == "const"
-        and tuple(op.outputs[0].shape) in (logit_w.shape, logit_w.T.shape)
-    ]
-    assert len(logit_consts) == 1, [op.name for op in logit_consts]
-    assert logit_consts[0].outputs[0].dtype == mil_types.fp16
+    # int8, not int4: the data must NOT carry the sub-byte tag.
+    data = head.inputs["data"].val
+    assert data.dtype.metadata is None, "logit head was quantized to int4, not int8"
+
+    # Grouped (block-32) along the contraction axis, i.e. >1 scale per row.
+    scale = head.inputs["scale"].val
+    assert scale.ndim == 2 and min(scale.shape) > 1, (
+        f"logit head scale {scale.shape} is not grouped; per-channel scales "
+        "silently corrupt this matmul at M >= 5 for vocab >= 65536"
+    )
+
+    assert table.shape in by_shape, "the embedding table stopped being quantized"
+
+    # ...and prefill keeps the plain fp16 const, because int8 costs it ~22%.
+    _, prefill_prog = _convert(prefill_fn, jnp.zeros((1, 4), jnp.int32))
+    prefill_shapes = {tuple(op.outputs[0].shape) for op in _ops(prefill_prog)
+                      if op.op_type == "constexpr_blockwise_shift_scale"}
+    assert not ({logit_w.shape, logit_w.T.shape} & prefill_shapes), (
+        "the prefill logit head was quantized; int8 costs ~22% of prefill"
+    )
+    assert table.shape in prefill_shapes, "prefill embedding table not quantized"
