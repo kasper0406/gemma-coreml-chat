@@ -109,7 +109,9 @@ import coremltools as ct
 from stablehlo_coreml import StateSpec
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
-from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN
+from gemma_chat.config import (
+    CHUNK_SIZE, E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN, VARIANTS,
+)
 from gemma_chat.model import Gemma4Transformer, Gemma4Config, AttentionType
 from gemma_chat.weight_mapper import load_params
 from gemma_chat.decode_coreml import (
@@ -471,6 +473,7 @@ def _mil_to_mlpackage(
 def export_chunk_prefill(
     output_path: str | Path,
     model_id: str = HF_MODEL_ID,
+    variant: str = "e2b",
     max_seq_len: int = MAX_SEQ_LEN,
     chunk_size: int = CHUNK_SIZE,
     num_layers: int | None = None,
@@ -499,7 +502,8 @@ def export_chunk_prefill(
     from jax import export as jax_export
 
     output_path = Path(output_path)
-    config = E2B_CONFIG
+    config = VARIANTS[variant][0]
+    full_num_layers = config.num_layers
     if num_layers is not None and num_layers < config.num_layers:
         config = _truncated_config(config, num_layers)
         print(f"  Truncated config to {config.num_layers} layers: "
@@ -509,7 +513,7 @@ def export_chunk_prefill(
     print("Chunk-prefill export — Step 1/3  Loading weights")
     print("=" * 60)
     params = load_params(model_id=model_id, config=config)
-    if num_layers is not None and num_layers < E2B_CONFIG.num_layers:
+    if num_layers is not None and num_layers < full_num_layers:
         _truncate_params(params, num_layers, config.per_layer_input_dim)
 
     print("=" * 60)
@@ -613,6 +617,7 @@ def export_chunk_prefill(
 def export_decode_step(
     output_path: str | Path,
     model_id: str = HF_MODEL_ID,
+    variant: str = "e2b",
     max_seq_len: int = MAX_SEQ_LEN,
     skip_warmup: bool = False,
     num_layers: int | None = None,
@@ -641,7 +646,8 @@ def export_decode_step(
     from jax import export as jax_export
 
     output_path = Path(output_path)
-    config = E2B_CONFIG
+    config = VARIANTS[variant][0]
+    full_num_layers = config.num_layers
     if num_layers is not None and num_layers < config.num_layers:
         config = _truncated_config(config, num_layers)
         print(f"  Truncated config to {config.num_layers} layers: "
@@ -651,7 +657,7 @@ def export_decode_step(
     print("Decode export — Step 1/3  Loading weights")
     print("=" * 60)
     params = load_params(model_id=model_id, config=config)
-    if num_layers is not None and num_layers < E2B_CONFIG.num_layers:
+    if num_layers is not None and num_layers < full_num_layers:
         _truncate_params(params, num_layers, config.per_layer_input_dim)
 
     print("=" * 60)
@@ -782,6 +788,7 @@ def _run_phase(phase: str, args: argparse.Namespace, output_path: Path) -> None:
         export_chunk_prefill(
             output_path=output_path,
             model_id=args.model_id,
+            variant=args.variant,
             max_seq_len=args.max_seq_len,
             chunk_size=CHUNK_SIZE,
             num_layers=args.num_layers,
@@ -790,6 +797,7 @@ def _run_phase(phase: str, args: argparse.Namespace, output_path: Path) -> None:
         export_decode_step(
             output_path=output_path,
             model_id=args.model_id,
+            variant=args.variant,
             max_seq_len=args.max_seq_len,
             skip_warmup=args.skip_warmup,
             num_layers=args.num_layers,
@@ -824,14 +832,20 @@ def main() -> None:
         )
     )
     parser.add_argument(
+        "--variant",
+        default="e2b",
+        choices=sorted(VARIANTS),
+        help="Model variant to export (default: e2b)",
+    )
+    parser.add_argument(
         "--output",
-        default="gemma4-e2b.mlpackage",
-        help="Output path (default: gemma4-e2b.mlpackage)",
+        default=None,
+        help="Output path (default: the variant's, e.g. gemma4-e2b.mlpackage)",
     )
     parser.add_argument(
         "--model-id",
-        default=HF_MODEL_ID,
-        help=f"HuggingFace model ID (default: {HF_MODEL_ID})",
+        default=None,
+        help="HuggingFace model ID (default: the variant's)",
     )
     parser.add_argument(
         "--max-seq-len",
@@ -897,6 +911,13 @@ def main() -> None:
     parser.add_argument("--_phase-output", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
+    # --variant supplies the defaults for --model-id and --output.
+    _cfg, _hf, _path = VARIANTS[args.variant]
+    if args.model_id is None:
+        args.model_id = _hf
+    if args.output is None:
+        args.output = _path
+
     # If invoked as a subprocess for a single phase, run it and exit.
     if args._phase:
         _run_phase(args._phase, args, Path(args._phase_output))
@@ -941,6 +962,7 @@ def main() -> None:
         # Forward user args.
         cmd += ["--output", str(args.output)]
         cmd += ["--model-id", args.model_id]
+        cmd += ["--variant", args.variant]
         cmd += ["--max-seq-len", str(args.max_seq_len)]
         if args.skip_warmup:
             cmd += ["--skip-warmup"]
