@@ -7,14 +7,13 @@ from stablehlo_coreml import build_pass_pipeline
 
 
 def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
-    """Return the stablehlo-coreml pipeline plus this project's own passes.
+    """Return upstream's pass pipeline, adjusted for this model.
 
-    ``stablehlo_coreml.build_pass_pipeline`` supplies the cleanup group
-    (``remove_broadcast_tiles``, ``fuse_reduce_keep_dims``, dce,
-    ``remove_noop_slice_update``) and the fusion group
-    (``replace_decomposed_softmax``, ``fuse_attention_to_sdpa``,
-    ``fuse_logit_softcap``, ``fuse_gelu_erfc``) on top of
-    ``ct.PassPipeline.DEFAULT``.
+    The base is ``stablehlo_coreml.build_pass_pipeline()``, which inserts its
+    own cleanup, fusion and late-fusion groups into ``ct.PassPipeline.DEFAULT``
+    — see that function for what those groups contain. On top of it this adds
+    the two passes owned by this repository and drops the three coremltools
+    passes the exported model cannot use.
     """
     import gemma_chat.mil_passes.quantize_const_weights  # noqa: F401
     import gemma_chat.mil_passes.collapse_cast_chains  # noqa: F401
@@ -28,9 +27,10 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
         pipeline.passes.index("common::replace_decomposed_softmax"),
         "common::collapse_cast_chains",
     )
-    # ``common::fuse_rmsnorm`` is no longer inserted here: stablehlo-coreml
-    # 0.1.5 ships this project's RMSNorm fusion upstream and already places it
-    # in its own late-fusion group, right after ``common::fuse_reduce_mean``.
+    # ``common::fuse_rmsnorm`` is not inserted here: this project's RMSNorm
+    # fusion now lives in stablehlo-coreml, which puts it in its own late-fusion
+    # group right after ``common::fuse_reduce_mean``. It is not in the 0.1.5
+    # release, so this requires the stablehlo-coreml release after 0.1.5.
     pipeline.remove_passes([
         # Callers convert with ``compute_precision=ct.precision.FLOAT32``, which
         # means "leave the dtypes alone", not "compute in fp32": the traced graph
