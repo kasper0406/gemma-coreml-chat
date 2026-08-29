@@ -55,13 +55,6 @@ CACHE_LEN = 32
 # to be called `main` to compile — so that is what this one materializes into.
 FUNC = "main"
 
-# Kept in sync with gemma_chat/export.py:_mil_to_mlpackage.
-_REMOVED_PASSES = [
-    "common::add_fp16_cast",
-    "common::fuse_layernorm_or_instancenorm",
-    "common::fuse_elementwise_to_batchnorm",
-]
-
 
 def global_decode_attention(cache_k, cache_v, q, position):
     """One global attention site: mask length comes from the cache, not a const."""
@@ -119,7 +112,6 @@ def _materialized_program():
         minimum_deployment_target=ct.target.iOS18,
     )
     pipeline = build_ct_convert_pass_pipeline()
-    pipeline.remove_passes(_REMOVED_PASSES)
     model = ct.convert(
         prog,
         pass_pipeline=pipeline,

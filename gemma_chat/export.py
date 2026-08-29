@@ -371,11 +371,6 @@ def _mil_to_mlpackage(
 
     # ── MIL pass pipeline (quantize_const_weights as belt-and-suspenders) ──
     pipeline = build_ct_convert_pass_pipeline()
-    pipeline.remove_passes([
-        "common::add_fp16_cast",
-        "common::fuse_layernorm_or_instancenorm",
-        "common::fuse_elementwise_to_batchnorm",
-    ])
     print(f"  [convert] ct.convert …", flush=True)
 
     _stop = threading.Event()
@@ -393,13 +388,8 @@ def _mil_to_mlpackage(
                 # FLOAT32 here means "leave the dtypes alone", not "compute in
                 # fp32": the traced graph already places fp16 and fp32 by hand
                 # (see the precision note in ``decode_coreml``), and this is the
-                # only setting that preserves that placement — it is why
-                # ``common::add_fp16_cast`` is dropped from the pipeline below.
-                # ct.precision.FLOAT16 would re-run that pass and pull the
-                # RMSNorm statistics, the RoPE angles and the ring-position
-                # scatter down to fp16 as well; those are fp32 for range and
-                # accumulation reasons, and downcasting them is what produced
-                # the unstable/garbage-token output seen previously.
+                # only setting that preserves that placement — see the
+                # ``add_fp16_cast`` note in ``mil_passes/ct_convert_pipeline.py``.
                 compute_precision=ct.precision.FLOAT32,
                 pass_pipeline=pipeline,
                 skip_model_load=True,

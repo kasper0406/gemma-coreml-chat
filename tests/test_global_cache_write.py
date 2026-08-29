@@ -43,14 +43,6 @@ NKV = 1
 HEAD_DIM = 2
 CHUNK = 2      # tokens per prefill chunk
 
-# Kept in sync with gemma_chat/export.py:_mil_to_mlpackage.
-_REMOVED_PASSES = [
-    "common::add_fp16_cast",
-    "common::fuse_layernorm_or_instancenorm",
-    "common::fuse_elementwise_to_batchnorm",
-]
-
-
 # ── 1. The writes themselves ───────────────────────────────────────────────
 
 
@@ -115,7 +107,6 @@ def _convert(fn, *args):
     hlo = jax.jit(fn).lower(*args).compiler_ir("stablehlo")
     prog = hlo_to_mil(hlo, minimum_deployment_target=ct.target.iOS18)
     pipeline = build_ct_convert_pass_pipeline()
-    pipeline.remove_passes(_REMOVED_PASSES)
     model = ct.convert(
         prog,
         pass_pipeline=pipeline,
