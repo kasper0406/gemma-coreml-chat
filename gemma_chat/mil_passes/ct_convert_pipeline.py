@@ -6,42 +6,17 @@ import coremltools as ct
 from stablehlo_coreml import build_pass_pipeline
 
 
-_backend_patched = False
-
-
-def _patch_backend_pipeline():
-    """Append replace_scalar_broadcasts to the backend_mlprogram pipeline.
-
-    The backend pipeline runs AFTER the main pipeline and contains two
-    ``const_elimination`` passes that fold ``fill`` ops back into materialized
-    constants.  By appending our pass at the end of the backend pipeline we
-    ensure fill ops survive to serialization.
-    """
-    global _backend_patched
-    if _backend_patched:
-        return
-    import gemma_chat.mil_passes.replace_scalar_broadcasts  # noqa: F401
-    from coremltools.converters.mil.mil.passes.pass_pipeline import (
-        _BACKEND_MIL_PASSES,
-    )
-    _BACKEND_MIL_PASSES.append("common::replace_scalar_broadcasts")
-    _backend_patched = True
-
-
 def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
-    """Return the stablehlo-coreml pipeline plus this project's own passes.
+    """Return upstream's pass pipeline, adjusted for this model.
 
-    ``stablehlo_coreml.build_pass_pipeline`` supplies the cleanup group
-    (``remove_broadcast_tiles``, ``fuse_reduce_keep_dims``, dce,
-    ``remove_noop_slice_update``) and the fusion group
-    (``replace_decomposed_softmax``, ``fuse_attention_to_sdpa``,
-    ``fuse_logit_softcap``, ``fuse_gelu_erfc``) on top of
-    ``ct.PassPipeline.DEFAULT``.
+    The base is ``stablehlo_coreml.build_pass_pipeline()``, which inserts its
+    own cleanup, fusion and late-fusion groups into ``ct.PassPipeline.DEFAULT``
+    — see that function for what those groups contain. On top of it this adds
+    the two passes owned by this repository and drops the three coremltools
+    passes the exported model cannot use.
     """
     import gemma_chat.mil_passes.quantize_const_weights  # noqa: F401
     import gemma_chat.mil_passes.collapse_cast_chains  # noqa: F401
-
-    _patch_backend_pipeline()
 
     pipeline = build_pass_pipeline()
     # First: weights must be quantized before any pass materializes them.
@@ -52,7 +27,22 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
         pipeline.passes.index("common::replace_decomposed_softmax"),
         "common::collapse_cast_chains",
     )
-    # ``common::fuse_rmsnorm`` is no longer inserted here: stablehlo-coreml
-    # 0.1.5 ships this project's RMSNorm fusion upstream and already places it
-    # in its own late-fusion group, right after ``common::fuse_reduce_mean``.
+    # ``common::fuse_rmsnorm`` is not inserted here: this project's RMSNorm
+    # fusion now lives in stablehlo-coreml, which puts it in its own late-fusion
+    # group right after ``common::fuse_reduce_mean`` (stablehlo-coreml >= 0.1.6).
+    pipeline.remove_passes([
+        # Callers convert with ``compute_precision=ct.precision.FLOAT32``, which
+        # means "leave the dtypes alone", not "compute in fp32": the traced graph
+        # already places fp16 and fp32 by hand (see the precision note in
+        # ``decode_coreml``), and that is the only setting which preserves that
+        # placement — which is why this pass has to go. Left in (or re-run by
+        # ct.precision.FLOAT16) it pulls the RMSNorm statistics, the RoPE angles
+        # and the ring-position scatter down to fp16 as well; those are fp32 for
+        # range and accumulation reasons, and downcasting them is what produced
+        # the unstable/garbage-token output seen previously.
+        "common::add_fp16_cast",
+        # Both of these produce incorrect fusions for this model.
+        "common::fuse_layernorm_or_instancenorm",
+        "common::fuse_elementwise_to_batchnorm",
+    ])
     return pipeline

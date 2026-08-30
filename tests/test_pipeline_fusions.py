@@ -1,7 +1,6 @@
 """Integration test for the project's MIL pass pipeline.
 
-Runs the real export flow — ``build_ct_convert_pass_pipeline()`` minus the
-passes ``gemma_chat/export.py:_mil_to_mlpackage`` removes, fed to
+Runs the real export flow — ``build_ct_convert_pass_pipeline()`` fed to
 ``ct.convert`` — over small JAX graphs shaped like the ones
 ``gemma_chat/decode_coreml.py`` traces, and checks that the fusions the
 exported model depends on actually land.
@@ -22,14 +21,6 @@ from stablehlo_coreml.converter import convert as hlo_to_mil
 from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
 from gemma_chat.model import _embed_lookup
 
-# Kept in sync with gemma_chat/export.py:_mil_to_mlpackage.
-_REMOVED_PASSES = [
-    "common::add_fp16_cast",
-    "common::fuse_layernorm_or_instancenorm",
-    "common::fuse_elementwise_to_batchnorm",
-]
-
-
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def _convert(fn, *example_args, load: bool = False):
@@ -38,7 +29,6 @@ def _convert(fn, *example_args, load: bool = False):
     prog = hlo_to_mil(hlo, minimum_deployment_target=ct.target.iOS18)
 
     pipeline = build_ct_convert_pass_pipeline()
-    pipeline.remove_passes(_REMOVED_PASSES)
     model = ct.convert(
         prog,
         pass_pipeline=pipeline,
