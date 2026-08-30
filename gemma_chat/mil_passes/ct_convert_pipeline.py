@@ -29,8 +29,7 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
     )
     # ``common::fuse_rmsnorm`` is not inserted here: this project's RMSNorm
     # fusion now lives in stablehlo-coreml, which puts it in its own late-fusion
-    # group right after ``common::fuse_reduce_mean``. It is not in the 0.1.5
-    # release, so this requires the stablehlo-coreml release after 0.1.5.
+    # group right after ``common::fuse_reduce_mean`` (stablehlo-coreml >= 0.1.6).
     pipeline.remove_passes([
         # Callers convert with ``compute_precision=ct.precision.FLOAT32``, which
         # means "leave the dtypes alone", not "compute in fp32": the traced graph
