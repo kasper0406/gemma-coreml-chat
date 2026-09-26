@@ -30,24 +30,41 @@ struct EmbeddingTable {
     static let groupSize = 32
 
     init(directory: URL, name: String, rows: Int, cols: Int, groupSize: Int, multiplier: Float16) throws {
-        guard groupSize == Self.groupSize, cols % groupSize == 0, rows > 0 else {
+        // The dimensions come from the manifest, so check them before any
+        // arithmetic on them: positive, whole scale groups (which also makes
+        // `cols` even, as the nibble packing needs), and byte sizes that fit
+        // in an `Int` — then those sizes against the actual files. Every row
+        // read below relies on these sizes and does no bounds checks of its own.
+        guard groupSize == Self.groupSize, rows > 0, cols > 0, cols % groupSize == 0 else {
             throw HostEmbeddingsError.malformed(
-                "\(name): rows=\(rows) cols=\(cols) group_size=\(groupSize); expected cols to be a multiple of \(Self.groupSize)"
+                "\(name): rows=\(rows) cols=\(cols) group_size=\(groupSize); expected positive "
+                    + "rows and cols, and cols a multiple of group_size \(Self.groupSize)"
             )
         }
+        let (elements, elementsOverflow) = rows.multipliedReportingOverflow(by: cols)
+        let (scaleCount, scaleCountOverflow) = rows.multipliedReportingOverflow(by: cols / groupSize)
+        let (scaleBytes, scaleBytesOverflow) = scaleCount.multipliedReportingOverflow(
+            by: MemoryLayout<Float16>.size
+        )
+        guard !elementsOverflow, !scaleCountOverflow, !scaleBytesOverflow else {
+            throw HostEmbeddingsError.malformed("\(name): [\(rows), \(cols)] is too large to address")
+        }
+        let dataBytes = elements / 2
+
         self.rows = rows
         self.cols = cols
         self.multiplier = multiplier
+        // Mapping is lazy, so a file of the wrong size costs nothing until
+        // it is read — and nothing reads it before this check.
         self.data = try Data(
             contentsOf: directory.appendingPathComponent("\(name).int4"), options: .alwaysMapped
         )
         self.scales = try Data(
             contentsOf: directory.appendingPathComponent("\(name).scales"), options: .alwaysMapped
         )
-        guard data.count == rows * cols / 2,
-              scales.count == rows * (cols / groupSize) * MemoryLayout<Float16>.size else {
+        guard data.count == dataBytes, scales.count == scaleBytes else {
             throw HostEmbeddingsError.malformed(
-                "\(name): \(data.count) data bytes / \(scales.count) scale bytes do not match [\(rows), \(cols)]"
+                "\(name): \(data.count) data bytes / \(scales.count) scale bytes; [\(rows), \(cols)] needs \(dataBytes) / \(scaleBytes)"
             )
         }
         // Start paging the tables in now, behind the model load. A row read

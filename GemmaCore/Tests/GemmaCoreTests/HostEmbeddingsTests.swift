@@ -53,4 +53,45 @@ final class HostEmbeddingsTests: XCTestCase {
             tokens: [Int32(embeddings.token.rows)], tokenEmbed: row, pleRows: pleRow
         ))
     }
+
+    /// A manifest whose dimensions are malformed, overflow, or disagree with
+    /// the files must throw — never trap or read out of bounds.
+    func testMalformedManifestThrows() throws {
+        let fixtures = try XCTUnwrap(Bundle.module.url(forResource: "Fixtures", withExtension: nil))
+        let source = fixtures.appendingPathComponent(HostEmbeddings.directoryName)
+        let good = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: source.appendingPathComponent("embeddings.json"))
+        ) as! [String: [String: Any]]
+
+        let cases: [(String, [String: Any])] = [
+            ("rows overflow", ["rows": Int.max]),
+            ("rows × cols overflow", ["rows": Int.max / 64 + 1]),
+            ("zero rows", ["rows": 0]),
+            ("negative rows", ["rows": -8]),
+            ("negative cols", ["cols": -64]),
+            ("cols not a multiple of the group", ["cols": 48]),
+            ("odd cols", ["cols": 63]),
+            ("unsupported group size", ["group_size": 16]),
+            ("rows disagree with the files", ["rows": 9]),
+            ("cols disagree with the files", ["cols": 96]),
+        ]
+        for (label, override) in cases {
+            let package = FileManager.default.temporaryDirectory
+                .appendingPathComponent("HostEmbeddingsTests-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: package) }
+            let dir = package.appendingPathComponent(HostEmbeddings.directoryName)
+            try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: source, to: dir)
+            var manifest = good
+            manifest[HostEmbeddings.tokenInputName]!.merge(override) { _, new in new }
+            try JSONSerialization.data(withJSONObject: manifest)
+                .write(to: dir.appendingPathComponent("embeddings.json"))
+
+            XCTAssertThrowsError(try HostEmbeddings(packageURL: package), label) { error in
+                guard case HostEmbeddingsError.malformed = error else {
+                    return XCTFail("\(label): unexpected \(error)")
+                }
+            }
+        }
+    }
 }
