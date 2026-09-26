@@ -66,6 +66,12 @@ Dropping `slice_update` also buys back decode time. Its `begin` is a runtime ind
 
 > **Re-export required.** The Swift runtime expects those state features. Loading a `.mlpackage` exported before this change fails with *"this model predates stateful KV caches"* — re-run `uv run gemma-export`.
 
+**Embedding lookups on the host.** The functions take the token's embedding rows — `token_embed` (`[1, L, 1536]`, already × √1536) and the raw per-layer-embedding row `ple_rows` (`[1, L, 35 × 256]`), both fp16 — instead of token ids. The two in-graph `gather`s from int4 tables were CPU-only ops worth ~45% of an ANE plan's cost, over ~1.5 GB of tables. The exporter now writes the tables to an `Embeddings/` directory inside the `.mlpackage` (next to `Tokenizer/`), quantized exactly as the graph quantized them (int4 block-32; format in `gemma_chat/host_embeddings.py`), and `GemmaCore`'s `HostEmbeddings` memory-maps them and dequantizes one row per token, bit-identical to the old lookup. The tied logit head still reads the token table in the graph.
+
+**fp16 RMSNorm.** The ANE has no fp32, and fp32 norm statistics pinned most of the graph to the CPU. The norms now run in fp16: RMSNorm is scale-invariant, so each input is first divided by its `max|x|`, which bounds the sum of squares by the axis width. See the precision notes in `gemma_chat/decode_coreml.py`.
+
+> **Re-export required.** Loading a `.mlpackage` exported before the host lookups fails with *"this model predates host-side embedding lookups"* — re-run `uv run gemma-export`.
+
 ### Phase 2 — Inference (Swift)
 
 All inference runs through native Swift for ~20x faster model loading vs Python coremltools:
@@ -128,6 +134,7 @@ benchmarks/     Standalone Swift benchmark for model loading / first prediction
 - **`Error: model not found`** — pass `--model <path>` or run from the repo root where `gemma4-e2b.mlpackage` lives.
 - **Tokenizer errors** — re-run `uv run gemma-export`; it embeds the tokenizer inside the `.mlpackage` (the CLI falls back to downloading from Hugging Face if missing).
 - **`this model predates stateful KV caches`** — the `.mlpackage` was exported before the sliding KV caches became CoreML state. Re-run `uv run gemma-export`.
+- **`this model predates host-side embedding lookups`** / **`has no Embeddings/ directory`** — the `.mlpackage` takes token ids, or lacks the embedding tables the runtime now reads. Re-run `uv run gemma-export`. When loading a `.mlmodelc` directly, copy the package's `Embeddings/` directory into it.
 - **Slow first load with `--compute-units all`** — ANE compilation can take 10–30 minutes, but is cached in `.mlmodelc` for subsequent runs.
 - **`cpu-and-ne` runs entirely on the CPU (0 mW ANE), then segfaults in prefill** — known and unfixed for the full 35-layer model; see the export section. `--compute-units cpu-only` fails the same way, so the segfault is BNNS executing this graph, not the ANE partitioning. Use `cpu-and-gpu`.
 

@@ -25,7 +25,7 @@ from gemma_chat import decode_coreml
 from gemma_chat.cache_spec import build_cache_specs
 from gemma_chat.config import E2B_CONFIG, MAX_SEQ_LEN
 from gemma_chat.decode_coreml import _sliding_ring_write, decode_step, empty_pos_ring
-from gemma_chat.model import AttentionType, Gemma4Config
+from gemma_chat.model import AttentionType, Gemma4Config, _embed_lookup
 
 
 def _dus_ring_write(cache, value, position, window: int):
@@ -146,9 +146,13 @@ def _run_decode(params, cfg, max_seq_len, steps):
 
     all_logits = []
     for position in range(steps):
-        token = jnp.int32((position * 7 + 3) % cfg.num_embed)
+        token = jnp.full((1, 1), (position * 7 + 3) % cfg.num_embed, jnp.int32)
+        # The rows the host looks up (see ``gemma_chat.host_embeddings``).
+        token_embed = _embed_lookup(params["embed_tokens"], token) \
+            * jnp.sqrt(float(cfg.embed_dim)).astype(jnp.float16)
+        ple_rows = _embed_lookup(params["embed_tokens_per_layer"], token)
         logits, kv, ring = decode_step(
-            params, token, jnp.int32(position), kv, ring, cfg=cfg,
+            params, token_embed, ple_rows, jnp.int32(position), kv, ring, cfg=cfg,
         )
         all_logits.append(np.asarray(logits))
     return all_logits, [np.asarray(c) for c in kv], np.asarray(ring)
@@ -184,7 +188,7 @@ def test_decode_step_unchanged_by_the_reformulation(monkeypatch):
 
 
 def test_kv_export_plan_indices_and_names():
-    from gemma_chat.export import _kv_export_plan
+    from gemma_chat.export import _LEADING_INPUTS, _kv_export_plan
 
     specs = build_cache_specs(E2B_CONFIG, MAX_SEQ_LEN)
     sliding = [i for i, s in enumerate(specs)
@@ -193,11 +197,14 @@ def test_kv_export_plan_indices_and_names():
                 if s.attn_type == AttentionType.GLOBAL]
     assert (len(sliding), len(globals_)) == (12, 3)
 
-    states, kv_in, kv_out = _kv_export_plan(specs, has_global=True)
+    leading = _LEADING_INPUTS["decode"]
+    assert leading == _LEADING_INPUTS["prefill"][:2] + ["position"]
+    states, kv_in, kv_out = _kv_export_plan(specs, has_global=True,
+                                            num_leading=len(leading))
 
-    # Traced args: [N, token, position] + kv_flat + [sliding_pos_ring]
+    # Traced args: [N, token_embed, ple_rows, position] + kv_flat + [sliding_pos_ring]
     # Traced outs: [logits] + kv_flat_out + [sliding_pos_ring_out]
-    base = 3
+    base = 4
     n_args = base + 2 * len(specs) + 1
     n_outs = 1 + 2 * len(specs) + 1
 
@@ -214,7 +221,7 @@ def test_kv_export_plan_indices_and_names():
     assert kv_out == [f"{n}_out" for n in kv_in]
 
     # Every argument is either state or a remaining input, exactly once.
-    remaining_inputs = ["N", "token_id", "position"] + kv_in + ["sliding_pos_ring"]
+    remaining_inputs = ["N"] + leading + kv_in + ["sliding_pos_ring"]
     assert len(remaining_inputs) + len(states) == n_args
     # Same for outputs.
     remaining_outputs = ["logits"] + kv_out + ["sliding_pos_ring_out"]
@@ -233,9 +240,9 @@ def test_kv_export_plan_without_global_layers():
         attention_types=(AttentionType.LOCAL_SLIDING,) * 2,
     )
     specs = build_cache_specs(cfg, 32)
-    states, kv_in, kv_out = _kv_export_plan(specs, has_global=False)
+    states, kv_in, kv_out = _kv_export_plan(specs, has_global=False, num_leading=3)
 
     assert kv_in == [] and kv_out == []
-    assert set(states) == {2, 3, 4, 5}
-    assert states[2].name == "k_0" and states[2].output == 1
-    assert states[5].name == "v_1" and states[5].output == 4
+    assert set(states) == {3, 4, 5, 6}
+    assert states[3].name == "k_0" and states[3].output == 1
+    assert states[6].name == "v_1" and states[6].output == 4

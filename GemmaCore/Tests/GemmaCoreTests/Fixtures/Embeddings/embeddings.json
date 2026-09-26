@@ -1,0 +1,14 @@
+{
+  "token_embed": {
+    "rows": 8,
+    "cols": 64,
+    "group_size": 32,
+    "multiplier": 39.1875
+  },
+  "ple_rows": {
+    "rows": 8,
+    "cols": 96,
+    "group_size": 32,
+    "multiplier": 1.0
+  }
+}

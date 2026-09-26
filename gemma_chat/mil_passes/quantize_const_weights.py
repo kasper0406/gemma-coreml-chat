@@ -17,10 +17,13 @@ consumes the tensor (see :func:`_quantize_weight`):
   These weights are laid out [input_dim, output_dim] — they feed ``matmul`` as
   the ``y`` operand with ``transpose_y=False`` — so the output axis is the last
   one and the scale shape is [1, O].
-* **Block-32 int4** for the [VOCAB_SIZE, dim] embedding lookup tables.  They
-  feed ``gather``, which never runs on the ANE anyway, so there is nothing to
+* **Block-32 int4** for [VOCAB_SIZE, dim] embedding lookup tables.  A lookup
+  is a ``gather``, which never runs on the ANE anyway, so there is nothing to
   gain from per-channel scales and real accuracy to lose: one block would span
-  all 262144 vocab rows.  Scale shape stays [V, D/32].
+  all 262144 vocab rows.  Scale shape stays [V, D/32].  The exported model no
+  longer has such a table in the graph -- the host does the lookups -- but
+  ``gemma_chat.host_embeddings`` quantizes the tables it ships with this same
+  function, so the host reproduces the old in-graph lookup exactly.
 * **Block-32 int8** for the [dim, VOCAB_SIZE] logit projection.  This used to
   be left as plain fp16, for two reasons that no longer hold now that weights
   reach the matmul as [N, K] with ``transpose_y=True`` (see
@@ -373,15 +376,15 @@ class quantize_const_weights(AbstractGraphPass):
     def apply(self, prog):
         _counter_int4[0] = _counter_int4[1] = 0
         _counter_skip[0] = 0
-        # A decode graph takes a single token, prefill takes a chunk -- that is
-        # the only signal here, since both phases convert as "main".  Match on a
-        # prefix: at this point in the pipeline the inputs still carry their
-        # pre-rename names (`token_id_1d`, `position_1d` for decode;
-        # `tokens`, `start_pos_1d` for prefill), so an exact match silently
-        # never fires and the head quietly stays fp16 in both phases.
+        # A decode graph embeds a single token, prefill a chunk -- that is the
+        # only signal here, since both phases convert as "main".  Both take a
+        # `token_embed` input of shape (1, L, D), with L = 1 for decode.  Match
+        # the name on a prefix: this early in the pipeline the inputs may still
+        # carry their pre-rename names, and a match that silently never fires
+        # quietly leaves the head fp16 in both phases.
         _quantize_logit_head[0] = any(
-            name.startswith("token_id")
-            for f in prog.functions.values() for name in f.inputs
+            name.startswith("token_embed") and var.shape[1] == 1
+            for f in prog.functions.values() for name, var in f.inputs.items()
         )
         for f in prog.functions.values():
             _quantize_consts_in_block(f)

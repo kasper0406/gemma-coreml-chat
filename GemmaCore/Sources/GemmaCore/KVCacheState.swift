@@ -15,10 +15,11 @@
 /// see ``CoreMLModel/grownToFit(_:needed:)``.
 ///
 /// This object also owns the per-conversation prediction scratch: the ring
-/// double buffer, the reusable token/position input buffers, and the logits
-/// output backings. Keeping them here rather than on ``CoreMLModel`` is what
-/// lets two caches coexist (iOS runs an eager-prefill cache alongside the one
-/// the current generation is decoding into) without writing over each other.
+/// double buffer, the reusable embedding-row and position input buffers, and
+/// the logits output backings. Keeping them here rather than on
+/// ``CoreMLModel`` is what lets two caches coexist (iOS runs an eager-prefill
+/// cache alongside the one the current generation is decoding into) without
+/// writing over each other.
 ///
 /// A conversation reset means a *fresh* `KVCacheState`, never a reused one with
 /// a cleared ring: stale K/V left in a sliding slot becomes valid again the
@@ -106,14 +107,16 @@ public final class KVCacheState: @unchecked Sendable {
     private var ringBuffers: [MLMultiArray]
     private var ringIndex = 0
 
-    /// Reusable int32 scalars for the token and position inputs. Allocating
-    /// these per decode step showed up as pure overhead once the KV caches
-    /// stopped crossing the boundary.
-    let tokenScalar: MLMultiArray
+    /// Reusable int32 scalar for the position input. Allocating inputs per
+    /// decode step showed up as pure overhead once the KV caches stopped
+    /// crossing the boundary.
     let positionScalar: MLMultiArray
 
-    /// Reusable `[1, chunkSize]` int32 buffer for prefill token chunks.
-    let chunkTokens: MLMultiArray
+    /// Reusable fp16 `token_embed` / `ple_rows` inputs, one pair per function
+    /// kind, allocated on first use — a cache that only ever decodes never
+    /// pays for the `[1, chunk, …]` prefill pair.
+    private var decodeEmbeddingInputs: EmbeddingInputs?
+    private var prefillEmbeddingInputs: EmbeddingInputs?
 
     /// Decode logits output backings, alternating so the array returned by step
     /// N survives until step N+1 has been sampled. Allocated on first decode,
@@ -134,8 +137,7 @@ public final class KVCacheState: @unchecked Sendable {
         size: Int,
         caches: MLState,
         ringShape: [NSNumber],
-        ringDataType: MLMultiArrayDataType,
-        chunkSize: Int
+        ringDataType: MLMultiArrayDataType
     ) throws {
         self.size = size
         self.caches = caches
@@ -145,11 +147,7 @@ public final class KVCacheState: @unchecked Sendable {
             try PredictionBuffer.make(shape: ringShape, dataType: ringDataType, fill: -1),
             try PredictionBuffer.make(shape: ringShape, dataType: ringDataType, fill: -1),
         ]
-        self.tokenScalar = try MLMultiArray(shape: [1], dataType: .int32)
         self.positionScalar = try MLMultiArray(shape: [1], dataType: .int32)
-        self.chunkTokens = try MLMultiArray(
-            shape: [1, NSNumber(value: chunkSize)], dataType: .int32
-        )
     }
 
     // MARK: - Prediction scratch
@@ -211,17 +209,18 @@ public final class KVCacheState: @unchecked Sendable {
         }
     }
 
-    /// Fill the reusable prefill token buffer. `tokens.count` must match the
-    /// model's chunk size, which the engine guarantees by padding.
-    func loadChunk(_ tokens: [Int32]) throws {
-        guard tokens.count == chunkTokens.count else {
-            throw KVCacheError.unexpectedBufferLayout(
-                "prefill chunk has \(tokens.count) tokens, model expects \(chunkTokens.count)"
-            )
+    /// The reusable embedding-row inputs for `io`, the prefill or decode
+    /// function's signature.
+    func embeddingInputs(prefill: Bool, io: CoreMLModel.FunctionIO) throws -> EmbeddingInputs {
+        if let existing = prefill ? prefillEmbeddingInputs : decodeEmbeddingInputs {
+            return existing
         }
-        chunkTokens.withUnsafeMutableBufferPointer(ofType: Int32.self) { ptr, _ in
-            for (i, t) in tokens.enumerated() { ptr[i] = t }
-        }
+        let fresh = EmbeddingInputs(
+            tokenEmbed: try PredictionBuffer.make(shape: io.tokenEmbedShape, dataType: .float16),
+            pleRows: try PredictionBuffer.make(shape: io.pleRowsShape, dataType: .float16)
+        )
+        if prefill { prefillEmbeddingInputs = fresh } else { decodeEmbeddingInputs = fresh }
+        return fresh
     }
 
     // MARK: - Growth
@@ -246,6 +245,12 @@ public final class KVCacheState: @unchecked Sendable {
         // the same at every size and it has to survive growth intact.
         try PredictionBuffer.copyPrefix(from: old.ring, to: ring, what: "sliding_pos_ring")
     }
+}
+
+/// One function's `token_embed` / `ple_rows` input buffers, fp16.
+struct EmbeddingInputs {
+    let tokenEmbed: MLMultiArray
+    let pleRows: MLMultiArray
 }
 
 // MARK: - Prediction buffers

@@ -9,11 +9,13 @@
 /// cache size — see ``KVCacheSizePolicy``, the only place bucketing lives.
 ///
 /// **Every** KV cache is a CoreML state: the sliding-window caches and the
-/// global-attention ones alike. A prediction therefore takes the token,
-/// the position, and the int32 `sliding_pos_ring` (states must be floating
-/// point, so the ring cannot be one), and returns logits plus the updated ring.
-/// An artifact that still declares `k_<slot>` / `v_<slot>` as inputs predates
-/// that change and is rejected at load — re-run `gemma-export`.
+/// global-attention ones alike. A prediction therefore takes the token's
+/// embedding rows (`token_embed`, `ple_rows` — looked up on the host, see
+/// ``HostEmbeddings``), the position, and the int32 `sliding_pos_ring` (states
+/// must be floating point, so the ring cannot be one), and returns logits plus
+/// the updated ring. An artifact that still declares `k_<slot>` / `v_<slot>`
+/// as inputs predates the cache states, and one that takes token ids predates
+/// the host lookups; both are rejected at load — re-run `gemma-export`.
 ///
 /// State buffer shapes are baked into each function, so an `MLState` belongs to
 /// exactly one size: ``makeEmptyKVState(size:)`` creates it from that pair's
@@ -31,8 +33,11 @@ public final class CoreMLModel: @unchecked Sendable {
         let logitsOutputName: String
         let logitsShape: [NSNumber]
         let logitsDataType: MLMultiArrayDataType
-        /// Token input, `[1, chunk]` for prefill and `[1]` for decode.
-        let tokenInputName: String
+        /// `token_embed` / `ple_rows` shapes, `[1, L, cols]` with L the chunk
+        /// for prefill and 1 for decode.
+        let tokenEmbedShape: [NSNumber]
+        let pleRowsShape: [NSNumber]
+        /// Tokens per call (L).
         let tokenLength: Int
         let positionInputName: String
         let ringInputName: String
@@ -46,6 +51,9 @@ public final class CoreMLModel: @unchecked Sendable {
 
     let decodeIO: FunctionIO
     let prefillIO: FunctionIO
+
+    /// The tables the embedding-row inputs are looked up in.
+    private let embeddings: HostEmbeddings
 
     /// Tokens per prefill call, read from the prefill function's token input.
     ///
@@ -116,6 +124,7 @@ public final class CoreMLModel: @unchecked Sendable {
     private init(
         prefillIO: FunctionIO,
         decodeIO: FunctionIO,
+        embeddings: HostEmbeddings,
         chunkSize: Int,
         materializedSizes: [Int],
         effectiveMaxSeqLen: Int,
@@ -128,6 +137,7 @@ public final class CoreMLModel: @unchecked Sendable {
     ) {
         self.prefillIO = prefillIO
         self.decodeIO = decodeIO
+        self.embeddings = embeddings
         self.chunkSize = chunkSize
         self.materializedSizes = materializedSizes
         self.effectiveMaxSeqLen = effectiveMaxSeqLen
@@ -161,8 +171,7 @@ public final class CoreMLModel: @unchecked Sendable {
             size: target,
             caches: model.makeState(),
             ringShape: decodeIO.ringShape,
-            ringDataType: decodeIO.ringDataType,
-            chunkSize: chunkSize
+            ringDataType: decodeIO.ringDataType
         )
     }
 
@@ -505,6 +514,12 @@ public final class CoreMLModel: @unchecked Sendable {
         // those are the names and shapes it needs.
         let prefillIO = try prefillModel.map { try classifyIO(model: $0, function: prefillName) }
             ?? decodeIO
+        // After `classifyIO`, so an artifact that still takes token ids gets
+        // that error rather than a missing-directory one.
+        let embeddings = try HostEmbeddings(packageURL: sourceURL)
+        for (io, name) in [(decodeIO, decodeName), (prefillIO, prefillName)] {
+            try checkEmbeddingShapes(io, against: embeddings, function: name)
+        }
         // Decode-only prefills one token at a time, so a chunk larger than 1
         // would only pad the prompt and spend real decode steps on padding.
         let chunkSize = prefillModel == nil ? 1 : prefillIO.tokenLength
@@ -531,6 +546,7 @@ public final class CoreMLModel: @unchecked Sendable {
         let instance = CoreMLModel(
             prefillIO: prefillIO,
             decodeIO: decodeIO,
+            embeddings: embeddings,
             chunkSize: chunkSize,
             materializedSizes: retainedSizes,
             effectiveMaxSeqLen: retainedSizes[retainedSizes.count - 1],
@@ -637,7 +653,7 @@ public final class CoreMLModel: @unchecked Sendable {
     private static func logIOSummary(
         decodeIO: FunctionIO, prefillIO: FunctionIO, chunkSize: Int
     ) {
-        Log.info("[CoreML] Decode: logits=\(decodeIO.logitsOutputName)\(decodeIO.logitsShape.map { $0.intValue }) dtype=\(decodeIO.logitsDataType.rawValue), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), ring=\(decodeIO.ringInputName)→\(decodeIO.ringOutputName), caches=\(decodeIO.stateNames.count) states")
+        Log.info("[CoreML] Decode: logits=\(decodeIO.logitsOutputName)\(decodeIO.logitsShape.map { $0.intValue }) dtype=\(decodeIO.logitsDataType.rawValue), token_embed=\(decodeIO.tokenEmbedShape.map { $0.intValue }), ple_rows=\(decodeIO.pleRowsShape.map { $0.intValue }), pos=\(decodeIO.positionInputName), ring=\(decodeIO.ringInputName)→\(decodeIO.ringOutputName), caches=\(decodeIO.stateNames.count) states")
         Log.info("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName)\(prefillIO.logitsShape.map { $0.intValue }) dtype=\(prefillIO.logitsDataType.rawValue), chunk=\(chunkSize)")
     }
 
@@ -698,11 +714,12 @@ public final class CoreMLModel: @unchecked Sendable {
     ///
     /// A GPU-backed CoreML function does not finish compiling when it loads:
     /// `MLModel.load` only builds the E5RT plan, and MPSGraph specializes the
-    /// executable lazily inside the *first* `predictionFromFeatures:`. For this
-    /// model that first call costs ~17 s of single-threaded MLIR work, almost
-    /// all of it constant-folding the block-32 int4 embedding tables that feed
-    /// `gather` (`LowerDequantizeND` → `foldCastAttribute`, one LLVM `APFloat`
-    /// per weight element), with a ~27 GB transient peak. Nothing caches it:
+    /// executable lazily inside the *first* `predictionFromFeatures:`. While the
+    /// graph still gathered from its block-32 int4 embedding tables, that first
+    /// call cost ~17 s of single-threaded MLIR work constant-folding them
+    /// (`LowerDequantizeND` → `foldCastAttribute`, one LLVM `APFloat` per weight
+    /// element), with a ~27 GB transient peak; the lookups are on the host now,
+    /// but the first prediction is still the expensive one. Nothing caches it:
     /// it is redone in every process, for every materialized function.
     ///
     /// So pay it here — at load, or at the moment a conversation grows into a
@@ -724,8 +741,7 @@ public final class CoreMLModel: @unchecked Sendable {
                 size: size,
                 caches: model.makeState(),
                 ringShape: decodeIO.ringShape,
-                ringDataType: decodeIO.ringDataType,
-                chunkSize: chunkSize
+                ringDataType: decodeIO.ringDataType
             )
             if name.hasPrefix("decode") {
                 _ = try decode(token: 0, position: 0, kvState: scratch)
@@ -1005,11 +1021,14 @@ public final class CoreMLModel: @unchecked Sendable {
         }
 
         let model = try function(prefix: "prefill", size: kvState.size)
-        try kvState.loadChunk(tokens)
+        // Padded positions get the pad token's rows, like any other token.
+        let rows = try kvState.embeddingInputs(prefill: true, io: prefillIO)
+        try embeddings.fill(tokens: tokens, tokenEmbed: rows.tokenEmbed, pleRows: rows.pleRows)
         kvState.setScalar(startPosition, in: kvState.positionScalar)
 
         let inputs: [String: MLMultiArray] = [
-            prefillIO.tokenInputName: kvState.chunkTokens,
+            HostEmbeddings.tokenInputName: rows.tokenEmbed,
+            HostEmbeddings.perLayerInputName: rows.pleRows,
             prefillIO.positionInputName: kvState.positionScalar,
             prefillIO.ringInputName: kvState.ring,
         ]
@@ -1075,11 +1094,15 @@ public final class CoreMLModel: @unchecked Sendable {
             )
         }
         let model = try function(prefix: "decode", size: kvState.size)
-        kvState.setScalar(token, in: kvState.tokenScalar)
+        let rows = try kvState.embeddingInputs(prefill: false, io: decodeIO)
+        try embeddings.fill(
+            tokens: CollectionOfOne(token), tokenEmbed: rows.tokenEmbed, pleRows: rows.pleRows
+        )
         kvState.setScalar(position, in: kvState.positionScalar)
 
         let inputs: [String: MLMultiArray] = [
-            decodeIO.tokenInputName: kvState.tokenScalar,
+            HostEmbeddings.tokenInputName: rows.tokenEmbed,
+            HostEmbeddings.perLayerInputName: rows.pleRows,
             decodeIO.positionInputName: kvState.positionScalar,
             decodeIO.ringInputName: kvState.ring,
         ]
@@ -1131,13 +1154,14 @@ public final class CoreMLModel: @unchecked Sendable {
     // MARK: - I/O Classification
 
     /// Read one function's I/O names, shapes, and dtypes, rejecting artifacts
-    /// that predate stateful KV caches.
+    /// that predate stateful KV caches or host-side embedding lookups.
     ///
     /// With every cache declared as state, the signature is small and rigid:
-    /// inputs are the token, the position, the int32 `sliding_pos_ring`, and
-    /// (on exports that keep it) the cache-length `N`; outputs are the
-    /// float logits and the updated ring. Anything named `k_<n>` / `v_<n>` on
-    /// the signature means the caches still cross the boundary.
+    /// inputs are the fp16 `token_embed` / `ple_rows` rows, the position and
+    /// the int32 `sliding_pos_ring`; outputs are the float logits and the
+    /// updated ring. Anything named `k_<n>` / `v_<n>` on the signature means
+    /// the caches still cross the boundary; no `token_embed` means the model
+    /// still takes token ids and gathers the rows itself.
     static func classifyIO(model: MLModel, function: String) throws -> FunctionIO {
         let description = model.modelDescription
         let stateNames = description.stateDescriptionsByName.keys.sorted()
@@ -1148,6 +1172,26 @@ public final class CoreMLModel: @unchecked Sendable {
         guard cacheIO.isEmpty, !stateNames.isEmpty else {
             throw CoreMLModelError.modelPredatesCacheStates(
                 function: function, cacheFeatures: cacheIO
+            )
+        }
+
+        let embeddingNames = [HostEmbeddings.tokenInputName, HostEmbeddings.perLayerInputName]
+        let embeddingShapes = embeddingNames.compactMap { name -> [NSNumber]? in
+            guard let c = inputs[name]?.multiArrayConstraint, c.dataType == .float16,
+                  c.shape.count == 3 else { return nil }
+            return c.shape
+        }
+        guard embeddingShapes.count == 2 else {
+            throw CoreMLModelError.modelPredatesHostEmbeddings(
+                function: function, inputs: inputs.keys.sorted()
+            )
+        }
+        let (tokenEmbedShape, pleRowsShape) = (embeddingShapes[0], embeddingShapes[1])
+        let tokenLength = tokenEmbedShape[1].intValue
+        guard pleRowsShape[1].intValue == tokenLength else {
+            throw CoreMLModelError.unexpectedSignature(
+                function: function,
+                detail: "token_embed \(tokenEmbedShape) and ple_rows \(pleRowsShape) disagree on the token count"
             )
         }
 
@@ -1183,25 +1227,24 @@ public final class CoreMLModel: @unchecked Sendable {
             )
         }
 
-        // Token and position are all that is left: the caches are state, and
+        // The position is all that is left: the caches are state, and
         // `concretize_cache_length` folds each function's own cache length into
         // the graph, so nothing else crosses the boundary.
-        let control = inputs.keys.filter { $0 != ringInputName }.sorted()
-        guard control.count == 2 else {
+        let control = inputs.keys.filter { $0 != ringInputName && !embeddingNames.contains($0) }
+        guard control.count == 1, let positionName = control.first,
+              inputs[positionName]?.multiArrayConstraint?.dataType == .int32 else {
             throw CoreMLModelError.unexpectedSignature(
                 function: function,
-                detail: "expected token + position inputs, got \(control)"
+                detail: "expected one int32 position input besides the embedding rows and the ring, got \(control.sorted())"
             )
         }
-        let (tokenName, positionName) = identifyTokenAndPosition(control, inputs: inputs)
-        let tokenLength = inputs[tokenName]?.multiArrayConstraint?.shape
-            .map { $0.intValue }.reduce(1, *) ?? 1
 
         return FunctionIO(
             logitsOutputName: logitsName,
             logitsShape: logitsConstraint.shape,
             logitsDataType: logitsConstraint.dataType,
-            tokenInputName: tokenName,
+            tokenEmbedShape: tokenEmbedShape,
+            pleRowsShape: pleRowsShape,
             tokenLength: tokenLength,
             positionInputName: positionName,
             ringInputName: ringInputName,
@@ -1210,6 +1253,19 @@ public final class CoreMLModel: @unchecked Sendable {
             ringDataType: ringConstraint.dataType,
             stateNames: stateNames
         )
+    }
+
+    /// The embedding inputs' widths must be the shipped tables' widths.
+    private static func checkEmbeddingShapes(
+        _ io: FunctionIO, against embeddings: HostEmbeddings, function: String
+    ) throws {
+        let widths = (io.tokenEmbedShape[2].intValue, io.pleRowsShape[2].intValue)
+        guard widths == (embeddings.token.cols, embeddings.perLayer.cols) else {
+            throw CoreMLModelError.unexpectedSignature(
+                function: function,
+                detail: "embedding inputs are \(widths.0) / \(widths.1) wide, but the Embeddings/ tables have \(embeddings.token.cols) / \(embeddings.perLayer.cols) columns"
+            )
+        }
     }
 
     /// `k_<n>` / `v_<n>`: a KV cache tensor on the function signature.
@@ -1223,24 +1279,6 @@ public final class CoreMLModel: @unchecked Sendable {
         guard !digits.isEmpty else { return false }
         let rest = String(chars.dropFirst(digits.count))
         return rest.isEmpty || rest == "_out"
-    }
-
-    /// Tell the token input from the position input. Prefill's token input is
-    /// `[1, chunk]` so element count settles it; decode's are both `[1]`, where
-    /// the name does.
-    private static func identifyTokenAndPosition(
-        _ names: [String], inputs: [String: MLFeatureDescription]
-    ) -> (token: String, position: String) {
-        func count(_ name: String) -> Int {
-            inputs[name]?.multiArrayConstraint?.shape.map { $0.intValue }.reduce(1, *) ?? 1
-        }
-        let (a, b) = (names[0], names[1])
-        if count(a) != count(b) {
-            return count(a) > count(b) ? (a, b) : (b, a)
-        }
-        if a.contains("token") { return (a, b) }
-        if b.contains("token") { return (b, a) }
-        return (a, b)
     }
 }
 
@@ -1272,6 +1310,9 @@ public enum CoreMLModelError: Error, LocalizedError {
     /// A KV cache still crosses the function signature, i.e. the artifact was
     /// exported before the caches became CoreML state.
     case modelPredatesCacheStates(function: String, cacheFeatures: [String])
+    /// The function takes token ids rather than embedding rows, i.e. the
+    /// artifact was exported before the lookups moved to the host.
+    case modelPredatesHostEmbeddings(function: String, inputs: [String])
     /// The function's inputs/outputs are not the shape this runtime expects.
     case unexpectedSignature(function: String, detail: String)
     /// A declared output was missing from a prediction result.
@@ -1287,6 +1328,8 @@ public enum CoreMLModelError: Error, LocalizedError {
             "No usable materialized function pairs (decode sizes: \(decodeSizes), prefill sizes: \(prefillSizes))"
         case .modelPredatesCacheStates(let function, let cacheFeatures):
             "Function '\(function)' passes KV caches through its signature (\(cacheFeatures.isEmpty ? "no state features at all" : cacheFeatures.joined(separator: ", "))) — this model predates global-cache states. Re-run `uv run gemma-export`."
+        case .modelPredatesHostEmbeddings(let function, let inputs):
+            "Function '\(function)' takes \(inputs.joined(separator: ", ")) instead of the fp16 `token_embed` / `ple_rows` embedding rows — this model predates host-side embedding lookups. Re-run `uv run gemma-export`."
         case .unexpectedSignature(let function, let detail):
             "Function '\(function)' has an unexpected signature: \(detail)"
         case .missingOutput(let name):

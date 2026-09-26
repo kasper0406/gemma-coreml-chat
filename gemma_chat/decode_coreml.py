@@ -44,7 +44,26 @@ Since materialization turns the global caches into state too (see
 ``mil_passes.global_cache_states``), the first reason now applies to them as
 well: there is no ``slice_update`` left anywhere on a cache path.
 
-Tokens: right-padded — real tokens at positions 0..T-1, zeros at T..L-1.
+Inputs: embeddings, not token ids
+---------------------------------
+Neither function sees a token id.  The two embedding lookups — the token row
+and the per-layer-embedding (PLE) row — run on the host, which reads the
+int4 block-32 tables the exporter ships next to the model (see
+``gemma_chat.host_embeddings``), so the graph takes
+
+* ``token_embed`` ``(1, L, embed_dim)`` fp16 — the token's embedding row,
+  already multiplied by ``fp16(sqrt(embed_dim))`` in fp16, and
+* ``ple_rows`` ``(1, L, num_layers * per_layer_input_dim)`` fp16 — the raw PLE
+  row; the ``sqrt(per_layer_input_dim)`` scaling, the projection of
+  ``token_embed`` and its norm stay in the graph (:func:`_ple_from_rows`).
+
+``L`` is 1 for decode and ``CHUNK_SIZE`` for prefill.  The two gathers were
+the costliest ops of an ANE plan (~45% of its estimated cost, on the CPU, from
+~1.5 GB of tables); a host lookup is one row per token.  The tied logit head
+still reads ``params['embed_tokens']`` in the graph.
+
+Prompts are right-padded: real tokens at positions 0..T-1, the rows of the pad
+token (id 0) at T..L-1.
 
 Numeric precision
 -----------------
@@ -91,7 +110,7 @@ import jax.numpy as jnp
 import jax.scipy.special
 
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN
-from gemma_chat.model import AttentionType, Gemma4Config, _apply_rope, _embed_lookup
+from gemma_chat.model import AttentionType, Gemma4Config, _apply_rope
 from gemma_chat.cache_spec import build_cache_specs, kv_shared_sources
 
 
@@ -223,24 +242,21 @@ def _rmsnorm(x, scale):
     return _rmsnorm_noscale(x) * scale.astype(jnp.float16)
 
 
-def _ple_for_tokens(params, token_ids, cfg: Gemma4Config):
-    """Per-layer input embeddings for token_ids (B, L).
+def _ple_from_rows(params, token_embed, ple_rows, cfg: Gemma4Config):
+    """Per-layer inputs from the host-gathered embedding rows.
+
+    token_embed: (B, L, D) fp16, already multiplied by sqrt(D).
+    ple_rows:    (B, L, num_layers * per_layer_input_dim) fp16, raw table rows.
 
     Returns (B, L, num_layers * per_layer_input_dim).
     """
-    B, L = token_ids.shape
+    B, L = token_embed.shape[:2]
     d = cfg.per_layer_input_dim
 
-    ple_table = params['embed_tokens_per_layer']         # (vocab, NL*d)
-    ple_embed = _embed_lookup(ple_table, token_ids)      # (B, L, NL*d)
-    ple_embed = ple_embed * jnp.sqrt(float(d)).astype(ple_embed.dtype)
-
-    embed_table = params['embed_tokens']                 # (vocab, D)
-    x0 = _embed_lookup(embed_table, token_ids)           # (B, L, D)
-    x0 = x0 * jnp.sqrt(float(cfg.embed_dim)).astype(x0.dtype)
+    ple_embed = ple_rows * jnp.sqrt(float(d)).astype(ple_rows.dtype)
 
     W_proj = params['per_layer_model_projection']['kernel']  # (D, NL*d)
-    ple_proj = jnp.dot(x0, W_proj) * (cfg.embed_dim ** -0.5)  # (B, L, NL*d)
+    ple_proj = jnp.dot(token_embed, W_proj) * (cfg.embed_dim ** -0.5)  # (B, L, NL*d)
 
     # 3D RMSNorm trick (avoids CoreML 4D batch_norm fusion bug)
     NL = B * cfg.num_layers
@@ -371,7 +387,8 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
 
 def decode_step(
     params,
-    token_id,
+    token_embed,
+    ple_rows,
     position,
     kv_flat,
     sliding_pos_ring,
@@ -381,7 +398,10 @@ def decode_step(
 
     Args:
         params:    Flax param tree from load_params().
-        token_id:  () int32 — the new token to process.
+        token_embed: (1, 1, D) fp16 — the new token's embedding row, already
+                   multiplied by sqrt(D) (see the module docstring).
+        ple_rows:  (1, 1, num_layers * per_layer_input_dim) fp16 — its raw
+                   per-layer-embedding row.
         position:  () int32 — absolute position of this token (= T + step).
         kv_flat:   List of 30 cache arrays (per-layer shapes, float16).
                    Global cache dim 1 may vary (symbolic/flexible shapes).
@@ -393,12 +413,8 @@ def decode_step(
         kv_flat_new: Updated list of 30 cache arrays.
         sliding_pos_ring_new: Updated (1, sliding_window_size) int32.
     """
-    token_arr = token_id[jnp.newaxis, jnp.newaxis]  # (1, 1)
-
-    embed_table = params['embed_tokens']
-    x = _embed_lookup(embed_table, token_arr) * jnp.sqrt(float(cfg.embed_dim)).astype(jnp.float16)
-
-    ple_all = _ple_for_tokens(params, token_arr, cfg)  # (1, 1, NL*d)
+    x = token_embed                                          # (1, 1, D)
+    ple_all = _ple_from_rows(params, token_embed, ple_rows, cfg)  # (1, 1, NL*d)
 
     # Update sliding_pos_ring for this position (shared by all sliding layers).
     W = cfg.sliding_window_size
@@ -610,7 +626,8 @@ def _attn_chunk_shared(lp, x, positions, cfg: Gemma4Config, attn_type: str,
 
 def chunk_prefill_step(
     params,
-    tokens,
+    token_embed,
+    ple_rows,
     start_position,
     kv_flat,
     sliding_pos_ring,
@@ -621,13 +638,17 @@ def chunk_prefill_step(
 
     Args:
         params:         Flax param tree from load_params().
-        tokens:         (1, chunk_size) int32 — chunk of tokens (right-padded if last).
+        token_embed:    (1, chunk_size, D) fp16 — the chunk's embedding rows,
+                        already multiplied by sqrt(D); a short final chunk is
+                        right-padded with the rows of token 0.
+        ple_rows:       (1, chunk_size, num_layers * per_layer_input_dim) fp16 —
+                        the chunk's raw per-layer-embedding rows, padded alike.
         start_position: () int32 — absolute position of the first token in this chunk.
         kv_flat:        List of 30 cache arrays (per-layer shapes, float16).
                         Global cache dim 1 may vary (symbolic/flexible shapes).
         sliding_pos_ring: (1, sliding_window_size) int32 — ring position tracker.
         cfg:            Model config.
-        chunk_size:     Number of tokens per chunk (must match tokens.shape[1]).
+        chunk_size:     Number of tokens per chunk (must match token_embed.shape[1]).
 
     Returns:
         logits: (chunk_size, vocab_size) float32 — logits at all chunk positions.
@@ -638,10 +659,8 @@ def chunk_prefill_step(
     positions = start_position + jnp.arange(C, dtype=jnp.int32)
     positions = positions[jnp.newaxis]  # (1, C)
 
-    embed_table = params['embed_tokens']
-    x = _embed_lookup(embed_table, tokens) * jnp.sqrt(float(cfg.embed_dim)).astype(jnp.float16)
-
-    ple_all = _ple_for_tokens(params, tokens, cfg)  # (1, C, NL*d)
+    x = token_embed                                          # (1, C, D)
+    ple_all = _ple_from_rows(params, token_embed, ple_rows, cfg)  # (1, C, NL*d)
 
     # Update sliding_pos_ring for this chunk (shared by all sliding layers).
     W = cfg.sliding_window_size

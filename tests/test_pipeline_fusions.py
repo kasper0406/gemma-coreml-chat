@@ -20,7 +20,6 @@ from stablehlo_coreml.converter import convert as hlo_to_mil
 
 from gemma_chat.decode_coreml import _rmsnorm as rmsnorm
 from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
-from gemma_chat.model import _embed_lookup
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -420,29 +419,21 @@ def test_logit_projection_int8_for_decode_fp16_for_prefill():
 
     Decode only: in situ the int8 head is worth ~+4% decode but costs ~22% of
     prefill, which runs it at M = CHUNK_SIZE rather than M = 1.  The two phases
-    convert separately, so they simply get different weights.
+    convert separately, so they simply get different weights; the pass tells
+    them apart by the length of the ``token_embed`` input.
 
-    The gather table in the same graph is the control: it stays int4 block-32.
+    The other [dim, *] weight in the same graph is the control: it stays int4.
     """
     rng = np.random.RandomState(5)
     vocab = 262144
-    # Distinct embedding/logit dims, so neither tensor can be mistaken for the
-    # other's transpose when the converter picks a matmul orientation.
-    table = (rng.randn(vocab, 32) * 0.05).astype(np.float16)
     hidden = (rng.randn(32, 64) * 0.1).astype(np.float16)
     logit_w = (rng.randn(64, vocab) * 0.02).astype(np.float16)
 
-    def decode_fn(token_id):
-        embedded = _embed_lookup(jnp.asarray(table), token_id)
-        return jnp.matmul(jnp.matmul(embedded, jnp.asarray(hidden)),
+    def logits_fn(token_embed):
+        return jnp.matmul(jnp.matmul(token_embed, jnp.asarray(hidden)),
                           jnp.asarray(logit_w))
 
-    def prefill_fn(tokens):
-        embedded = _embed_lookup(jnp.asarray(table), tokens)
-        return jnp.matmul(jnp.matmul(embedded, jnp.asarray(hidden)),
-                          jnp.asarray(logit_w))
-
-    _, prog = _convert(decode_fn, jnp.zeros((1, 1), jnp.int32))
+    _, prog = _convert(logits_fn, jnp.zeros((1, 1, 32), jnp.float16))
 
     constexprs = [op for op in _ops(prog)
                   if op.op_type == "constexpr_blockwise_shift_scale"]
@@ -464,13 +455,13 @@ def test_logit_projection_int8_for_decode_fp16_for_prefill():
         "silently corrupt this matmul at M >= 5 for vocab >= 65536"
     )
 
-    assert table.shape in by_shape, "the embedding table stopped being quantized"
+    assert {hidden.shape, hidden.T.shape} & set(by_shape), "the hidden weight stopped being quantized"
 
     # ...and prefill keeps the plain fp16 const, because int8 costs it ~22%.
-    _, prefill_prog = _convert(prefill_fn, jnp.zeros((1, 4), jnp.int32))
+    _, prefill_prog = _convert(logits_fn, jnp.zeros((1, 4, 32), jnp.float16))
     prefill_shapes = {tuple(op.outputs[0].shape) for op in _ops(prefill_prog)
                       if op.op_type == "constexpr_blockwise_shift_scale"}
     assert not ({logit_w.shape, logit_w.T.shape} & prefill_shapes), (
         "the prefill logit head was quantized; int8 costs ~22% of prefill"
     )
-    assert table.shape in prefill_shapes, "prefill embedding table not quantized"
+    assert {hidden.shape, hidden.T.shape} & prefill_shapes, "prefill hidden weight not quantized"

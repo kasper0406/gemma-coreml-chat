@@ -2,17 +2,20 @@
 
 By default, both functions are merged into a single multifunction .mlpackage
 with shared quantized weights (per-channel int4 for matmul weights, since
-blockwise scales are not ANE-eligible; block-32 int4 for the CPU-side embedding
-tables; the logit projection left unquantized as plain fp16, because int8 is
-what MPSGraph constant-folds on first prediction and int4 cannot carry the
-logits — see ``mil_passes/quantize_const_weights``), and the global KV caches are
+blockwise scales are not ANE-eligible; block-32 int8 for the decode logit head
+— see ``mil_passes/quantize_const_weights``), and the global KV caches are
 materialized into one concrete-shape function per size so the model runs on
 ANE / CPU as well as GPU.  Pass --no-materialize to keep RangeDim shapes for a
 single dynamic-shape function pair.
 
+The embedding lookups are not in the graph: the functions take the embedding
+rows (``token_embed``, ``ple_rows``) and the runtime looks them up in the
+block-32 int4 tables this exporter ships in the package's ``Embeddings/``
+directory, next to ``Tokenizer/`` — see ``gemma_chat.host_embeddings``.
+
 All 15 KV caches end up as Core ML **state** in the materialized model; the
-int32 ``sliding_pos_ring`` is the only thing besides tokens/positions that
-still crosses the model boundary (states must be floating point).
+int32 ``sliding_pos_ring`` is the only thing besides the embedding rows and the
+position that still crosses the model boundary (states must be floating point).
 
 The two halves get there by different routes.  The 12 sliding-window caches are
 static-shaped from the start, so the StableHLO→MIL converter binds them to
@@ -37,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import shutil
 import subprocess
 import sys
 import os as _os
@@ -118,6 +122,7 @@ from gemma_chat.decode_coreml import (
     chunk_prefill_step, decode_step, empty_pos_ring,
 )
 from gemma_chat.cache_spec import build_cache_specs
+from gemma_chat import host_embeddings
 
 
 # ── Truncated config / params for --num-layers ────────────────────────────
@@ -164,9 +169,32 @@ def _truncate_params(params: dict, num_layers: int, ple_dim: int) -> dict:
 
 # ── Shared helpers ─────────────────────────────────────────────────────────
 
+# The non-cache inputs of each traced function, in argument order: the
+# host-gathered embedding rows (see ``decode_coreml``) and the position.
+_LEADING_INPUTS = {
+    "prefill": ["token_embed", "ple_rows", "start_position"],
+    "decode": ["token_embed", "ple_rows", "position"],
+}
+
+
+def _embedding_input_specs(config: Gemma4Config, length: int):
+    """``token_embed`` / ``ple_rows`` trace specs for ``length`` tokens."""
+    return (
+        jax.ShapeDtypeStruct((1, length, config.embed_dim), jnp.float16),
+        jax.ShapeDtypeStruct(
+            (1, length, config.num_layers * config.per_layer_input_dim), jnp.float16
+        ),
+    )
+
+
+def _host_tables_dir(phase_output: Path) -> Path:
+    """Where the decode phase leaves the host embedding tables for the parent."""
+    return Path(phase_output).with_suffix(".embeddings")
+
+
 
 def _kv_export_plan(
-    cache_specs, has_global: bool,
+    cache_specs, has_global: bool, num_leading: int,
 ) -> tuple[dict[int, StateSpec], list[str], list[str]]:
     """Split the flat KV caches into Core ML state and ordinary I/O.
 
@@ -180,11 +208,13 @@ def _kv_export_plan(
     I/O for good.
 
     Both traced functions have the argument order
-    ``[N?] + [tokens, start_position] + kv_flat + [sliding_pos_ring]`` and the
-    result order ``[logits] + kv_flat_out + [sliding_pos_ring_out]``, where
+    ``[N?] + leading + kv_flat + [sliding_pos_ring]`` and the result order
+    ``[logits] + kv_flat_out + [sliding_pos_ring_out]``, where ``leading`` is
+    the ``num_leading`` non-cache inputs (see :data:`_LEADING_INPUTS`) and
     ``kv_flat`` is ``[k_0, v_0, k_1, v_1, ...]``.  Cache slot ``s`` is therefore
     argument ``base + 2s`` (k) / ``base + 2s + 1`` (v) with
-    ``base = (1 if has_global else 0) + 2``, and output ``1 + 2s`` / ``2 + 2s``.
+    ``base = (1 if has_global else 0) + num_leading``, and output ``1 + 2s`` /
+    ``2 + 2s``.
     ``N`` is the leading dimension-variable argument JAX adds for the symbolic
     global cache length; it is absent when no layer is global.
 
@@ -193,7 +223,7 @@ def _kv_export_plan(
     keep the names the inputs used to have (``k_0``, ``v_0``, …) so the layout
     is unchanged from the runtime's point of view.
     """
-    base = (1 if has_global else 0) + 2
+    base = (1 if has_global else 0) + num_leading
     states: dict[int, StateSpec] = {}
     kv_input_names: list[str] = []
     kv_output_names: list[str] = []
@@ -478,7 +508,8 @@ def export_chunk_prefill(
     described below.
 
     Inputs:  N (1,) int32 — phantom dim for current global cache length
-             tokens (1, chunk_size) int32
+             token_embed (1, chunk_size, embed_dim) fp16 — embedding rows × sqrt(D)
+             ple_rows (1, chunk_size, num_layers * per_layer_input_dim) fp16
              start_position (1,) int32  — absolute position of first token in chunk
              k_s, v_s — current **global** KV cache arrays float16 (slot order)
              sliding_pos_ring (1, sliding_window_size) int32
@@ -521,6 +552,9 @@ def export_chunk_prefill(
 
     print("  Converting params to float16 …", flush=True)
     _inplace_bf16_to_f16(params)
+    # The host looks the per-layer embeddings up (the decode phase ships the
+    # table); nothing in the graph reads it any more.
+    del params["embed_tokens_per_layer"]
 
     gc.disable()
     try:
@@ -530,12 +564,12 @@ def export_chunk_prefill(
             (N,) = jax_export.symbolic_shape("N", constraints=[f"N >= {CHUNK_SIZE}"])
         pos_ring_shape = (1, config.sliding_window_size)
 
-        def chunk_prefill_fn(tokens, start_pos_1d, *kv_and_ring):
+        def chunk_prefill_fn(token_embed, ple_rows, start_pos_1d, *kv_and_ring):
             kv_flat = list(kv_and_ring[:-1])
             sliding_pos_ring = kv_and_ring[-1]
             start_pos = start_pos_1d[0]
             logits, kv_new, ring_new = chunk_prefill_step(
-                params, tokens, start_pos, kv_flat, sliding_pos_ring,
+                params, token_embed, ple_rows, start_pos, kv_flat, sliding_pos_ring,
                 cfg=config, chunk_size=chunk_size,
             )
             return (logits,) + tuple(kv_new) + (ring_new,)
@@ -551,8 +585,8 @@ def export_chunk_prefill(
 
         print("  Tracing chunk_prefill_step with symbolic shapes …", flush=True)
         traced = jax.jit(chunk_prefill_fn).trace(
-            jax.ShapeDtypeStruct((1, chunk_size), jnp.int32),  # tokens
-            jax.ShapeDtypeStruct((1,), jnp.int32),             # start_position
+            *_embedding_input_specs(config, chunk_size),     # token_embed, ple_rows
+            jax.ShapeDtypeStruct((1,), jnp.int32),           # start_position
             *kv_flat_shapes,
             ring_shape,
         )
@@ -575,7 +609,10 @@ def export_chunk_prefill(
         print("=" * 60)
         print("Chunk-prefill export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        states, kv_names, kv_out_names = _kv_export_plan(cache_specs, has_global)
+        leading = _LEADING_INPUTS["prefill"]
+        states, kv_names, kv_out_names = _kv_export_plan(
+            cache_specs, has_global, len(leading),
+        )
         print(
             f"  Sliding caches as Core ML state: {len(states)}; "
             f"global caches as I/O: {len(kv_names)}",
@@ -593,7 +630,7 @@ def export_chunk_prefill(
         n_prefix = ["N"] if has_global else []
         _mil_to_mlpackage(
             mil_program, output_path,
-            input_names=n_prefix + ["tokens", "start_position"] + kv_names + ["sliding_pos_ring"],
+            input_names=n_prefix + leading + kv_names + ["sliding_pos_ring"],
             output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
             flexible_shapes=flex_shapes,
         )
@@ -622,7 +659,8 @@ def export_decode_step(
     described below.
 
     Inputs:  N (1,) int32 — phantom dim for current global cache length
-             token_id (1,) int32
+             token_embed (1, 1, embed_dim) fp16 — embedding row × sqrt(D)
+             ple_rows (1, 1, num_layers * per_layer_input_dim) fp16
              position (1,) int32  — absolute position of this token
              k_s, v_s — current **global** KV cache arrays float16 (slot order)
              sliding_pos_ring (1, sliding_window_size) int32
@@ -630,6 +668,11 @@ def export_decode_step(
     Outputs: logits (vocab_size,) float32
              k_s_out, v_s_out — updated global KV caches
              sliding_pos_ring_out (1, sliding_window_size) int32
+
+    Also writes the host embedding tables the runtime feeds ``token_embed`` and
+    ``ple_rows`` from (see ``gemma_chat.host_embeddings``) into
+    :func:`_host_tables_dir` of ``output_path``; the caller moves them into the
+    final package.
     """
     import numpy as np
     import gc
@@ -669,6 +712,20 @@ def export_decode_step(
     print("  Converting params to float16 …", flush=True)
     _inplace_bf16_to_f16(params)
 
+    # The host does both embedding lookups, from tables quantized exactly as
+    # the graph used to quantize them.  The per-layer table leaves the graph
+    # entirely; the token table stays, as the (tied) logit head.
+    print("  Writing host embedding tables …", flush=True)
+    host_embeddings.write_tables(
+        {
+            "token_embed": params["embed_tokens"],
+            "ple_rows": params.pop("embed_tokens_per_layer"),
+        },
+        config.embed_dim,
+        _host_tables_dir(output_path),
+    )
+    _release_malloc()
+
     gc.disable()
     try:
         cache_specs = build_cache_specs(config, max_seq_len)
@@ -677,13 +734,12 @@ def export_decode_step(
             (N,) = jax_export.symbolic_shape("N", constraints=["N >= 1"])
         pos_ring_shape = (1, config.sliding_window_size)
 
-        def decode_fn(token_id_1d, position_1d, *kv_and_ring):
+        def decode_fn(token_embed, ple_rows, position_1d, *kv_and_ring):
             kv_flat = list(kv_and_ring[:-1])
             sliding_pos_ring = kv_and_ring[-1]
-            token_id = token_id_1d[0]
             position = position_1d[0]
             logits, kv_new, ring_new = decode_step(
-                params, token_id, position, kv_flat, sliding_pos_ring,
+                params, token_embed, ple_rows, position, kv_flat, sliding_pos_ring,
                 cfg=config,
             )
             return (logits,) + tuple(kv_new) + (ring_new,)
@@ -699,7 +755,7 @@ def export_decode_step(
 
         print("  Tracing decode_step with symbolic shapes …", flush=True)
         traced = jax.jit(decode_fn).trace(
-            jax.ShapeDtypeStruct((1,), jnp.int32),  # token_id
+            *_embedding_input_specs(config, 1),     # token_embed, ple_rows
             jax.ShapeDtypeStruct((1,), jnp.int32),  # position
             *kv_flat_shapes,
             ring_shape,
@@ -719,7 +775,10 @@ def export_decode_step(
         print("=" * 60)
         print("Decode export — Step 3/3  ct.convert + save")
         print("=" * 60)
-        states, kv_names, kv_out_names = _kv_export_plan(cache_specs, has_global)
+        leading = _LEADING_INPUTS["decode"]
+        states, kv_names, kv_out_names = _kv_export_plan(
+            cache_specs, has_global, len(leading),
+        )
         print(
             f"  Sliding caches as Core ML state: {len(states)}; "
             f"global caches as I/O: {len(kv_names)}",
@@ -737,7 +796,7 @@ def export_decode_step(
         n_prefix = ["N"] if has_global else []
         _mil_to_mlpackage(
             mil_program, output_path,
-            input_names=n_prefix + ["token_id", "position"] + kv_names + ["sliding_pos_ring"],
+            input_names=n_prefix + leading + kv_names + ["sliding_pos_ring"],
             output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
             flexible_shapes=flex_shapes,
         )
@@ -767,6 +826,15 @@ def _embed_tokenizer(model_id: str, mlpackage_path: Path) -> None:
     print(f"  Wrote config.json (model_type=gemma)")
 
     print(f"  Tokenizer stored in {tok_dir}/")
+
+
+def _embed_host_tables(tables_dir: Path, mlpackage_path: Path) -> None:
+    """Move the decode phase's host embedding tables into the .mlpackage."""
+    dst = mlpackage_path / host_embeddings.DIR_NAME
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.move(str(tables_dir), str(dst))
+    print(f"  Host embedding tables stored in {dst}/")
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
@@ -810,7 +878,6 @@ def _parse_materialize_sizes(s: str | None) -> list[int]:
 
 
 def main() -> None:
-    import shutil
     import tempfile
 
     parser = argparse.ArgumentParser(
@@ -1020,8 +1087,10 @@ def main() -> None:
                 sizes.append(f"    {p.name}  ({sz / 1e9:.2f} GB)")
             print("\n  Export complete:\n" + "\n".join(sizes) + "\n")
 
-            # Embed tokenizer into decode model (the one the CLI loads)
+            # Embed tokenizer and host tables into decode model (the one the
+            # CLI loads)
             _embed_tokenizer(args.model_id, out_decode)
+            _embed_host_tables(_host_tables_dir(out_decode), out_decode)
 
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr)
@@ -1096,6 +1165,7 @@ def main() -> None:
                 print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
 
             _embed_tokenizer(args.model_id, output)
+            _embed_host_tables(_host_tables_dir(tmp_decode), output)
 
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr)
