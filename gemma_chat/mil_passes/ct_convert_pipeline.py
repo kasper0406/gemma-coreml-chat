@@ -12,11 +12,12 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
     The base is ``stablehlo_coreml.build_pass_pipeline()``, which inserts its
     own cleanup, fusion and late-fusion groups into ``ct.PassPipeline.DEFAULT``
     — see that function for what those groups contain. On top of it this adds
-    the two passes owned by this repository and drops the passes the exported
+    the three passes owned by this repository and drops the passes the exported
     model cannot use.
     """
     import gemma_chat.mil_passes.quantize_const_weights  # noqa: F401
     import gemma_chat.mil_passes.collapse_cast_chains  # noqa: F401
+    import gemma_chat.mil_passes.fp16_l2_norm  # noqa: F401
 
     pipeline = build_pass_pipeline()
     # First: weights must be quantized before any pass materializes them.
@@ -30,6 +31,10 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
     # ``common::fuse_rmsnorm`` is not inserted here: this project's RMSNorm
     # fusion now lives in stablehlo-coreml, which puts it in its own late-fusion
     # group right after ``common::fuse_reduce_mean`` (stablehlo-coreml >= 0.1.6).
+    # Right behind it, move the fused norms from fp32 to fp16.
+    pipeline.insert_pass(
+        pipeline.passes.index("common::fuse_rmsnorm") + 1, "common::fp16_l2_norm",
+    )
     pipeline.remove_passes([
         # Callers convert with ``compute_precision=ct.precision.FLOAT32``, which
         # means "leave the dtypes alone", not "compute in fp32": the traced graph

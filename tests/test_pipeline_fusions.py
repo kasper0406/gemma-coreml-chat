@@ -128,9 +128,11 @@ def logit_softcap(x):
     return jnp.tanh(x / cap) * cap
 
 
-def double_rmsnorm(x, scale_a, scale_b):
-    """Adjacent norms, as every sub-layer boundary of the real graph has them."""
-    return rmsnorm(rmsnorm(x, scale_a), scale_b)
+def double_rmsnorm(x):
+    """Adjacent norms, as every sub-layer boundary of the real graph has them
+    (the scales are weight constants there too)."""
+    scale = jnp.asarray(np.full((x.shape[-1],), 0.5, np.float16))
+    return rmsnorm(rmsnorm(x, scale), scale)
 
 
 def _attn_args(C, hd, kv_rep=2, H=8, S=128):
@@ -230,12 +232,13 @@ def _rmsnorm_const_scale(x):
     return rmsnorm(x, jnp.asarray(np.full((x.shape[-1],), 0.5, np.float16)))
 
 
-def test_rmsnorm_fuses_to_l2_norm():
-    """``fuse_rmsnorm`` still matches the fp16 norm: its sum-of-squares tail
-    becomes ``l2_norm`` + one ``mul``, behind the ``max|x|`` prescale.
+def test_rmsnorm_fuses_to_one_fp16_l2_norm():
+    """The fp32-statistics norm becomes ``l2_norm`` + one ``mul``, in fp16.
 
-    ``(1, 1, D)`` needs no reshape: ``l2_norm`` normalizes over the last three
-    dims, which for that shape is exactly the last one.
+    ``fuse_rmsnorm`` collapses the chain onto ``l2_norm`` and ``fp16_l2_norm``
+    drops the casts around it. ``(1, 1, D)`` needs no reshape: ``l2_norm``
+    normalizes over the last three dims, which for that shape is exactly the
+    last one.
     """
     x = jnp.ones((1, 1, 256), jnp.float16)
     _, prog = _convert(_rmsnorm_const_scale, x)
@@ -243,21 +246,24 @@ def test_rmsnorm_fuses_to_l2_norm():
     assert _count(prog, "l2_norm") == 1
     for op_type in ("reduce_mean", "reduce_sum", "rsqrt", "reshape", "cast"):
         assert _count(prog, op_type) == 0, f"unfused RMSNorm leftover: {op_type}"
-    # eps' = d * eps, so that l2_norm's sum-of-squares matches mean + 1e-5.
+    # eps' = d * eps, so that l2_norm's sum of squares matches mean + 1e-6.
     l2 = next(op for op in _ops(prog) if op.op_type == "l2_norm")
-    assert abs(float(l2.inputs["epsilon"].val) - 256 * 1e-5) < 1e-5
-    # abs -> reduce_max -> maximum -> real_div -> l2_norm -> mul(sqrt(d)*scale).
-    assert sum(1 for op in _ops(prog) if op.op_type != "const") == 6
+    assert l2.inputs["epsilon"].val == np.float16(256 * 1e-6)
+    assert l2.outputs[0].dtype == mil_types.fp16
+    # l2_norm -> mul(sqrt(d) * scale).
+    assert sum(1 for op in _ops(prog) if op.op_type != "const") == 2
 
 
-def test_rmsnorm_off_canonical_shape_is_left_alone():
-    """``l2_norm`` reduces the last three dims, so a ``(1, L, H, hd)`` q-norm
-    would need reshaping around it — measurably a loss, so the pass skips it."""
-    for shape in ((1, 4, 8, 256), (1, 128, 256)):
+def test_rmsnorm_off_canonical_shape_is_viewed_as_rows():
+    """Prefill ``(1, L, D)`` and per-head ``(1, L, H, hd)`` norms are viewed as
+    ``(rows, 1, 1, d)`` so they fuse too: an unfused fp16 sum of squares
+    would overflow, and the fp32 one would pin the norm to the CPU on the ANE."""
+    for shape in ((1, 4, 8, 256), (1, 128, 256), (1, 1, 8, 256)):
         _, prog = _convert(_rmsnorm_const_scale, jnp.ones(shape, jnp.float16))
-        assert _count(prog, "l2_norm") == 0, shape
-        assert _count(prog, "reduce_mean") == 1, shape
-        assert _count(prog, "rsqrt") == 1, shape
+        assert _count(prog, "l2_norm") == 1, shape
+        for op_type in ("reduce_mean", "reduce_sum", "rsqrt", "cast"):
+            assert _count(prog, op_type) == 0, (shape, op_type)
+        assert _count(prog, "reshape") <= 2, shape
 
 
 def test_exact_gelu_fuses_to_one_fp16_op():
@@ -278,14 +284,12 @@ def test_exact_gelu_fuses_to_one_fp16_op():
 def test_rmsnorm_is_fp16_end_to_end():
     """The ANE has no fp32: a norm that upcasts anywhere pins its ops to the CPU.
 
-    Covers every norm shape the model has — the fused ``(1, 1, D)`` decode
-    norms, the unfused chunk and per-head ones — and two norms back to back.
+    Covers every norm shape the model has — the ``(1, 1, D)`` decode norms,
+    the chunk and per-head ones — and two norms back to back.
     """
-    scale = jnp.ones((256,), jnp.float16)
     progs = [_convert(_rmsnorm_const_scale, jnp.ones(shape, jnp.float16))[1]
              for shape in ((1, 1, 1536), (1, 128, 256), (1, 4, 8, 256))]
-    progs.append(_convert(double_rmsnorm, jnp.ones((1, 1, 256), jnp.float16),
-                          scale, scale)[1])
+    progs.append(_convert(double_rmsnorm, jnp.ones((1, 1, 256), jnp.float16))[1])
     for prog in progs:
         assert _count(prog, "cast") == 0
         for op in _ops(prog):
@@ -297,23 +301,44 @@ def test_rmsnorm_is_fp16_end_to_end():
                 )
 
 
-def test_fp16_rmsnorm_matches_fp32_statistics():
-    """The max|x| prescale keeps the fp16 sum of squares finite and accurate.
-
-    Activations of this size square to ~1e5 each, so a plain fp16 sum of
-    squares would overflow to inf.
-    """
+def _norm_rows():
+    """fp16 rows across the range RMSNorm meets, eps-dominated ones included."""
     rng = np.random.RandomState(11)
-    x = (rng.randn(4, 1536) * 300.0).astype(np.float16)
-    x[0, 7] = 6.0e4  # one huge outlier, as residual streams have
-    scale = (1.0 + rng.randn(1536) * 0.1).astype(np.float16)
+    rows = {
+        "zeros": np.zeros(1536),
+        "all 1e-6": np.full(1536, 1e-6),
+        "all 1e-4": np.full(1536, 1e-4),
+        "all 1e-3": np.full(1536, 1e-3),
+        "rms 1": rng.randn(1536),
+        "rms 80": rng.randn(1536) * 80.0,
+        "rms 2000": rng.randn(1536) * 2000.0,
+    }
+    outlier = rng.randn(1536) * 300.0
+    outlier[7] = 6.0e4  # one huge outlier, as residual streams have
+    rows["rms 300 + 6e4 outlier"] = outlier
+    return {k: v.astype(np.float16) for k, v in rows.items()}
 
-    x32 = x.astype(np.float32)
-    ref = x32 / np.sqrt(np.mean(x32 ** 2, axis=-1, keepdims=True) + 1e-6) * scale
-    out = np.asarray(rmsnorm(jnp.asarray(x), jnp.asarray(scale)), np.float32)
 
-    assert np.all(np.isfinite(out))
-    np.testing.assert_allclose(out, ref, atol=2e-2, rtol=1e-2)
+def _reference_rmsnorm(x16, scale16):
+    x = x16.astype(np.float64)
+    return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + 1e-6) * scale16.astype(np.float64)
+
+
+def test_rmsnorm_matches_an_fp64_reference_across_the_range():
+    """The JAX function, fp16 in and out, against fp64 — tiny rows included,
+    where ``eps`` dominates and the output must stay small, and rows whose
+    fp16 sum of squares would overflow."""
+    scale = (1.0 + np.random.RandomState(5).randn(1536) * 0.1).astype(np.float16)
+    for name, row in _norm_rows().items():
+        # decode (1, 1, D), prefill (1, L, D) and per-head (1, 1, H, hd) rows
+        for x in (row.reshape(1, 1, 1536), np.stack([row, row])[None], row.reshape(1, 1, 6, 256)):
+            s = scale[:x.shape[-1]]
+            out = np.asarray(rmsnorm(jnp.asarray(x), jnp.asarray(s)), np.float64)
+            ref = _reference_rmsnorm(x, s)
+            shape = x.shape
+            assert np.all(np.isfinite(out)), (name, shape)
+            np.testing.assert_allclose(out, ref, rtol=2e-3, atol=2e-3 * np.abs(ref).max() + 1e-12,
+                                       err_msg=f"{name} {shape}")
 
 
 # ── numerical parity ─────────────────────────────────────────────────────
@@ -366,6 +391,25 @@ def test_numerical_logit_softcap():
     out = _predict(model, x)
 
     np.testing.assert_allclose(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def test_exported_rmsnorm_matches_an_fp64_reference_on_cpu():
+    """The converted norm — an fp16 ``l2_norm`` — on the CPU across the range.
+
+    Its sum of squares must not overflow like a plain fp16 one would. (Measured
+    on the GPU and the ANE as well; see ``mil_passes/fp16_l2_norm`` for those
+    numbers and the ANE's one deviation, on eps-dominated rows.)
+    """
+    rows = _norm_rows()
+    x = np.stack(list(rows.values()))[:, None, None, :]   # (rows, 1, 1, 1536)
+    scale = (1.0 + np.random.RandomState(5).randn(1536) * 0.1).astype(np.float16)
+    model, prog = _convert(_rmsnorm_const_scale, jnp.asarray(x), load=True)
+    assert _count(prog, "l2_norm") == 1 and _count(prog, "cast") == 0
+    out = _predict(model, x).astype(np.float64)
+    ref = _reference_rmsnorm(x, np.full(1536, 0.5, np.float16))
+    for i, name in enumerate(rows):
+        np.testing.assert_allclose(out[i], ref[i], rtol=5e-3, atol=5e-3 * np.abs(ref[i]).max() + 1e-12,
+                                   err_msg=name)
 
 
 def test_numerical_rmsnorm_and_gelu():

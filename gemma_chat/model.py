@@ -148,7 +148,7 @@ class RMSNormNoScale(nnx.Module):
     """RMS normalization without a learnable scale parameter.
 
     Matches Gemma4RMSNorm(with_scale=False) — computes in fp32 and returns fp32.
-    Reference-model counterpart of ``decode_coreml._rmsnorm_noscale``.
+    Reference-model counterpart of ``decode_coreml._rmsnorm`` without a scale.
     """
     def __call__(self, x):
         x32 = x.astype(jnp.float32)

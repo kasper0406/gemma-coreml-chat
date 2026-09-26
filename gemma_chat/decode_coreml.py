@@ -71,16 +71,18 @@ Every *stored* activation is fp16 — the residual stream, the attention
 inputs/outputs, the KV caches, the MLP activations.  fp32 is used only where a
 range genuinely needs it:
 
-* **RMSNorm runs in fp16** (``_rmsnorm``, ``_rmsnorm_noscale``), because the
-  ANE has no fp32: fp32 norm statistics used to pin ~70% of the graph's ops to
-  the CPU.  Done naively in fp16 the sum of squares reaches ~1e7 and overflows.
-  RMSNorm is scale-invariant, so the input is first divided by its ``max|x|``:
-  every square is then at most 1 and the sum at most the axis width (≤ 1536),
-  and the eps becomes 1e-5 on the rescaled mean.  Measured against the fp32
-  statistics, KL 0.001 — below the backends' own disagreement.  Beware
-  ``jnp.mean`` here: on fp16 it silently accumulates in fp32
-  (``convert → reduce_sum → div → convert``), which is why the sum is spelled
-  ``jnp.sum(..., dtype=float16) * (1/d)``.
+* **RMSNorm runs in fp16** (``_rmsnorm``), because the ANE has no fp32: fp32
+  norm statistics used to pin ~70% of the graph's ops to the CPU.  The JAX
+  function computes the statistics in fp32 — the exact definition — and the
+  export turns every norm into one fp16 ``l2_norm`` + ``mul``
+  (``stablehlo_coreml``'s ``fuse_rmsnorm``, then ``mil_passes.fp16_l2_norm``).
+  A plain fp16 sum of squares would overflow (activations reach ``|x| ~ 1800``,
+  ``sum x^2 ~ 7e6``); ``l2_norm`` is range-safe on CPU, GPU and ANE, measured —
+  see that pass for the numbers and the ANE's one deviation (it ignores eps,
+  which only matters for rows no real activation comes near).  ``l2_norm``
+  reduces over the last three axes, so a norm's rows are viewed as
+  ``(rows, 1, 1, d)``; decode lays q out as ``(H, 1, 1, hd)`` so that costs it
+  no reshape.
 * **RoPE angles** (``model._apply_rope``): positions run to 65535, which fp16
   cannot represent exactly; the sinusoid argument, ``sin`` and ``cos`` are
   computed in fp32 and cast to fp16 before the rotation itself.
@@ -224,21 +226,26 @@ def _gelu_exact(x):
     return x * 0.5 * (1.0 + jax.scipy.special.erf(x * _INV_SQRT2))
 
 
-def _rmsnorm_noscale(x):
-    """fp16 RMSNorm without a learned scale — see the module docstring."""
-    x = x.astype(jnp.float16)
-    m = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-    xs = x / jnp.maximum(m, jnp.float16(1e-4))
-    # jnp.mean on fp16 silently accumulates in fp32 (convert → reduce_sum →
-    # div → convert); sum in fp16 instead, which the max|x| prescale keeps
-    # below the axis width.
-    var = jnp.sum(jnp.square(xs), axis=-1, keepdims=True, dtype=jnp.float16) \
-        * jnp.float16(1.0 / x.shape[-1])
-    return xs * jax.lax.rsqrt(var + jnp.float16(1e-5))
+_RMSNORM_EPS = 1e-6
 
 
-def _rmsnorm(x, scale):
-    return _rmsnorm_noscale(x) * scale.astype(jnp.float16)
+def _rmsnorm(x, scale=None):
+    """RMSNorm over the last axis, fp16 in and out — see the module docstring.
+
+    Written with fp32 statistics, the exact definition; what the export runs is
+    an fp16 ``l2_norm`` (``mil_passes.fp16_l2_norm``).  The row is viewed as
+    ``(rows, 1, 1, d)`` because that is the only shape ``fuse_rmsnorm`` turns
+    into ``l2_norm``: the op reduces over the last three axes.  Call sites that
+    already have that shape (the decode ones) cost no reshape.
+    """
+    shape = x.shape
+    d = shape[-1]
+    canonical = x.ndim >= 3 and shape[-2] == 1 and shape[-3] == 1
+    x32 = (x if canonical else x.reshape(-1, 1, 1, d)).astype(jnp.float32)
+    y = x32 * jax.lax.rsqrt(jnp.mean(x32 * x32, axis=-1, keepdims=True) + _RMSNORM_EPS)
+    if scale is not None:
+        y = y * scale.astype(jnp.float32)
+    return y.astype(jnp.float16).reshape(shape)
 
 
 def _ple_from_rows(params, token_embed, ple_rows, cfg: Gemma4Config):
@@ -257,12 +264,9 @@ def _ple_from_rows(params, token_embed, ple_rows, cfg: Gemma4Config):
     W_proj = params['per_layer_model_projection']['kernel']  # (D, NL*d)
     ple_proj = jnp.dot(token_embed, W_proj) * (cfg.embed_dim ** -0.5)  # (B, L, NL*d)
 
-    # 3D RMSNorm trick (avoids CoreML 4D batch_norm fusion bug)
-    NL = B * cfg.num_layers
     scale = params['per_layer_projection_norm']['scale']   # (d,)
-    ple_proj_3d = ple_proj.reshape(NL, L, d)
-    ple_proj_3d = _rmsnorm(ple_proj_3d, scale)
-    ple_proj = ple_proj_3d.reshape(B, L, cfg.num_layers * d)
+    ple_proj = _rmsnorm(ple_proj.reshape(B, L, cfg.num_layers, d), scale)
+    ple_proj = ple_proj.reshape(B, L, cfg.num_layers * d)
 
     return (ple_proj + ple_embed) * (2.0 ** -0.5)
 
@@ -317,7 +321,9 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
 
     pos_arr = position[jnp.newaxis, jnp.newaxis]  # (1, 1) for RoPE
 
-    q = jnp.dot(x[0, 0], sa['q_proj']['kernel']).reshape(1, 1, num_heads, hd)
+    # (H, 1, 1, hd): each head a row of the shape the fused norm wants (see
+    # ``_rmsnorm``); RoPE broadcasts over the leading axis all the same.
+    q = jnp.dot(x[0, 0], sa['q_proj']['kernel']).reshape(num_heads, 1, 1, hd)
     q = _rmsnorm(q, sa['q_norm']['scale'])
     q = _apply_rope(q, pos_arr, base_freq, rope_frac)
 
@@ -330,7 +336,7 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
         k_new = jnp.dot(x[0, 0], sa['k_proj']['kernel']).reshape(1, 1, num_kv_heads, hd)
         v_new = jnp.dot(x[0, 0], sa['v_proj']['kernel']).reshape(1, 1, num_kv_heads, hd)
         k_new = _rmsnorm(k_new, sa['k_norm']['scale'])
-        v_new = _rmsnorm_noscale(v_new)
+        v_new = _rmsnorm(v_new)
         k_new = _apply_rope(k_new, pos_arr, base_freq, rope_frac)
 
         # k_new/v_new are already fp16 — the norms and `_apply_rope` are both
@@ -364,8 +370,7 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
     # matmul needs no broadcast at all.
     kv_rep = num_heads // num_kv_heads
 
-    qg = jnp.transpose(q, (0, 2, 1, 3))                    # (1, H, 1, hd)
-    qg = qg.reshape(1, num_kv_heads, kv_rep, hd)           # (1, G, R, hd)
+    qg = q.reshape(1, num_kv_heads, kv_rep, hd)            # (1, G, R, hd)
     kt = jnp.transpose(k_full, (0, 2, 1, 3))               # (1, G, max_len, hd)
     vt = jnp.transpose(v_full, (0, 2, 1, 3))
 
@@ -468,7 +473,7 @@ def decode_step(
         x = residual + ffn_out
 
         # PLE gate
-        x = _ple_gate(lp, x[0, 0], ple_slice[0, 0])[None, None, :]
+        x = _ple_gate(lp, x, ple_slice)
 
         x = x * lp['layer_scalar']
 
@@ -527,7 +532,7 @@ def _attn_chunk(lp, x, positions, cfg: Gemma4Config, attn_type: str,
 
     q = _rmsnorm(q, sa['q_norm']['scale'])
     k_new = _rmsnorm(k_new, sa['k_norm']['scale'])
-    v_new = _rmsnorm_noscale(v_new)
+    v_new = _rmsnorm(v_new)
 
     q = _apply_rope(q, positions, base_freq, rope_frac)
     k_new = _apply_rope(k_new, positions, base_freq, rope_frac)
