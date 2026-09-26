@@ -32,6 +32,11 @@ unless the model type is ML Program" error.  The sliding caches never had the
 problem: the converter already writes them where they are produced and reads
 the attention's keys and values back from the write.  This pass does the same.
 
+It is not free on the GPU: with the full model, decode steps of the 1024 and
+2048 functions are ~2% slower than with the writes at the end of the block
+(MPSGraph; measured with interleaved predict loops, macOS 27, M4 Pro), while
+the 512 one is unaffected.
+
 ``sliding_pos_ring`` keeps its ordinary int32 I/O: Core ML states must be
 floating point.  That falls out of the fp16 filter below rather than being
 special-cased by name.
