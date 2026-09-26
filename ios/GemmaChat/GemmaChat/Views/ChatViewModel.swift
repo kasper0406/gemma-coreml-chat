@@ -102,7 +102,7 @@ final class ChatViewModel {
             tokenizer = tok
 
             guard let modelURL = Bundle.main.url(forResource: "gemma4-e2b", withExtension: "mlpackage") else {
-                throw CoreMLModelError.modelNotFound
+                throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: "gemma4-e2b.mlpackage"])
             }
 
             #if targetEnvironment(simulator)
