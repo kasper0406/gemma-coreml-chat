@@ -86,9 +86,10 @@ def _concretize_cache_lengths(prog, function_name_to_length: dict[str, int]) -> 
     **Why the attention fusion is deliberately NOT re-run here.**  Concrete
     shapes would let ``common::fuse_attention_to_sdpa`` finally collect the
     *global* attention sites it had to skip during export (it bails on symbolic
-    dimensions; the *sliding* sites were always concrete, are fused at convert
-    time, and stay fused — they are not affected by either defect below).
-    Fusing the global sites trips two Apple bugs, both on macOS 26.5:
+    dimensions).  It is no longer in the export pipeline at all — the ANE
+    ignores SDPA's ``attn_mask``, see ``mil_passes.ct_convert_pipeline`` — but
+    even before that, fusing the global sites tripped two Apple bugs, both on
+    macOS 26.5:
 
     1. **ANE partitioner.** Once a function holds two or more global SDPAs,
        ANECCompile() fails on the segment containing the *deepest* one with
@@ -107,9 +108,7 @@ def _concretize_cache_lengths(prog, function_name_to_length: dict[str, int]) -> 
        on the query is part of the trigger.
 
     Leaving the global sites as the ``matmul → add(mask) → softmax → matmul``
-    they already are avoids both.  When Apple fixes either defect, re-running
-    ``common::fuse_attention_to_sdpa`` here (plus DCE) is all it takes to get
-    the fused form back — benchmark it against the decomposed form first.
+    they already are avoids both, and the ANE mask defect as well.
     """
     from coremltools.converters.mil.mil.passes.pass_pipeline import (
         PassPipelineManager as _PassPipelineManager,

@@ -12,8 +12,8 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
     The base is ``stablehlo_coreml.build_pass_pipeline()``, which inserts its
     own cleanup, fusion and late-fusion groups into ``ct.PassPipeline.DEFAULT``
     — see that function for what those groups contain. On top of it this adds
-    the two passes owned by this repository and drops the three coremltools
-    passes the exported model cannot use.
+    the two passes owned by this repository and drops the passes the exported
+    model cannot use.
     """
     import gemma_chat.mil_passes.quantize_const_weights  # noqa: F401
     import gemma_chat.mil_passes.collapse_cast_chains  # noqa: F401
@@ -45,5 +45,16 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
         # Both of these produce incorrect fusions for this model.
         "common::fuse_layernorm_or_instancenorm",
         "common::fuse_elementwise_to_batchnorm",
+        # The Neural Engine ignores ``scaled_dot_product_attention``'s
+        # ``attn_mask`` (macOS 27, M4 Pro): in the chunk-prefill graph every
+        # query attended to all cache slots, empty and future ones included,
+        # and ``cpu-and-ne`` / ``all`` produced garbage — additive and boolean
+        # masks alike, while the same op on CPU/GPU was correct.  Attention
+        # therefore stays ``matmul -> select -> softmax -> matmul``, which the
+        # ANE runs correctly.  It costs nothing: prefill time is unchanged on
+        # the GPU and the ANE and ~25% lower on the CPU.  (Decode attention
+        # never matched the fusion, and the global sites are kept decomposed
+        # for two more Apple defects — see ``materialize._concretize_cache_lengths``.)
+        "common::fuse_attention_to_sdpa",
     ])
     return pipeline

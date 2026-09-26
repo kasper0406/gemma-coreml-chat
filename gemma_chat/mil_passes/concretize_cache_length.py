@@ -30,7 +30,7 @@ For each named function it is given a length for:
    ``constexpr_*`` weights and decompress them.
 
 Concrete shapes would also let ``fuse_attention_to_sdpa`` finally fuse those
-global sites, but that fusion is deliberately not re-run — it trips two Apple
+global sites, but that fusion is deliberately not re-run — it trips Apple
 defects; see ``materialize._concretize_cache_lengths``.
 
 The value-inference size cap

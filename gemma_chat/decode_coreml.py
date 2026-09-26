@@ -95,9 +95,8 @@ dispatch-bound: any op that returns fp32 drags its consumers up with it.  A
 single fp32 leak in ``_apply_rope`` used to promote q, and through it SDPA, the
 attention output and o_proj — which forced the 35 o_proj weights to be
 re-materialized as fp32 constants at runtime (528 MB) and put ~1 GB of fp32
-attention intermediates in every step.  Long-axis sums inside `matmul` and the
-fused ``scaled_dot_product_attention`` are left to the backend, which
-accumulates them in fp32.
+attention intermediates in every step.  Long-axis sums inside `matmul` and
+``softmax`` are left to the backend, which accumulates them in fp32.
 """
 
 from __future__ import annotations

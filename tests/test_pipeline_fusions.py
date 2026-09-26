@@ -144,53 +144,39 @@ def _attn_args(C, hd, kv_rep=2, H=8, S=128):
 
 # ── attention fusion ─────────────────────────────────────────────────────
 
-def test_chunk_attention_fuses_to_sdpa():
+def _assert_attention_decomposed(prog):
+    """``matmul -> select(mask) -> softmax -> matmul``, never SDPA.
+
+    The Neural Engine ignores ``scaled_dot_product_attention``'s ``attn_mask``,
+    so the pipeline drops ``fuse_attention_to_sdpa`` — see
+    ``ct_convert_pipeline``.  The decomposed softmax still collapses to one op.
+    """
+    assert _count(prog, "scaled_dot_product_attention") == 0
+    assert _count(prog, "softmax") == 1
+    assert _count(prog, "matmul") == 2
+    assert _count(prog, "select") == 1
+    _assert_softmax_not_decomposed(prog)
+
+
+def test_chunk_attention_stays_decomposed():
     q, k, v = _attn_args(C=16, hd=256)
     mask = jnp.ones((16, 128), jnp.bool_)
     _, prog = _convert(chunk_attention, q, k, v, mask)
-
-    assert _count(prog, "scaled_dot_product_attention") == 1
-    assert _count(prog, "softmax") == 0
-    assert _count(prog, "matmul") == 0
-    assert _count(prog, "select") == 0
-    _assert_softmax_not_decomposed(prog)
+    _assert_attention_decomposed(prog)
 
 
-def test_global_attention_fuses_to_sdpa():
-    """Global layers use head_dim=512; SDPA pre-scales the query by sqrt(512)."""
+def test_global_chunk_attention_stays_decomposed():
     q, k, v = _attn_args(C=16, hd=512)
     mask = jnp.ones((16, 128), jnp.bool_)
     _, prog = _convert(chunk_attention, q, k, v, mask)
-
-    assert _count(prog, "scaled_dot_product_attention") == 1
-    assert _count(prog, "softmax") == 0
-    scales = [float(op.inputs["y"].val) for op in _ops(prog)
-              if op.op_type == "mul" and op.inputs["y"].val is not None
-              and np.asarray(op.inputs["y"].val).size == 1]
-    assert any(abs(s - np.sqrt(512.0)) < 0.1 for s in scales), scales
+    _assert_attention_decomposed(prog)
 
 
-def test_decode_attention_fuses_to_sdpa():
-    """Decode is the hot path: query length 1 must fuse as completely as prefill.
-
-    stablehlo-coreml 0.1.5 taught ``fuse_attention_to_sdpa`` to handle a unit
-    query axis, so the whole block collapses and the mask rides along as SDPA's
-    ``attn_mask`` rather than surviving as a ``select``.
-    """
+def test_decode_attention_stays_decomposed():
     q, k, v = _attn_args(C=1, hd=256)
     valid = jnp.ones((128,), jnp.bool_)
     _, prog = _convert(decode_attention, q, k, v, valid)
-
-    assert _count(prog, "scaled_dot_product_attention") == 1
-    assert _count(prog, "softmax") == 0
-    assert _count(prog, "matmul") == 0
-    assert _count(prog, "select") == 0
-    # Only the two GQA repeat tiles (k and v) are left; the mask tile is gone.
-    assert _count(prog, "tile") == 2
-    _assert_softmax_not_decomposed(prog)
-
-    sdpa = next(op for op in _ops(prog) if op.op_type == "scaled_dot_product_attention")
-    assert sdpa.inputs.get("attn_mask") is not None, "the mask was dropped, not absorbed"
+    _assert_attention_decomposed(prog)
 
 
 def test_standalone_softmax_stays_a_softmax():
@@ -346,7 +332,7 @@ def test_numerical_chunk_attention():
         jnp.ones_like(q), jnp.ones_like(k), jnp.ones_like(v), jnp.ones((C, S), jnp.bool_),
         load=True,
     )
-    assert _count(prog, "scaled_dot_product_attention") == 1
+    _assert_attention_decomposed(prog)
     out = _predict(model, q, k, v, mask.astype(np.float32))
 
     assert np.max(np.abs(ref - out)) < 1e-3
@@ -366,7 +352,7 @@ def test_numerical_decode_attention():
         jnp.ones_like(q), jnp.ones_like(k), jnp.ones_like(v), jnp.ones((S,), jnp.bool_),
         load=True,
     )
-    assert _count(prog, "scaled_dot_product_attention") == 1
+    _assert_attention_decomposed(prog)
     out = _predict(model, q, k, v, valid.astype(np.float32))
 
     assert np.max(np.abs(ref - out)) < 1e-3
