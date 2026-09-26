@@ -173,3 +173,82 @@ def test_cache_contents_persist_across_predictions(statified_model):
         {"pos": np.array([4], dtype=np.int32)}, state=state,
     )
     assert result["entry"][0] == pytest.approx(running)
+
+
+# ── The write is consumed, never a sink ─────────────────────────────────────
+
+
+def _build_reading_program():
+    """Like :func:`_build_program`, but the updated cache is also *read* after
+    the update — as the attention reads the cache it has just written."""
+
+    @mb.program(
+        input_specs=[
+            mb.TensorSpec((1,), dtype=types.int32),
+            mb.TensorSpec((1, LEN, 1, HEAD_DIM), dtype=types.fp16),
+        ],
+        opset_version=ct.target.iOS18,
+    )
+    def prog(pos, cache):
+        value = mb.cast(x=mb.add(x=pos, y=np.int32(1)), dtype="fp16")
+        value = mb.tile(
+            x=mb.reshape(x=value, shape=[1, 1, 1, 1]), reps=[1, 1, 1, HEAD_DIM],
+        )
+        begin = mb.concat(
+            values=[np.int32([0]), pos, np.int32([0]), np.int32([0])], axis=0,
+        )
+        end = mb.add(x=begin, y=np.int32([1, 1, 1, HEAD_DIM]))
+        cache_out = mb.slice_update(
+            x=cache, update=value, begin=begin, end=end, name="cache_out",
+        )
+        after = mb.reduce_sum(
+            x=mb.cast(x=cache_out, dtype="fp32"), axes=[0, 1, 2, 3], keep_dims=True,
+        )
+        after = mb.reshape(x=after, shape=[1], name="after")
+        return after, cache_out
+
+    return prog
+
+
+@pytest.fixture(scope="module")
+def reading_program():
+    prog = _build_reading_program()
+    global_kv_caches_to_states().apply(prog)
+    return prog
+
+
+def test_the_write_follows_its_value_and_feeds_the_later_readers(reading_program):
+    """A ``coreml_update_state`` nothing reads makes ANECompiler throw once it
+    lands in an ANE segment; the pass must write where the value is produced
+    and hand the write's result to everything after it."""
+    func = reading_program.functions["main"]
+    ops = [op for op in func.operations if op.op_type != "const"]
+    update = next(op for op in ops if op.op_type == "coreml_update_state")
+    value_op = next(op for op in ops if op.name == "cache_out")
+
+    i = ops.index(value_op)
+    assert [op.op_type for op in ops[i + 1:i + 4]] == ["fill_like", "add", "coreml_update_state"]
+    assert ops[i + 3] is update
+
+    written = update.outputs[0]
+    assert written.child_ops, "the write is a sink"
+    # Nothing after the write reads the unwritten value any more.
+    assert [op for op in value_op.outputs[0].child_ops if op is not update.value.op] == []
+    # The output kept its name; only the state write feeds it.
+    assert [var.name for var in func.outputs] == ["after"]
+
+
+def test_the_later_readers_see_the_written_cache(reading_program):
+    model = ct.convert(
+        reading_program,
+        source="milinternal",
+        minimum_deployment_target=ct.target.iOS18,
+        compute_precision=ct.precision.FLOAT32,
+        compute_units=ct.ComputeUnit.CPU_AND_GPU,
+    )
+    state = model.make_state()
+    running = 0.0
+    for pos in range(4):
+        running += HEAD_DIM * (pos + 1)
+        result = model.predict({"pos": np.array([pos], dtype=np.int32)}, state=state)
+        assert result["after"][0] == pytest.approx(running), f"at pos {pos}"

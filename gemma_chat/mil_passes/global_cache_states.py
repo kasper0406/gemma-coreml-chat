@@ -18,8 +18,19 @@ converts the leftover cache I/O into state:
   used to read the input — it is the first op in the block, so it dominates
   every use;
 * the value that used to leave the function as ``k_4_out`` is written back with
-  ``coreml_update_state`` at the end of the block, and ``k_4_out`` is dropped
-  from the function outputs.
+  ``coreml_update_state`` right where it is produced, every later reader of it
+  reads the write's result instead, and ``k_4_out`` is dropped from the
+  function outputs.
+
+Why the write is not a sink
+---------------------------
+Appending the writes at the end of the block, where nothing reads their
+result, looks simpler — and on macOS 27 makes ANECompiler throw ("Exception
+thrown: <private>") whenever such a "sink" write lands in an ANE segment, which
+fails the whole model load with the misleading "``functionName`` must be nil
+unless the model type is ML Program" error.  The sliding caches never had the
+problem: the converter already writes them where they are produced and reads
+the attention's keys and values back from the write.  This pass does the same.
 
 ``sliding_pos_ring`` keeps its ordinary int32 I/O: Core ML states must be
 floating point.  That falls out of the fp16 filter below rather than being
@@ -108,6 +119,11 @@ def _statify_function(func: Function, pairs: list[tuple[str, Var]]) -> None:
             "outputs, which Core ML rejects"
         )
 
+    # Drop the cache outputs before rerouting their readers below: rerouting a
+    # block output renames the write's result to ``k_4_out``, and Core ML
+    # rejects the program ("Block redefines I/O name").
+    func.set_outputs(remaining_outputs)
+
     for in_name, out_var in pairs:
         old_var = func.inputs[in_name]
 
@@ -128,17 +144,24 @@ def _statify_function(func: Function, pairs: list[tuple[str, Var]]) -> None:
             anchor_op=None, old_var=old_var, new_var=read_var,
         )
 
-        # 3. Write the fully-updated cache back at the end of the block.  The
-        #    zero add is load-bearing — see the module docstring.
+        # 3. Write the fully-updated cache back right after it is produced,
+        #    and make every later reader consume the write's result, so the
+        #    write is never a sink (see the module docstring).  The zero add is
+        #    load-bearing — see the module docstring too.
+        ops = list(func.operations)
+        producer = ops.index(out_var.op)
+        after = ops[producer + 1] if producer + 1 < len(ops) else None
         zeros = mb.fill_like(
-            ref_tensor=read_var, value=np.float16(0), name=f"{in_name}_state_zeros",
+            ref_tensor=read_var, value=np.float16(0),
+            name=f"{in_name}_state_zeros", before_op=after,
         )
-        value = mb.add(x=zeros, y=out_var, name=f"{in_name}_state_value")
-        mb.coreml_update_state(
-            state=state_var, value=value, name=f"{in_name}_update_state",
+        value = mb.add(x=zeros, y=out_var, name=f"{in_name}_state_value", before_op=after)
+        written = mb.coreml_update_state(
+            state=state_var, value=value, name=f"{in_name}_update_state", before_op=after,
         )
-
-    func.set_outputs(remaining_outputs)
+        func.replace_uses_of_var_after_op(
+            anchor_op=written.op, old_var=out_var, new_var=written,
+        )
 
 
 @register_pass(namespace="common")
