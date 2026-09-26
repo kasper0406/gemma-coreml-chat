@@ -25,7 +25,7 @@ import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types, get_new_symbol
 
-from gemma_chat.materialize import materialize_mlpackage
+from gemma_chat.materialize import SIDECAR_DIRS, materialize_mlpackage
 
 
 SIZES = [32, 64, 128]
@@ -182,6 +182,21 @@ def main():
 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_materialize_carries_the_sidecar_directories(tmp_path):
+    """The tokenizer and host embedding tables live next to the Core ML model
+    inside the package; standalone materialization must not drop them."""
+    dyn = _build_dynamic_mlpackage(tmp_path)
+    for name in SIDECAR_DIRS:
+        (dyn / name / "nested").mkdir(parents=True)
+        (dyn / name / "nested" / "blob.bin").write_bytes(name.encode())
+
+    out = tmp_path / "materialized.mlpackage"
+    materialize_mlpackage(dyn, out, SIZES[:1])
+
+    for name in SIDECAR_DIRS:
+        assert (out / name / "nested" / "blob.bin").read_bytes() == name.encode()
 
 
 if __name__ == "__main__":

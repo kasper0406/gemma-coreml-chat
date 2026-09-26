@@ -1139,6 +1139,9 @@ def main() -> None:
             if materialize_sizes:
                 tmp_combined = tmp_dir / "combined.mlpackage"
                 save_multifunction(desc, str(tmp_combined))
+                # Materialization carries these over into the output.
+                _embed_tokenizer(args.model_id, tmp_combined)
+                _embed_host_tables(_host_tables_dir(tmp_decode), tmp_combined)
 
                 # Materialize the combined multifunction. Loading it once into
                 # pymil and running materialize_symbolic_shape_program per
@@ -1160,12 +1163,11 @@ def main() -> None:
                 if output.exists():
                     shutil.rmtree(output)
                 save_multifunction(desc, str(output))
+                _embed_tokenizer(args.model_id, output)
+                _embed_host_tables(_host_tables_dir(tmp_decode), output)
 
                 final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
                 print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
-
-            _embed_tokenizer(args.model_id, output)
-            _embed_host_tables(_host_tables_dir(tmp_decode), output)
 
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr)

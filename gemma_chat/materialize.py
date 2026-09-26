@@ -43,7 +43,8 @@ uv run gemma-materialize --input gemma4-e2b.mlpackage --output gemma4-e2b-mat.ml
 ```
 
 Defaults to sizes [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
-matching the runtime doubling growth strategy.
+matching the runtime doubling growth strategy.  The input's ``Tokenizer/`` and
+``Embeddings/`` directories are copied into the output.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ from typing import Sequence
 import coremltools as ct
 
 import gemma_chat.weight_shards  # noqa: F401  — caps blob files below 2 GiB
+from gemma_chat import host_embeddings
 from gemma_chat.mil_passes.concretize_cache_length import concretize_cache_length
 from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
 from gemma_chat.mil_passes.transpose_matmul_weights import transpose_matmul_weights
@@ -484,6 +486,25 @@ def _materialize_multifunction_source(
     out.save(str(dest_path))
 
 
+# What the runtime reads from inside the package besides the Core ML model:
+# the tokenizer and the host embedding tables (``gemma_chat.host_embeddings``).
+# A Core ML save writes neither, so materialization carries them over.
+SIDECAR_DIRS = ("Tokenizer", host_embeddings.DIR_NAME)
+
+
+def _copy_sidecars(source_path: Path, dest_path: Path) -> None:
+    for name in SIDECAR_DIRS:
+        src = Path(source_path) / name
+        if not src.is_dir():
+            print(
+                f"  warning: {Path(source_path).name} has no {name}/, so neither "
+                "will the output; the runtime needs it",
+                flush=True,
+            )
+            continue
+        shutil.copytree(src, Path(dest_path) / name)
+
+
 def materialize_mlpackage(
     source_path: Path,
     dest_path: Path,
@@ -495,6 +516,9 @@ def materialize_mlpackage(
     ``main_{N}`` functions. For a named-function or multifunction source
     (e.g. prefill + decode), the output contains ``{fname}_{N}`` functions
     for each source function ``fname`` and each ``N`` in ``sizes``.
+
+    The source's :data:`SIDECAR_DIRS` are copied into the output, so a
+    runnable source gives a runnable output.
     """
     peek = ct.models.MLModel(str(source_path), skip_model_load=True)
     has_named_functions = len(peek._spec.description.functions) > 0
@@ -512,6 +536,7 @@ def materialize_mlpackage(
         _materialize_multifunction_source(
             source_path, dest_path, sizes, fn_names,
         )
+    _copy_sidecars(source_path, dest_path)
 
 
 def _parse_sizes(s: str) -> list[int]:
