@@ -18,6 +18,7 @@ import coremltools as ct
 from coremltools.converters.mil.mil import types as mil_types
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
+from gemma_chat.decode_coreml import _rmsnorm as rmsnorm
 from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
 from gemma_chat.model import _embed_lookup
 
@@ -117,13 +118,6 @@ def sliding_cache_write(cache, value, slot):
     return jnp.where(mask, value, cache)
 
 
-def rmsnorm(x, scale):
-    """``decode_coreml._rmsnorm``."""
-    x32 = x.astype(jnp.float32)
-    var = jnp.mean(jnp.square(x32), axis=-1, keepdims=True)
-    return (x32 * jax.lax.rsqrt(var + 1e-6) * scale.astype(jnp.float32)).astype(jnp.float16)
-
-
 def exact_gelu(x):
     """The FFN activation from ``decode_coreml._gelu_exact`` — fp16, erf spelling."""
     return x * 0.5 * (1.0 + jax.scipy.special.erf(x * float(1.0 / np.sqrt(2.0))))
@@ -136,7 +130,7 @@ def logit_softcap(x):
 
 
 def double_rmsnorm(x, scale_a, scale_b):
-    """Adjacent norms — the fp16→fp32 round-trip ``collapse_cast_chains`` targets."""
+    """Adjacent norms, as every sub-layer boundary of the real graph has them."""
     return rmsnorm(rmsnorm(x, scale_a), scale_b)
 
 
@@ -252,7 +246,8 @@ def _rmsnorm_const_scale(x):
 
 
 def test_rmsnorm_fuses_to_l2_norm():
-    """``fuse_rmsnorm`` — the eight-op chain becomes ``l2_norm`` + one ``mul``.
+    """``fuse_rmsnorm`` still matches the fp16 norm: its sum-of-squares tail
+    becomes ``l2_norm`` + one ``mul``, behind the ``max|x|`` prescale.
 
     ``(1, 1, D)`` needs no reshape: ``l2_norm`` normalizes over the last three
     dims, which for that shape is exactly the last one.
@@ -261,13 +256,13 @@ def test_rmsnorm_fuses_to_l2_norm():
     _, prog = _convert(_rmsnorm_const_scale, x)
 
     assert _count(prog, "l2_norm") == 1
-    for op_type in ("reduce_mean", "reduce_sum", "rsqrt", "reshape"):
+    for op_type in ("reduce_mean", "reduce_sum", "rsqrt", "reshape", "cast"):
         assert _count(prog, op_type) == 0, f"unfused RMSNorm leftover: {op_type}"
-    # eps' = d * eps, so that l2_norm's sum-of-squares matches mean + 1e-6.
+    # eps' = d * eps, so that l2_norm's sum-of-squares matches mean + 1e-5.
     l2 = next(op for op in _ops(prog) if op.op_type == "l2_norm")
-    assert abs(float(l2.inputs["epsilon"].val) - 256 * 1e-6) < 1e-9
-    # cast(fp32) -> l2_norm -> mul(sqrt(d)*scale) -> cast(fp16), nothing else.
-    assert sum(1 for op in _ops(prog) if op.op_type != "const") == 4
+    assert abs(float(l2.inputs["epsilon"].val) - 256 * 1e-5) < 1e-5
+    # abs -> reduce_max -> maximum -> real_div -> l2_norm -> mul(sqrt(d)*scale).
+    assert sum(1 for op in _ops(prog) if op.op_type != "const") == 6
 
 
 def test_rmsnorm_off_canonical_shape_is_left_alone():
@@ -295,14 +290,45 @@ def test_exact_gelu_fuses_to_one_fp16_op():
     assert gelu.outputs[0].dtype == mil_types.fp16
 
 
-def test_adjacent_rmsnorms_have_no_cast_roundtrip():
-    """``collapse_cast_chains`` — coremltools keeps lossy downcast→upcast pairs."""
-    x = jnp.ones((1, 1, 256), jnp.float16)
-    scale = jnp.ones((256,), jnp.float16)
-    _, prog = _convert(double_rmsnorm, x, scale, scale)
+def test_rmsnorm_is_fp16_end_to_end():
+    """The ANE has no fp32: a norm that upcasts anywhere pins its ops to the CPU.
 
-    assert _count(prog, "l2_norm") == 2
-    assert _cast_roundtrips(prog) == 0
+    Covers every norm shape the model has — the fused ``(1, 1, D)`` decode
+    norms, the unfused chunk and per-head ones — and two norms back to back.
+    """
+    scale = jnp.ones((256,), jnp.float16)
+    progs = [_convert(_rmsnorm_const_scale, jnp.ones(shape, jnp.float16))[1]
+             for shape in ((1, 1, 1536), (1, 128, 256), (1, 4, 8, 256))]
+    progs.append(_convert(double_rmsnorm, jnp.ones((1, 1, 256), jnp.float16),
+                          scale, scale)[1])
+    for prog in progs:
+        assert _count(prog, "cast") == 0
+        for op in _ops(prog):
+            for out in op.outputs:
+                if not mil_types.is_float(out.dtype):
+                    continue  # int32 axes constants
+                assert out.dtype == mil_types.fp16, (
+                    f"{op.op_type} produces {mil_types.builtin_to_string(out.dtype)}"
+                )
+
+
+def test_fp16_rmsnorm_matches_fp32_statistics():
+    """The max|x| prescale keeps the fp16 sum of squares finite and accurate.
+
+    Activations of this size square to ~1e5 each, so a plain fp16 sum of
+    squares would overflow to inf.
+    """
+    rng = np.random.RandomState(11)
+    x = (rng.randn(4, 1536) * 300.0).astype(np.float16)
+    x[0, 7] = 6.0e4  # one huge outlier, as residual streams have
+    scale = (1.0 + rng.randn(1536) * 0.1).astype(np.float16)
+
+    x32 = x.astype(np.float32)
+    ref = x32 / np.sqrt(np.mean(x32 ** 2, axis=-1, keepdims=True) + 1e-6) * scale
+    out = np.asarray(rmsnorm(jnp.asarray(x), jnp.asarray(scale)), np.float32)
+
+    assert np.all(np.isfinite(out))
+    np.testing.assert_allclose(out, ref, atol=2e-2, rtol=1e-2)
 
 
 # ── numerical parity ─────────────────────────────────────────────────────

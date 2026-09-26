@@ -49,14 +49,19 @@ Tokens: right-padded — real tokens at positions 0..T-1, zeros at T..L-1.
 Numeric precision
 -----------------
 Every *stored* activation is fp16 — the residual stream, the attention
-inputs/outputs, the KV caches, the MLP activations.  fp32 is used only where an
-accumulation or a range genuinely needs it, mirroring how the HF and JAX Gemma
-references run bf16 storage with fp32 norms:
+inputs/outputs, the KV caches, the MLP activations.  fp32 is used only where a
+range genuinely needs it:
 
-* **RMSNorm statistics** (``_rmsnorm``, ``_rmsnorm_noscale``): the square, the
-  mean over the 1536/256-wide axis and the rsqrt run in fp32 — the sum of
-  squares reaches ~1e7 and would overflow fp16, and eps=1e-6 underflows to 0 in
-  fp16.  The normalized result is cast straight back to fp16.
+* **RMSNorm runs in fp16** (``_rmsnorm``, ``_rmsnorm_noscale``), because the
+  ANE has no fp32: fp32 norm statistics used to pin ~70% of the graph's ops to
+  the CPU.  Done naively in fp16 the sum of squares reaches ~1e7 and overflows.
+  RMSNorm is scale-invariant, so the input is first divided by its ``max|x|``:
+  every square is then at most 1 and the sum at most the axis width (≤ 1536),
+  and the eps becomes 1e-5 on the rescaled mean.  Measured against the fp32
+  statistics, KL 0.001 — below the backends' own disagreement.  Beware
+  ``jnp.mean`` here: on fp16 it silently accumulates in fp32
+  (``convert → reduce_sum → div → convert``), which is why the sum is spelled
+  ``jnp.sum(..., dtype=float16) * (1/d)``.
 * **RoPE angles** (``model._apply_rope``): positions run to 65535, which fp16
   cannot represent exactly; the sinusoid argument, ``sin`` and ``cos`` are
   computed in fp32 and cast to fp16 before the rotation itself.
@@ -201,16 +206,21 @@ def _gelu_exact(x):
     return x * 0.5 * (1.0 + jax.scipy.special.erf(x * _INV_SQRT2))
 
 
-def _rmsnorm(x, scale):
-    x32 = x.astype(jnp.float32)
-    var = jnp.mean(jnp.square(x32), axis=-1, keepdims=True)
-    return (x32 * jax.lax.rsqrt(var + 1e-6) * scale.astype(jnp.float32)).astype(jnp.float16)
-
-
 def _rmsnorm_noscale(x):
-    x32 = x.astype(jnp.float32)
-    var = jnp.mean(jnp.square(x32), axis=-1, keepdims=True)
-    return (x32 * jax.lax.rsqrt(var + 1e-6)).astype(jnp.float16)
+    """fp16 RMSNorm without a learned scale — see the module docstring."""
+    x = x.astype(jnp.float16)
+    m = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+    xs = x / jnp.maximum(m, jnp.float16(1e-4))
+    # jnp.mean on fp16 silently accumulates in fp32 (convert → reduce_sum →
+    # div → convert); sum in fp16 instead, which the max|x| prescale keeps
+    # below the axis width.
+    var = jnp.sum(jnp.square(xs), axis=-1, keepdims=True, dtype=jnp.float16) \
+        * jnp.float16(1.0 / x.shape[-1])
+    return xs * jax.lax.rsqrt(var + jnp.float16(1e-5))
+
+
+def _rmsnorm(x, scale):
+    return _rmsnorm_noscale(x) * scale.astype(jnp.float16)
 
 
 def _ple_for_tokens(params, token_ids, cfg: Gemma4Config):
