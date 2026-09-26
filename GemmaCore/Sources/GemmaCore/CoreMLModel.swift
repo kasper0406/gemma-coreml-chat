@@ -55,7 +55,7 @@ public final class CoreMLModel: @unchecked Sendable {
     /// The tables the embedding-row inputs are looked up in.
     private let embeddings: HostEmbeddings
 
-    /// Tokens per prefill call, read from the prefill function's token input.
+    /// Tokens per prefill call, read from the prefill function's `token_embed`.
     ///
     /// A decode-only artifact has no prefill function and prefills by looping
     /// `decode`, so its chunk is 1: any larger value would only pad the prompt
@@ -700,9 +700,10 @@ public final class CoreMLModel: @unchecked Sendable {
             try await group.waitForAll()
         }
 
-        // Serial, deliberately: a specialization transiently allocates tens of
-        // GB (MPSGraph materializes the dequantized embedding tables), so two
-        // at once exhausts memory on machines that comfortably run one.
+        // Serial, deliberately: a specialization is a large transient
+        // allocation (tens of GB while the graph still dequantized its
+        // embedding tables here), so two at once risks exhausting memory on
+        // machines that comfortably run one.
         try specialize(name: decodeName, size: size)
         if !isDecodeOnly {
             try specialize(name: prefillName, size: size)
@@ -718,9 +719,10 @@ public final class CoreMLModel: @unchecked Sendable {
     /// graph still gathered from its block-32 int4 embedding tables, that first
     /// call cost ~17 s of single-threaded MLIR work constant-folding them
     /// (`LowerDequantizeND` → `foldCastAttribute`, one LLVM `APFloat` per weight
-    /// element), with a ~27 GB transient peak; the lookups are on the host now,
-    /// but the first prediction is still the expensive one. Nothing caches it:
-    /// it is redone in every process, for every materialized function.
+    /// element), with a ~27 GB transient peak. With the lookups on the host it
+    /// is down to ~5 s for `decode_512` (M4 Pro), still far more than a token.
+    /// Nothing caches it: it is redone in every process, for every
+    /// materialized function.
     ///
     /// So pay it here — at load, or at the moment a conversation grows into a
     /// new size — instead of inside the first token the user is waiting on.

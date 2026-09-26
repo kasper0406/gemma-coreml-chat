@@ -13,8 +13,7 @@
 /// - then `fp16(value × multiplier)` — `fp16(√embed_dim)` for `token_embed`,
 ///   1 for `ple_rows`.
 ///
-/// Only the rows actually looked up are ever paged in, so the ~1.5 GB of
-/// tables cost address space, not memory.
+/// The tables are memory-mapped, so they cost page cache, not resident memory.
 
 import CoreML
 import Foundation
@@ -50,6 +49,15 @@ struct EmbeddingTable {
             throw HostEmbeddingsError.malformed(
                 "\(name): \(data.count) data bytes / \(scales.count) scale bytes do not match [\(rows), \(cols)]"
             )
+        }
+        // Start paging the tables in now, behind the model load. A row read
+        // from a cold page costs a page fault — ~0.3 ms per token when a
+        // prompt's rows all miss — where the old in-graph tables were read in
+        // whole at load. Advisory and asynchronous; a failure costs nothing.
+        for mapped in [data, scales] {
+            mapped.withUnsafeBytes { raw in
+                _ = madvise(UnsafeMutableRawPointer(mutating: raw.baseAddress), raw.count, MADV_WILLNEED)
+            }
         }
     }
 
