@@ -136,7 +136,7 @@ benchmarks/     Standalone Swift benchmark for model loading / first prediction
 - **`this model predates stateful KV caches`** — the `.mlpackage` was exported before the sliding KV caches became CoreML state. Re-run `uv run gemma-export`.
 - **`this model predates host-side embedding lookups`** / **`has no Embeddings/ directory`** — the `.mlpackage` takes token ids, or lacks the embedding tables the runtime now reads. Re-run `uv run gemma-export`. When loading a `.mlmodelc` directly, copy the package's `Embeddings/` directory into it.
 - **Slow first load with `--compute-units all`** — ANE compilation can take 10–30 minutes, but is cached in `.mlmodelc` for subsequent runs.
-- **`cpu-and-ne` runs entirely on the CPU (0 mW ANE), then segfaults in prefill** — known and unfixed for the full 35-layer model; see the export section. `--compute-units cpu-only` fails the same way, so the segfault is BNNS executing this graph, not the ANE partitioning. Use `cpu-and-gpu`.
+- **`cpu-and-ne` / `all` give incoherent replies** — known and unfixed for the full 35-layer model (macOS 27): the fp16 norms and host-side embeddings make the `prefill_<N>` functions ANE-eligible, and the Neural Engine runs them (~4 W ANE) with wrong results, while `decode_<N>` stays on the CPU and is correct. `cpu-only` and `cpu-and-gpu` are correct. Use `cpu-and-gpu`.
 
 ## License
 
