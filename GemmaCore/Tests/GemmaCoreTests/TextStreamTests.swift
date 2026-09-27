@@ -10,8 +10,8 @@ import XCTest
 final class TextStreamTests: XCTestCase {
     // MARK: - A tokenizer with swift-transformers' decode semantics
 
-    /// Gemma's decoder (`Replace("▁", " ")`, `ByteFallback`, `Fuse`), over a
-    /// small vocabulary. `specials`
+    /// Gemma's decoder (`Replace("▁", " ")`, `ByteFallback`, `Fuse`) followed
+    /// by `PreTrainedTokenizer.cleanUp`, over a small vocabulary. `specials`
     /// are dropped, as `decode(skipSpecialTokens: true)` drops them.
     /// `flushesTrailingBytes: false` is swift-transformers' own ByteFallback
     /// (0.1.24), which loses byte tokens at the very end of a decode; `true` is
@@ -43,6 +43,9 @@ final class TextStreamTests: XCTestCase {
                 text += Self.vocabulary[id].replacingOccurrences(of: "▁", with: " ")
             }
             if flushesTrailingBytes, !bytes.isEmpty { text += String(decoding: bytes, as: UTF8.self) }
+            for (pattern, replacement) in TextStream.cleanupRules {
+                text = text.replacingOccurrences(of: pattern, with: replacement)
+            }
             return text
         }
 
@@ -86,6 +89,30 @@ final class TextStreamTests: XCTestCase {
         XCTAssertEqual(pieces, ["Hello", "\u{FFFD}", ""])
     }
 
+    func testCleanupIsHeldUntilTheNextTokenSettlesIt() {
+        // "Hello", " ", ".", "X" decode to "Hello.X": cleanup drops the space.
+        let pieces = check([T.id("Hello"), T.id("▁"), T.id("."), T.id("X")])
+        XCTAssertEqual(pieces, ["Hello", "", "", ".X", ""])
+    }
+
+    func testContractionsAreCleanedUpAcrossTokens() {
+        check([T.id("I"), T.id("▁do"), T.id("▁n"), T.id("'t"), T.id("▁know")])     // "I don't know"
+        check([T.id("I"), T.id("▁'"), T.id("ve"), T.id("▁'"), T.id("▁world")])      // " 've", " ' "
+        check([T.id("Hello"), T.id("▁'s"), T.id("▁'"), T.id("re")])
+    }
+
+    func testACombiningMarkUndoesACleanup() {
+        // " 's" is cleaned up to "'s" until an accent joins the "s".
+        let pieces = check([T.id("I"), T.id("▁'s"), T.id("\u{0301}"), T.id("X")])
+        XCTAssertEqual(pieces.joined(), "I 's\u{0301}X")
+        XCTAssertEqual(pieces[1], "")
+    }
+
+    func testHeldTextIsFlushedAtTheEnd() {
+        XCTAssertEqual(check([T.id("Hello"), T.id("▁")]), ["Hello", "", " "])
+        XCTAssertEqual(check([T.id("Hello"), T.id("▁n")]), ["Hello", "", " n"])
+    }
+
     func testAByteFallbackCharacterIsReturnedWhole() {
         let euro = Array("€".utf8).map(T.byte)   // E2 82 AC
         for flushes in [false, true] {
@@ -108,7 +135,8 @@ final class TextStreamTests: XCTestCase {
     }
 
     func testRandomSequences() {
-        // Weighted towards what interacts: byte tokens (a few characters' worth, some cut short) and specials.
+        // Weighted towards what interacts: spaces, punctuation, apostrophes,
+        // byte tokens (a few characters' worth, some cut short) and specials.
         var rng = SplitMix64(seed: 7)
         let chars = ["é", "€", "🦜", "日"].map { Array($0.utf8).map(T.byte) }
         for flushes in [false, true] {
@@ -148,9 +176,20 @@ final class TextStreamTests: XCTestCase {
             assertStreamsAsFullDecode(ids, decode: tokenizer.decode, stream: TextStream(tokenizer: tokenizer))
         }
         check([9259, 238479])                    // "Hello" + a literal U+FFFD token
-        // Byte-fallback spellings (ids 238 + byte) between real words.
+        check([9259, 236743, 236761, 236917])    // "Hello", " ", ".", "X" -> "Hello.X"
+        let text = """
+            Café naïve — 日本語のテキスト、한국어. Emoji: 🦜🧑‍🚀👩🏽‍💻 and e\u{301}. \
+            I do n't know , he said ' yes ' . Isn't it ? We 've , they 're ! 𓀀𐎀 ꧁꧂
+            """
+        let encoded = tokenizer.encode(text).filter { $0 != GemmaConfig.bosTokenID }
+        check(encoded)
+        // Byte-fallback spellings (ids 238 + byte) mixed into real text.
         let bytes = Array("🦜€é".utf8).map { 238 + Int($0) }
-        check([9259] + bytes + [9259] + bytes.prefix(2) + [9259] + bytes.prefix(1))
+        check(encoded.prefix(10) + bytes + encoded.suffix(10) + bytes.prefix(2) + [236761])
+        var rng = SplitMix64(seed: 11)
+        for _ in 0..<200 {
+            check((0..<40).map { _ in Int.random(in: 0..<262_144, using: &rng) })
+        }
     }
 }
 

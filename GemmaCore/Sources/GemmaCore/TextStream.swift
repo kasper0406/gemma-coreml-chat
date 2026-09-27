@@ -11,7 +11,7 @@ import Foundation
 /// it, compared by Unicode scalars, so the work per token stays constant
 /// however long the reply gets. That is only valid while text already
 /// returned can no longer change, so the tail that a later token still could
-/// change is held back until one does not.
+/// change is held back until one does not:
 ///
 /// - **An unfinished byte-fallback character.** A character outside the
 ///   vocabulary is spelled as `<0xNN>` byte tokens; until its last byte
@@ -19,9 +19,43 @@ import Foundation
 ///   held while the last token with any text is a byte token — a U+FFFD
 ///   after any other token is a character of its own and is returned right
 ///   away.
+/// - **Space cleanup.** The tokenizer's decode drops the space before
+///   punctuation and contractions (`" ."` → `"."`, `" n't"` → `"n't"`, …; see
+///   ``cleanupRules``), which rewrites text a later token completes — or,
+///   when that token brings a combining mark that joins the pattern's last
+///   character, un-rewrites it (`" 's"` + U+0301 stays `" 'ś"`), letting
+///   other rules match instead. Rules only delete spaces and match nothing
+///   but the characters of their patterns, so a scalar outside those that
+///   does not join the character before it separates the text: whatever
+///   comes later, cleanup of what precedes it is final. Everything after the
+///   last such scalar is held (typically a few letters: `"trees"` is all
+///   pattern characters).
+///
 /// Call ``finish()`` when generation ends, however it ends: it returns
 /// whatever was held.
 public struct TextStream {
+    /// swift-transformers' `PreTrainedTokenizer.cleanUp`, applied in this
+    /// order. Gemma's `tokenizer_config.json` leaves
+    /// `clean_up_tokenization_spaces` at its default, which turns it on.
+    static let cleanupRules = [
+        (" .", "."), (" ?", "?"), (" !", "!"), (" ,", ","), (" ' ", "'"),
+        (" n't", "n't"), (" 'm", "'m"), (" 's", "'s"), (" 've", "'ve"), (" 're", "'re"),
+    ]
+
+    /// The characters of the patterns: a rewrite never reaches past a scalar
+    /// outside them (see the type's documentation).
+    private static let patternScalars = Set(cleanupRules.flatMap { $0.0.unicodeScalars })
+
+    /// Whether a later token's cleanup can still change `scalar` or the text
+    /// before it: a pattern character, or one that joins the character
+    /// before it into one (a combining mark, an emoji modifier, a joiner).
+    private static func isReachable(_ scalar: Unicode.Scalar) -> Bool {
+        let properties = scalar.properties
+        return patternScalars.contains(scalar) || properties.isGraphemeExtend
+            || properties.isEmojiModifier || properties.generalCategory == .spacingMark
+            || scalar == "\u{200D}"
+    }
+
     private let decode: ([Int]) -> String
     private let isByteToken: (Int) -> Bool
     private var tokens: [Int] = []
@@ -87,6 +121,7 @@ public struct TextStream {
 
     /// How many trailing scalars of `text` a later token could still change.
     private func heldBack(_ text: String.UnicodeScalarView) -> Int {
-        inCharacter ? text.reversed().prefix { $0 == "\u{FFFD}" }.count : 0
+        let bytes = inCharacter ? text.reversed().prefix { $0 == "\u{FFFD}" }.count : 0
+        return bytes + text.dropLast(bytes).reversed().prefix(while: Self.isReachable).count
     }
 }
