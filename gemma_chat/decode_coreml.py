@@ -29,7 +29,8 @@ Only 15 of the 35 layers store their own KV (layers 15-34 are KV-shared).
   overwrites only ``s-W-C .. s-W-1``, which no row of the chunk can see, and a
   KV-shared layer in a later layer chunk still finds every position it needs
   in the state.  Decode is one row, so it never had the problem; it pays
-  ``C/W`` = 25% more sliding keys for sharing the layout.
+  ``C/W`` = 25% more sliding keys for sharing the layout — measured against a
+  512-row export, ~0.45 ms per token on the GPU (~4%), ~0.3 ms on the ANE.
 - **Global layers** (3 caches): linear shape ``(1, max_seq_len, nkv, hd)``.
   Slot index = absolute position.
 
@@ -573,11 +574,14 @@ def decode_chunk(params, chunk: LayerChunk, hidden, token_embed, ple_rows,
 # the weight-streaming rate (https://eiln.github.io/posts/ane-dma.html;
 # stablehlo-coreml PR #110).  Measured on the full int8 per-channel head
 # (262144 x 1536, M4 Pro, macOS 27): 8 vocab slices = 3.000 MiB per core,
-# 13.6 ms; 9 slices = 2.667 MiB, 5.69 ms; 10 slices = 2.401 MiB, 5.76 ms;
-# 8 slices x 3 contracting splits = 1.000 MiB, 13.7 ms.
+# 13.6 ms; 9 slices = 2.667 MiB, 5.66 ms; 10 slices = 2.401 MiB, 5.67 ms.
+# Stepping equal slices through the notch one row per core (1.5 KiB) at a
+# time, around 1, 2 and 3 MiB alike: 5.6 ms from -16 KiB, 9.2 ms at -12 KiB,
+# 15-18 ms from -6 to +1 KiB (worst just below the multiple), 9-10 ms at
+# +3..+6 KiB, 5.7 ms again from +8 KiB (+16 KiB at 1 and 2 MiB).
 _ANE_CORES = 16
 _ANE_NOTCH = 1 << 20
-_ANE_NOTCH_GUARD = 64 << 10   # 4x the measured notch width
+_ANE_NOTCH_GUARD = 64 << 10   # 4x the widest side of the measured slow band
 # Rows per head slice, at most.  Core ML's int8 per-channel matmul returns
 # garbage on the GPU for N_out >= 65536 once M >= 5 (the head runs at M = 1,
 # this is margin), and one ANE weight kernel may not pass 128 MiB (this is
