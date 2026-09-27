@@ -11,6 +11,7 @@ placement, and the graph shapes this project actually produces.
 """
 
 import numpy as np
+import pytest
 import jax
 import jax.numpy as jnp
 import jax.scipy.special
@@ -23,7 +24,7 @@ from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipe
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
-def _convert(fn, *example_args, load: bool = False):
+def _convert(fn, *example_args, load: bool = False, compute_units=ct.ComputeUnit.ALL):
     """Trace ``fn``, run the project pipeline, return ``(mlmodel, mil_program)``."""
     hlo = jax.jit(fn).lower(*example_args).compiler_ir("stablehlo")
     prog = hlo_to_mil(hlo, minimum_deployment_target=ct.target.iOS18)
@@ -34,6 +35,7 @@ def _convert(fn, *example_args, load: bool = False):
         pass_pipeline=pipeline,
         compute_precision=ct.precision.FLOAT32,
         minimum_deployment_target=ct.target.iOS18,
+        compute_units=compute_units,
         skip_model_load=not load,
     )
     return model, model._mil_program
@@ -266,6 +268,16 @@ def test_rmsnorm_off_canonical_shape_is_viewed_as_rows():
         assert _count(prog, "reshape") <= 2, shape
 
 
+def test_a_norm_scale_fp16_cannot_hold_fails_the_conversion():
+    """``sqrt(d) * scale`` is narrowed to fp16; one that overflows must not
+    silently become ``inf``. At d = 1536 that takes a scale above ~1671."""
+    def big_scale_norm(x):
+        return rmsnorm(x, jnp.asarray(np.full((x.shape[-1],), 2000.0, np.float16)))
+
+    with pytest.raises(ValueError, match="fp16 cannot represent"):
+        _convert(big_scale_norm, jnp.ones((1, 1, 1536), jnp.float16))
+
+
 def test_exact_gelu_fuses_to_one_fp16_op():
     """``chlo.erf`` is mapped natively and fused by ``fuse_gelu_exact``.
 
@@ -403,7 +415,9 @@ def test_exported_rmsnorm_matches_an_fp64_reference_on_cpu():
     rows = _norm_rows()
     x = np.stack(list(rows.values()))[:, None, None, :]   # (rows, 1, 1, 1536)
     scale = (1.0 + np.random.RandomState(5).randn(1536) * 0.1).astype(np.float16)
-    model, prog = _convert(_rmsnorm_const_scale, jnp.asarray(x), load=True)
+    model, prog = _convert(
+        _rmsnorm_const_scale, jnp.asarray(x), load=True, compute_units=ct.ComputeUnit.CPU_ONLY,
+    )
     assert _count(prog, "l2_norm") == 1 and _count(prog, "cast") == 0
     out = _predict(model, x).astype(np.float64)
     ref = _reference_rmsnorm(x, np.full(1536, 0.5, np.float16))

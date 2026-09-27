@@ -22,6 +22,7 @@ from pathlib import Path
 
 import coremltools as ct
 import numpy as np
+import pytest
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types, get_new_symbol
 
@@ -197,6 +198,14 @@ def test_materialize_carries_the_sidecar_directories(tmp_path):
 
     for name in SIDECAR_DIRS:
         assert (out / name / "nested" / "blob.bin").read_bytes() == name.encode()
+
+
+def test_materialize_refuses_to_overwrite_its_input(tmp_path):
+    """In place, the save would delete the sidecars before they are copied."""
+    dyn = _build_dynamic_mlpackage(tmp_path)
+    with pytest.raises(ValueError, match="in place"):
+        materialize_mlpackage(dyn, tmp_path / "." / dyn.name, SIZES[:1])
+    assert (dyn / "Manifest.json").exists()
 
 
 if __name__ == "__main__":

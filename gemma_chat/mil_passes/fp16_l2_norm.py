@@ -58,6 +58,32 @@ def _const_mul(var):
     return mul if other.val is not None else None
 
 
+def _fp16_scale(value, name: str) -> np.ndarray:
+    """The folded ``sqrt(d) * scale`` constant, narrowed to fp16.
+
+    ``l2_norm`` returns unit-norm rows, so the whole RMSNorm magnitude lives in
+    this constant: ``sqrt(d)`` (39.2 at ``d = 1536``) times the checkpoint's
+    norm scale.  fp16 tops out at 65504, so a scale above ~1671 at that width
+    would become ``inf`` and turn every row it touches into inf/NaN.  The
+    checkpoint has nothing near that (see the export log), so a site that would
+    overflow fails the export instead of getting a special-cased fp32 path.
+    """
+    wide = np.asarray(value, dtype=np.float32)
+    with np.errstate(over="ignore"):
+        narrow = wide.astype(np.float16)
+    if not np.all(np.isfinite(narrow)):
+        raise ValueError(
+            f"fp16_l2_norm: the folded RMSNorm scale of {name!r} reaches "
+            f"{np.max(np.abs(wide)):.6g}, which fp16 cannot represent"
+        )
+    _largest_scale[0] = max(_largest_scale[0], float(np.max(np.abs(wide))))
+    return narrow
+
+
+# Largest |folded scale| seen by the current ``apply``, for the log line.
+_largest_scale = [0.0]
+
+
 @block_context_manager
 def _narrow_block(block) -> int:
     """Narrow every fp32 ``l2_norm -> mul(const)`` whose input is fp16 underneath.
@@ -85,13 +111,11 @@ def _narrow_block(block) -> int:
         if mul is None:
             continue
         scale = mul.y if mul.x is op.outputs[0] else mul.x
+        scale16 = _fp16_scale(scale.val, mul.name)
         normalized = mb.l2_norm(
             x=x16, epsilon=np.float16(op.epsilon.val), before_op=mul, name=op.name + "_fp16",
         )
-        scaled = mb.mul(
-            x=normalized, y=np.asarray(scale.val).astype(np.float16),
-            before_op=mul, name=mul.name + "_fp16",
-        )
+        scaled = mb.mul(x=normalized, y=scale16, before_op=mul, name=mul.name + "_fp16")
         narrowed[mul.outputs[0]] = scaled
         for reader in list(mul.outputs[0].child_ops):
             if reader.op_type == "cast" and reader.outputs[0].dtype == types.fp16:
@@ -109,6 +133,11 @@ class fp16_l2_norm(AbstractGraphPass):
     before a ``dead_code_elimination``, which drops the fp32 originals."""
 
     def apply(self, prog):
+        _largest_scale[0] = 0.0
         count = sum(_narrow_block(f) for f in prog.functions.values())
         if count:
-            print(f"  fp16_l2_norm: {count} RMSNorm(s) now run in fp16", flush=True)
+            print(
+                f"  fp16_l2_norm: {count} RMSNorm(s) now run in fp16 "
+                f"(largest folded scale {_largest_scale[0]:.4g}, fp16 max 65504)",
+                flush=True,
+            )

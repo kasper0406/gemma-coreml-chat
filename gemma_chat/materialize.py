@@ -517,8 +517,14 @@ def materialize_mlpackage(
     for each source function ``fname`` and each ``N`` in ``sizes``.
 
     The source's :data:`SIDECAR_DIRS` are copied into the output, so a
-    runnable source gives a runnable output.
+    runnable source gives a runnable output.  That is also why the output must
+    be a different path: the save replaces the destination before the
+    sidecars are copied out of the source.
     """
+    if Path(source_path).resolve() == Path(dest_path).resolve():
+        raise ValueError(
+            f"cannot materialize {source_path} in place: write to a different path"
+        )
     peek = ct.models.MLModel(str(source_path), skip_model_load=True)
     has_named_functions = len(peek._spec.description.functions) > 0
     fn_names = _source_function_names(peek._spec)
