@@ -1,32 +1,53 @@
 /// Temperature + top-p (nucleus) sampling for next-token prediction.
 ///
-/// The vocabulary is 262144 entries, so a naive sampler that sorts the whole
-/// distribution costs ~20 ms per token — a third of the budget at 60-100 tok/s.
-/// This implementation never sorts the full vocabulary:
+/// The vocabulary is 262144 entries, so a sampler that sorts the whole
+/// distribution costs ~25 ms per token. This one does a few linear passes
+/// over the vocabulary and orders only as much of it as the nucleus walk
+/// consumes:
 ///
-///   * All elementwise work (temperature, max-shift, exp, sum) runs through
-///     Accelerate on a single Float scratch buffer. fp16 logits are converted
-///     once, straight into that buffer; there is no intermediate Double array.
-///   * Top-p operates on a bounded top-k preselect (`preselectK` candidates)
-///     found in a single streaming pass with a running threshold. Scaling by
-///     1/temperature and subtracting the max are monotone, and exp is monotone,
-///     so the k largest *logits* are exactly the k most probable tokens: the
-///     preselect is an exact prefix of the descending order the full sort would
-///     have produced. If the nucleus is not contained in those k candidates
-///     (their probability mass never reaches `topP`), the code falls back to the
-///     full descending sort, so the result is exact for every input rather than
-///     an approximation. With p <= 0.95 a 256-token nucleus essentially never
-///     occurs for this model, so the fallback is a safety net, not a hot path.
-///   * Greedy decoding (temperature <= 0) is a pure vDSP argmax over the logits
-///     with no copy at all for fp32 input.
+///   * Probabilities: temperature, max-shift, exp and sum run through
+///     Accelerate on one Float buffer that is reused across calls. fp32 logits
+///     are scaled straight into it; fp16 logits are converted once into it.
+///     Normalizing is a single multiply per token, done only for the tokens
+///     the nucleus walk looks at (the same rounding a vector multiply gives).
+///     The exp over the whole vocabulary is the bulk of the remaining cost.
+///   * Nucleus: the exact top-p set is the shortest prefix of the descending
+///     order (probability desc, then token id asc) whose running Float sum
+///     reaches `topP`. That order is produced band by band. Band k holds the
+///     tokens whose probability lies in [pmax·e^-edge[k], pmax·e^-edge[k-1]):
+///     one SIMD scan over the vocabulary gathers it. Only as much of the band
+///     is put in order as the walk consumes: partial sorts select its largest
+///     64, then 256, 1024, ... keys until the running sum reaches `topP`, so
+///     even a band holding the whole vocabulary (a nearly flat distribution)
+///     costs O(log nucleus) scans of it plus ordering the nucleus, never a
+///     sort of the whole band. The
+///     bands are disjoint value ranges in descending order, so the walked
+///     sequence is exactly the prefix a full sort yields. The result is bit
+///     for bit what sorting the whole vocabulary gives (see `SamplingTests`).
+///     For this model the first band (within 6 nats of the top token, rarely
+///     more than a hundred tokens) almost always holds the whole nucleus.
+///   * Degenerate input: if the exp sum is not finite (1/temperature
+///     overflows, a logit is +inf or NaN, or every logit is -inf), the
+///     distribution is taken as a point mass on the first largest non-NaN
+///     logit, and that token is returned.
+///   * Greedy decoding (temperature <= 0) is a vDSP argmax over the logits
+///     with no copy at all for fp32 input, plus a vDSP sum that detects NaN
+///     and infinities (vDSP_maxvi mishandles NaN); those resolve like the
+///     degenerate case above.
 
 import Accelerate
 import CoreML
 import Foundation
+import Synchronization
 
 public enum Sampling {
-    /// Number of candidates preselected before the top-p walk.
-    private static let preselectK = 256
+    /// Band edges in nats below the most probable token. The final band takes
+    /// everything below the last edge.
+    private static let bandEdges: [Float] = [6, 12, 24]
+
+    /// Buffers reused across calls. The lock serializes sampling across
+    /// concurrent generations; a call holds it for ~0.15 ms on real logits.
+    private static let scratch = Mutex(Scratch())
 
     /// Sample next token from logits with temperature and top-p filtering.
     ///
@@ -60,118 +81,258 @@ public enum Sampling {
         topP: Float,
         uniform: Float
     ) -> Int32 {
-        let count = logits.count
-
-        if temperature <= 0 {
-            return withFloatLogits(logits) { ptr, n in
-                var maxVal: Float = 0
-                var maxIdx: vDSP_Length = 0
-                vDSP_maxvi(ptr, 1, &maxVal, &maxIdx, vDSP_Length(n))
-                return Int32(maxIdx)
+        scratch.withLock { s in
+            if temperature <= 0 { return s.argmax(logits) }
+            s.nucleus(logits, temperature: temperature, topP: topP)
+            var accum: Float = 0
+            for i in 0..<s.nucleusCount {
+                accum += s.probs[i]
+                if accum >= uniform { return Scratch.token(s.keys[i]) }
             }
+            return Scratch.token(s.keys[0])
         }
-
-        let probs = UnsafeMutablePointer<Float>.allocate(capacity: count)
-        defer { probs.deallocate() }
-        copyLogits(logits, into: probs, count: count)
-
-        // Temperature, then numerical-stability shift by the max.
-        var invTemp = 1.0 / temperature
-        vDSP_vsmul(probs, 1, &invTemp, probs, 1, vDSP_Length(count))
-        var maxVal: Float = 0
-        vDSP_maxv(probs, 1, &maxVal, vDSP_Length(count))
-        var negMax = -maxVal
-        vDSP_vsadd(probs, 1, &negMax, probs, 1, vDSP_Length(count))
-
-        // Preselect the top-k while the buffer still holds (monotone) logits.
-        let k = min(preselectK, count)
-        var candidates = topKDescending(probs, count: count, k: k)
-
-        // Probabilities.
-        var n = Int32(count)
-        vvexpf(probs, probs, &n)
-        var sum: Float = 0
-        vDSP_sve(probs, 1, &sum, vDSP_Length(count))
-        var invSum = 1.0 / sum
-        vDSP_vsmul(probs, 1, &invSum, probs, 1, vDSP_Length(count))
-
-        // Does the nucleus fit inside the preselect?
-        let cutoff: Int
-        if let fits = nucleusCutoff(probs, candidates: candidates, topP: topP) {
-            cutoff = fits
-        } else {
-            // Rare: the nucleus is wider than the preselect. Take the exact path.
-            candidates = fullDescendingOrder(probs, count: count)
-            cutoff = nucleusCutoff(probs, candidates: candidates, topP: topP) ?? count
-        }
-
-        // Renormalize the nucleus and draw.
-        var topProbs = [Float](repeating: 0, count: cutoff)
-        for i in 0..<cutoff { topProbs[i] = probs[Int(candidates[i])] }
-        var topSum: Float = 0
-        vDSP_sve(topProbs, 1, &topSum, vDSP_Length(topProbs.count))
-        var invTopSum = 1.0 / topSum
-        vDSP_vsmul(topProbs, 1, &invTopSum, &topProbs, 1, vDSP_Length(topProbs.count))
-
-        var accum: Float = 0
-        for (i, prob) in topProbs.enumerated() {
-            accum += prob
-            if accum >= uniform { return candidates[i] }
-        }
-        return candidates[0]
     }
 
-    /// Number of leading `candidates` whose probability mass reaches `topP`,
-    /// or nil if the candidate list never gets there.
-    private static func nucleusCutoff(
-        _ probs: UnsafePointer<Float>,
-        candidates: [Int32],
+    /// The distribution `sampleNextToken` draws from: the nucleus in walk
+    /// order with its renormalized probabilities.
+    static func nucleus(
+        logits: MLMultiArray,
+        temperature: Float,
         topP: Float
-    ) -> Int? {
-        var cumulative: Float = 0
-        for (i, idx) in candidates.enumerated() {
-            cumulative += probs[Int(idx)]
-            if cumulative >= topP { return i + 1 }
-        }
-        return nil
-    }
-
-    // MARK: - Logit access
-
-    /// Run `body` over the logits as contiguous Float32. fp32 input is used in
-    /// place; fp16 input is converted once into a temporary buffer.
-    private static func withFloatLogits<R>(
-        _ logits: MLMultiArray,
-        _ body: (UnsafePointer<Float>, Int) -> R
-    ) -> R {
-        let count = logits.count
-        switch logits.dataType {
-        case .float32:
-            return logits.withUnsafeBufferPointer(ofType: Float.self) { buf in
-                body(buf.baseAddress!, count)
-            }
-        case .float16:
-            let scratch = UnsafeMutablePointer<Float>.allocate(capacity: count)
-            defer { scratch.deallocate() }
-            copyLogits(logits, into: scratch, count: count)
-            return body(scratch, count)
-        default:
-            preconditionFailure("Sampling: unsupported logits dtype \(logits.dataType)")
+    ) -> [(id: Int32, prob: Float)] {
+        scratch.withLock { s in
+            s.nucleus(logits, temperature: temperature, topP: topP)
+            return (0..<s.nucleusCount).map { (Scratch.token(s.keys[$0]), s.probs[$0]) }
         }
     }
 
-    /// Materialize the logits as Float32 in `destination`.
-    private static func copyLogits(
-        _ logits: MLMultiArray,
-        into destination: UnsafeMutablePointer<Float>,
-        count: Int
-    ) {
-        switch logits.dataType {
-        case .float32:
-            logits.withUnsafeBufferPointer(ofType: Float.self) { buf in
-                destination.update(from: buf.baseAddress!, count: count)
+    /// Only ever touched under `scratch`'s lock.
+    private final class Scratch: @unchecked Sendable {
+        /// One Float per vocabulary entry: scaled logits, then unnormalized
+        /// probabilities. After `nucleus(_:temperature:topP:)` its first
+        /// `nucleusCount` entries are the nucleus's renormalized probabilities.
+        private(set) var probs = UnsafeMutableBufferPointer<Float>(start: nil, count: 0)
+        /// Gathered tokens as `(probability bits << 32) | ~token`. Probabilities
+        /// are non-negative, so descending integer order *is* the walk order:
+        /// probability desc, then token id asc. After `nucleus(_:temperature:topP:)`
+        /// the first `nucleusCount` keys are the nucleus in walk order.
+        private(set) var keys = UnsafeMutableBufferPointer<UInt64>(start: nil, count: 0)
+        private(set) var nucleusCount = 0
+
+        static func token(_ key: UInt64) -> Int32 {
+            Int32(bitPattern: ~UInt32(truncatingIfNeeded: key))
+        }
+
+        private static func probability(_ key: UInt64) -> Float {
+            Float(bitPattern: UInt32(truncatingIfNeeded: key >> 32))
+        }
+
+        /// Size the buffers for a `count`-entry vocabulary.
+        private func reserve(_ count: Int) {
+            guard probs.count < count else { return }
+            probs.deallocate()
+            keys.deallocate()
+            probs = .allocate(capacity: count)
+            keys = .allocate(capacity: count)
+        }
+
+        func argmax(_ logits: MLMultiArray) -> Int32 {
+            if logits.dataType == .float32 {
+                return logits.withUnsafeBufferPointer(ofType: Float.self) { buf in
+                    Scratch.argmax(buf.baseAddress!, count: logits.count)
+                }
             }
-        case .float16:
+            reserve(logits.count)
+            Scratch.convertFloat16(logits, into: probs.baseAddress!)
+            return Scratch.argmax(probs.baseAddress!, count: logits.count)
+        }
+
+        /// First index of the largest value, ignoring NaN (+inf is largest);
+        /// 0 if every value is NaN.
+        private static func argmax(_ x: UnsafePointer<Float>, count: Int) -> Int32 {
+            var maxVal: Float = 0
+            var maxIdx: vDSP_Length = 0
+            vDSP_maxvi(x, 1, &maxVal, &maxIdx, vDSP_Length(count))
+            // vDSP_maxvi's answer is unreliable once a NaN is present. A
+            // finite sum rules out NaN and infinities; otherwise (rare) scan.
+            var sum: Float = 0
+            vDSP_sve(x, 1, &sum, vDSP_Length(count))
+            if sum.isFinite { return Int32(maxIdx) }
+            var best = -1
+            for i in 0..<count where !x[i].isNaN && (best < 0 || x[i] > x[best]) { best = i }
+            return Int32(max(best, 0))
+        }
+
+        /// Fill the first `nucleusCount` entries of `keys` with the nucleus and
+        /// of `probs` with its renormalized probabilities.
+        func nucleus(_ logits: MLMultiArray, temperature: Float, topP: Float) {
+            let count = logits.count
+            reserve(count)
+            let p = probs.baseAddress!
+            let n = vDSP_Length(count)
+
+            // Temperature, then numerical-stability shift by the max.
+            var invTemp = 1.0 / temperature
+            if logits.dataType == .float32 {
+                logits.withUnsafeBufferPointer(ofType: Float.self) { buf in
+                    vDSP_vsmul(buf.baseAddress!, 1, &invTemp, p, 1, n)
+                }
+            } else {
+                Scratch.convertFloat16(logits, into: p)
+                vDSP_vsmul(p, 1, &invTemp, p, 1, n)
+            }
+            var maxVal: Float = 0
+            vDSP_maxv(p, 1, &maxVal, n)
+            var negMax = -maxVal
+            vDSP_vsadd(p, 1, &negMax, p, 1, n)
+
+            // Unnormalized probabilities. A token's probability is
+            // `p[i] * invSum`, computed only for the tokens a band gathers.
+            // The top token is exp(0) = 1, so its probability is `invSum`.
+            var count32 = Int32(count)
+            vvexpf(p, p, &count32)
+            var sum: Float = 0
+            vDSP_sve(p, 1, &sum, n)
+            // Any NaN, +inf logit, all -inf logits or overflowing 1/temperature
+            // ends up as a NaN here (inf - inf, 0 * inf, NaN - max).
+            guard sum.isFinite else { return pointMass(argmax(logits)) }
+            let invSum = 1.0 / sum
+
+            // Walk the descending order band by band until the mass reaches topP.
+            var gathered = 0
+            var cutoff: Int?
+            var cumulative: Float = 0
+            var hi = Float.infinity
+            for band in 0...Sampling.bandEdges.count where cutoff == nil {
+                let lo = band < Sampling.bandEdges.count ? invSum * exp(-Sampling.bandEdges[band]) : 0
+                let start = gathered
+                gathered = gather(p, count: count, scale: invSum, lo: lo, hi: hi, from: start)
+                let band = UnsafeMutableBufferPointer(rebasing: keys[start..<gathered])
+                if let taken = Scratch.walk(band, cumulative: &cumulative, topP: topP) {
+                    cutoff = start + taken
+                }
+                hi = lo
+            }
+            nucleusCount = cutoff ?? gathered
+
+            // Renormalize the nucleus, reusing the front of `probs`.
+            for i in 0..<nucleusCount { p[i] = Scratch.probability(keys[i]) }
+            var topSum: Float = 0
+            vDSP_sve(p, 1, &topSum, vDSP_Length(nucleusCount))
+            var invTopSum = 1.0 / topSum
+            vDSP_vsmul(p, 1, &invTopSum, p, 1, vDSP_Length(nucleusCount))
+        }
+
+        /// The nucleus of a degenerate distribution: all mass on `token`.
+        private func pointMass(_ token: Int32) {
+            keys[0] = UInt64(Float(1).bitPattern) << 32 | UInt64(~UInt32(bitPattern: token))
+            probs[0] = 1
+            nucleusCount = 1
+        }
+
+        /// Continue the walk into `band`: order it descending only as far as
+        /// the running sum needs to reach `topP`, in growing chunks (64, 256,
+        /// 1024, ...) each selected by a partial sort of what is left. A band
+        /// of b keys whose walk takes c of them costs O(b·log(c)) scans plus
+        /// O(c·log c) ordering, never a sort of the whole band. Returns how
+        /// many keys that took, or nil if the whole band did not reach it; the
+        /// walked keys end up first in `band`, in descending order.
+        private static func walk(
+            _ band: UnsafeMutableBufferPointer<UInt64>,
+            cumulative: inout Float,
+            topP: Float
+        ) -> Int? {
+            var done = 0
+            var chunk = 64
+            while done < band.count {
+                let end = min(done + chunk, band.count)
+                selectLargest(band, from: done, to: end)
+                for i in done..<end {
+                    cumulative += probability(band[i])
+                    if cumulative >= topP { return i + 1 }
+                }
+                done = end
+                chunk *= 4
+            }
+            return nil
+        }
+
+        /// Partial sort: move the largest `end - start` keys of `keys[start...]`
+        /// into `keys[start..<end]`, in descending order.
+        private static func selectLargest(_ keys: UnsafeMutableBufferPointer<UInt64>, from start: Int, to end: Int) {
+            // Min-heap of the largest keys seen so far; a key that beats its
+            // root replaces it. Most keys of a large band are rejected by the
+            // one comparison.
+            let heap = UnsafeMutableBufferPointer(rebasing: keys[start..<end])
+            let k = heap.count
+            for i in stride(from: k / 2 - 1, through: 0, by: -1) { siftDown(heap, from: i, heapSize: k) }
+            for i in end..<keys.count where keys[i] > heap[0] {
+                let evicted = heap[0]
+                heap[0] = keys[i]
+                keys[i] = evicted
+                siftDown(heap, from: 0, heapSize: k)
+            }
+            // Move the minimum to the back until the heap reads descending.
+            for size in stride(from: k - 1, to: 0, by: -1) {
+                heap.swapAt(0, size)
+                siftDown(heap, from: 0, heapSize: size)
+            }
+        }
+
+        /// Restore the min-heap property below `i` in `heap[0..<heapSize]`.
+        private static func siftDown(_ heap: UnsafeMutableBufferPointer<UInt64>, from i: Int, heapSize: Int) {
+            let value = heap[i]
+            var i = i
+            while true {
+                var child = 2 * i + 1
+                if child >= heapSize { break }
+                if child + 1 < heapSize && heap[child + 1] < heap[child] { child += 1 }
+                if heap[child] >= value { break }
+                heap[i] = heap[child]
+                i = child
+            }
+            heap[i] = value
+        }
+
+        /// Write the key of every token with probability `lo <= e[i] * scale < hi`
+        /// to `keys`, starting at index `start`, in ascending token order.
+        /// Returns the index past the last key written. NaN falls in no band.
+        private func gather(
+            _ e: UnsafePointer<Float>, count: Int, scale: Float, lo: Float, hi: Float, from start: Int
+        ) -> Int {
+            let out = keys.baseAddress!
+            var written = start
+            typealias Lanes = SIMD16<Float>
+            let scaleV = Lanes(repeating: scale)
+            let loV = Lanes(repeating: lo)
+            let hiV = Lanes(repeating: hi)
+            let raw = UnsafeRawPointer(e)
+            func take(_ i: Int) {
+                let p = e[i] * scale
+                if p >= lo && p < hi {
+                    out[written] = UInt64(p.bitPattern) << 32 | UInt64(~UInt32(i))
+                    written += 1
+                }
+            }
+            var i = 0
+            while i + Lanes.scalarCount <= count {
+                let p = raw.loadUnaligned(fromByteOffset: i * MemoryLayout<Float>.stride, as: Lanes.self) * scaleV
+                if any((p .>= loV) .& (p .< hiV)) {
+                    for j in i..<(i + Lanes.scalarCount) { take(j) }
+                }
+                i += Lanes.scalarCount
+            }
+            while i < count {
+                take(i)
+                i += 1
+            }
+            return written
+        }
+
+        /// Materialize fp16 logits as Float32 in `destination`.
+        private static func convertFloat16(_ logits: MLMultiArray, into destination: UnsafeMutablePointer<Float>) {
+            precondition(logits.dataType == .float16, "Sampling: unsupported logits dtype \(logits.dataType)")
+            let count = logits.count
             logits.withUnsafeBufferPointer(ofType: Float16.self) { buf in
                 var src = vImage_Buffer(
                     data: UnsafeMutableRawPointer(mutating: buf.baseAddress!),
@@ -183,83 +344,6 @@ public enum Sampling {
                 )
                 vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
             }
-        default:
-            preconditionFailure("Sampling: unsupported logits dtype \(logits.dataType)")
         }
-    }
-
-    // MARK: - Selection
-
-    /// Indices of the `k` largest values, ordered descending.
-    ///
-    /// One streaming pass with a running threshold `tau`: a value only enters
-    /// the candidate buffer if it beats the current k-th best. The buffer holds
-    /// 2k entries and is trimmed back to k (raising `tau`) whenever it fills, so
-    /// the expected number of trims is O(log(count/k)) — a handful for a 262K
-    /// vocabulary. Total cost is one linear scan, no full sort.
-    private static func topKDescending(
-        _ values: UnsafePointer<Float>,
-        count: Int,
-        k: Int
-    ) -> [Int32] {
-        let capacity = 2 * k
-        let vals = UnsafeMutablePointer<Float>.allocate(capacity: capacity)
-        let idxs = UnsafeMutablePointer<Int32>.allocate(capacity: capacity)
-        let order = UnsafeMutablePointer<vDSP_Length>.allocate(capacity: capacity)
-        defer {
-            vals.deallocate()
-            idxs.deallocate()
-            order.deallocate()
-        }
-
-        // Sort the first `n` entries descending in place, keeping pairs together.
-        func sortPrefix(_ n: Int) {
-            // vDSP_vsorti permutes an existing index vector; it must start as identity.
-            for i in 0..<n { order[i] = vDSP_Length(i) }
-            vDSP_vsorti(vals, order, nil, vDSP_Length(n), -1)
-            let tmpV = UnsafeMutablePointer<Float>.allocate(capacity: n)
-            let tmpI = UnsafeMutablePointer<Int32>.allocate(capacity: n)
-            defer {
-                tmpV.deallocate()
-                tmpI.deallocate()
-            }
-            for i in 0..<n {
-                let p = Int(order[i])
-                tmpV[i] = vals[p]
-                tmpI[i] = idxs[p]
-            }
-            vals.update(from: tmpV, count: n)
-            idxs.update(from: tmpI, count: n)
-        }
-
-        var n = 0
-        var tau = -Float.infinity
-        for i in 0..<count {
-            let v = values[i]
-            if v > tau {
-                vals[n] = v
-                idxs[n] = Int32(i)
-                n += 1
-                if n == capacity {
-                    sortPrefix(n)
-                    n = k
-                    tau = vals[k - 1]
-                }
-            }
-        }
-        sortPrefix(n)
-        return Array(UnsafeBufferPointer(start: idxs, count: min(n, k)))
-    }
-
-    /// Exact fallback: full descending order over the whole vocabulary.
-    private static func fullDescendingOrder(
-        _ values: UnsafePointer<Float>,
-        count: Int
-    ) -> [Int32] {
-        var order = Array(0..<vDSP_Length(count))
-        order.withUnsafeMutableBufferPointer { buf in
-            vDSP_vsorti(values, buf.baseAddress!, nil, vDSP_Length(count), -1)
-        }
-        return order.map { Int32($0) }
     }
 }
