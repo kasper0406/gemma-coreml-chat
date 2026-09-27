@@ -44,6 +44,14 @@ public final class GemmaTokenizer: @unchecked Sendable {
         tokenizer.decode(tokens: ids, skipSpecialTokens: true)
     }
 
+    /// Whether `id` is a byte-fallback token (`<0xNN>`): one UTF-8 byte of a
+    /// character the vocabulary has no token for. Same test as the
+    /// tokenizer's `ByteFallback` decoder.
+    func isByteToken(_ id: Int) -> Bool {
+        guard let piece = tokenizer.convertIdToToken(id) else { return false }
+        return piece.count == 6 && piece.hasPrefix("<0x") && piece.hasSuffix(">")
+    }
+
     /// Tokenize conversation history using Gemma4's chat template.
     ///
     /// Returns token IDs directly (no intermediate string).

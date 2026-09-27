@@ -236,15 +236,13 @@ final class ChatViewModel {
                 )
 
                 var genIDs: [Int32] = []
+                var textStream = TextStream(tokenizer: tokenizer)
                 for try await tokenID in stream {
                     if Task.isCancelled { break }
 
                     if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
                     genIDs.append(tokenID)
-
-                    // O(1) per token: decode only the new token for streaming.
-                    // Full-sequence decode at finalization ensures accuracy.
-                    streamingText += tokenizer.decode([Int(tokenID)])
+                    streamingText += textStream.push(tokenID)
                     generatedTokenCount = genIDs.count
                 }
 

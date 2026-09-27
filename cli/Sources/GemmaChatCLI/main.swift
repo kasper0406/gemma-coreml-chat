@@ -158,7 +158,7 @@ struct GemmaChatCLI {
             fflush(stdout)
 
             var responseTokens: [Int32] = []
-            var textStream = TextStream()
+            var textStream = TextStream(tokenizer: tokenizer)
             let genStart = CFAbsoluteTimeGetCurrent()
             let stream = engine.generate(
                 promptIDs: promptIDs,
@@ -168,18 +168,24 @@ struct GemmaChatCLI {
                 context: genContext
             )
 
+            var failure: Error?
             do {
                 for try await tokenID in stream {
                     if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
                     responseTokens.append(tokenID)
-                    let delta = textStream.push(tokenID, decode: tokenizer.decode)
+                    let delta = textStream.push(tokenID)
                     if !delta.isEmpty {
                         print(delta, terminator: "")
                         fflush(stdout)
                     }
                 }
             } catch {
-                print("\n[error] \(error.localizedDescription)\n")
+                failure = error
+            }
+            // However generation ended, print what the stream still held.
+            print(textStream.finish(), terminator: "")
+            if let failure {
+                print("\n[error] \(failure.localizedDescription)\n")
                 continue
             }
 
@@ -341,29 +347,5 @@ struct GemmaChatCLI {
         Re-export with `uv run gemma-export` if missing.
         
         """)
-    }
-}
-
-/// Incremental detokenization with constant work per token. Each step decodes
-/// a short window (the last printed chunk plus the new tokens) with and
-/// without the new tokens and returns the difference, compared by Unicode
-/// scalars. A character whose bytes span byte-fallback tokens decodes to
-/// nothing (or to a trailing U+FFFD) until its last byte arrives, so nothing
-/// is returned before the character is complete.
-struct TextStream {
-    private var tokens: [Int] = []
-    /// Start of the decode window: context for the tokens after `printed`.
-    private var windowStart = 0
-    /// Tokens before this index have been returned as text.
-    private var printed = 0
-
-    mutating func push(_ token: Int32, decode: ([Int]) -> String) -> String {
-        tokens.append(Int(token))
-        let before = decode(Array(tokens[windowStart..<printed])).unicodeScalars
-        let after = decode(Array(tokens[windowStart...])).unicodeScalars
-        guard after.count > before.count, after.last != "\u{FFFD}" else { return "" }
-        windowStart = printed
-        printed = tokens.count
-        return String(String.UnicodeScalarView(after.dropFirst(before.count)))
     }
 }
