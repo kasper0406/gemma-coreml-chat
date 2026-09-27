@@ -180,3 +180,41 @@ private final class Results: @unchecked Sendable {
         return values[i]!
     }
 }
+
+final class PromptLimitTests: XCTestCase {
+    private static func engine() async throws -> InferenceEngine {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "TinyModel", withExtension: "mlpackage"))
+        let model = try await CoreMLModel.load(from: url, computeUnits: .cpuOnly, backgroundPreload: false)
+        return InferenceEngine(model: model)
+    }
+
+    private static func run(_ engine: InferenceEngine, prompt: Int) async throws -> [Int32] {
+        var out: [Int32] = []
+        let ids = (0..<prompt).map { Int32(1 + $0 % 7) }
+        for try await id in engine.generate(promptIDs: ids, maxNewTokens: 4, respectStopTokens: false) {
+            out.append(id)
+        }
+        return out
+    }
+
+    /// The engine never cuts a prompt (a suffix loses the chat framing): one
+    /// that fits runs, with room for its reply's first token; one that does
+    /// not is refused.
+    func testAPromptLongerThanTheContextIsRefusedNotCut() async throws {
+        let engine = try await Self.engine()
+        let limit = engine.maxPromptTokens
+        XCTAssertEqual(limit, engine.model.effectiveMaxSeqLen - 1)
+        // A reply budget never takes more than half the context from the history.
+        XCTAssertEqual(engine.promptBudget(reservingForReply: 100), limit - 100)
+        XCTAssertEqual(engine.promptBudget(reservingForReply: 4 * limit), limit - limit / 2)
+        let generated = try await Self.run(engine, prompt: limit)
+        XCTAssertEqual(generated.count, 1)
+        do {
+            _ = try await Self.run(engine, prompt: limit + 1)
+            XCTFail("a prompt past the context ran")
+        } catch InferenceError.promptTooLong(let tokens, let reported) {
+            XCTAssertEqual(tokens, limit + 1)
+            XCTAssertEqual(reported, limit)
+        }
+    }
+}

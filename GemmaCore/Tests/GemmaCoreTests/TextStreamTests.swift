@@ -157,21 +157,8 @@ final class TextStreamTests: XCTestCase {
 
     // MARK: - The model's own tokenizer
 
-    /// The repository's exported package, when there is one (`gemma-export`
-    /// writes it to the repository root).
-    private func realTokenizer() async throws -> GemmaTokenizer {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent()
-            .deletingLastPathComponent().deletingLastPathComponent()
-        let package = root.appendingPathComponent("gemma4-e2b.mlpackage")
-        guard FileManager.default.fileExists(atPath: package.appendingPathComponent("Tokenizer").path) else {
-            throw XCTSkip("no exported gemma4-e2b.mlpackage at \(root.path)")
-        }
-        return try await GemmaTokenizer(fromModelPackage: package)
-    }
-
     func testTheModelTokenizer() async throws {
-        let tokenizer = try await realTokenizer()
+        let tokenizer = try await exportedTokenizer()
         func check(_ ids: [Int]) {
             assertStreamsAsFullDecode(ids, decode: tokenizer.decode, stream: TextStream(tokenizer: tokenizer))
         }

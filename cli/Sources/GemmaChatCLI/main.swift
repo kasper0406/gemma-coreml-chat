@@ -30,6 +30,10 @@ private let flagsWithValue: Set<String> = [
 /// `--max-context` when you actually need a longer conversation.
 private let defaultMaxContext = 8192
 
+/// Longest reply, in tokens; a conversation keeps this much of the context
+/// (at most half of it) free by dropping its oldest turns.
+private let maxReplyTokens = 1024
+
 @main
 struct GemmaChatCLI {
     static func main() async {
@@ -145,8 +149,11 @@ struct GemmaChatCLI {
             // Add user message
             history.append(ChatMessage(role: .user, content: input))
 
-            // Encode conversation
-            let promptIDs = tokenizer.encodeChatPrompt(history: history).map { Int32($0) }
+            // Encode the conversation, dropping its oldest turns if it would
+            // leave too little of the context for the reply.
+            let promptIDs = tokenizer.encodeChatPrompt(
+                history: history, budget: engine.promptBudget(reservingForReply: maxReplyTokens)
+            ).map { Int32($0) }
 
             // Check if we can reuse KV cache from the previous turn
             let (existingKV, prefillOffset) = resolveKVReuse(
@@ -162,7 +169,7 @@ struct GemmaChatCLI {
             let genStart = CFAbsoluteTimeGetCurrent()
             let stream = engine.generate(
                 promptIDs: promptIDs,
-                maxNewTokens: 1024,
+                maxNewTokens: maxReplyTokens,
                 existingKVState: existingKV,
                 prefillOffset: prefillOffset,
                 context: genContext

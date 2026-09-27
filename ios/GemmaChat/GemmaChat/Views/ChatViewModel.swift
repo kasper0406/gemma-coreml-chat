@@ -76,8 +76,8 @@ final class ChatViewModel {
     ///
     /// Every retained size is a separate set of `MLModel`s; loading every
     /// exported size OOMs on iPhone. A chat turn
-    /// plus `maxNewTokens` fits comfortably inside 2048 tokens, and the engine
-    /// truncates the prompt to `effectiveMaxSeqLen` if a conversation runs long.
+    /// plus `maxNewTokens` fits comfortably inside 2048 tokens, and a longer
+    /// conversation drops its oldest turns to keep `maxNewTokens` free.
     private static let deviceMaxContextSize = 2048
 
     /// Whether to skip prefill functions entirely and prefill via per-token
@@ -142,7 +142,8 @@ final class ChatViewModel {
             eagerPrefill = EagerPrefillManager(
                 engine: eng,
                 tokenizer: tok,
-                model: coreml
+                model: coreml,
+                promptBudget: eng.promptBudget(reservingForReply: maxNewTokens)
             )
 
             // Listen for memory warnings (view model lives for app lifetime)

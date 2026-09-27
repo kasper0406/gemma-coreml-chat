@@ -23,6 +23,9 @@ actor EagerPrefillManager {
     private let engine: InferenceEngine
     private let tokenizer: GemmaTokenizer
     private let model: CoreMLModel
+    /// Prompt tokens a conversation may use before its oldest turns are
+    /// dropped (``GemmaTokenizer/encodeChatPrompt(history:systemPrompt:budget:)``).
+    private let promptBudget: Int
 
     /// Tokens that have been prefilled so far.
     private var prefillTokens: [Int] = []
@@ -38,10 +41,11 @@ actor EagerPrefillManager {
     /// Current status for UI display.
     private(set) var status: PrefillStatus = .idle
 
-    init(engine: InferenceEngine, tokenizer: GemmaTokenizer, model: CoreMLModel) {
+    init(engine: InferenceEngine, tokenizer: GemmaTokenizer, model: CoreMLModel, promptBudget: Int) {
         self.engine = engine
         self.tokenizer = tokenizer
         self.model = model
+        self.promptBudget = promptBudget
         // Smallest materialized pair, which `CoreMLModel.load` always brings
         // up, so the state can be made without awaiting a load — safe to force.
         self.kvState = try! model.makeEmptyKVState()
@@ -84,7 +88,8 @@ actor EagerPrefillManager {
 
         let newTokens = tokenizer.encodeChatPrompt(
             history: fullHistory,
-            systemPrompt: systemPrompt
+            systemPrompt: systemPrompt,
+            budget: promptBudget
         )
 
         // Check if existing prefill is still valid
@@ -138,7 +143,8 @@ actor EagerPrefillManager {
         fullHistory.append(ChatMessage(role: .user, content: finalText))
         let finalTokens = tokenizer.encodeChatPrompt(
             history: fullHistory,
-            systemPrompt: systemPrompt
+            systemPrompt: systemPrompt,
+            budget: promptBudget
         )
         let promptIDs = finalTokens.map { Int32($0) }
 
