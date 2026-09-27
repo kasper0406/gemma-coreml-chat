@@ -1031,8 +1031,13 @@ public final class CoreMLModel: @unchecked Sendable {
         kvState: KVCacheState
     ) throws -> MLMultiArray {
         // This chunk writes cache rows startPosition ..< +count, so every one
-        // of them has to fit. The real prefill kernel would fault; the
-        // per-token loop would silently scribble past the end.
+        // of them has to fit — checked before anything, the ring included, is
+        // touched (a negative position would index the ring below slot 0).
+        guard startPosition >= 0 else {
+            throw CoreMLModelError.positionOutOfRange(
+                position: Int(startPosition), cacheSize: kvState.size
+            )
+        }
         guard Int(startPosition) + tokens.count <= kvState.size else {
             throw CoreMLModelError.positionOutOfRange(
                 position: Int(startPosition) + tokens.count - 1, cacheSize: kvState.size
@@ -1105,7 +1110,7 @@ public final class CoreMLModel: @unchecked Sendable {
         position: Int32,
         kvState: KVCacheState
     ) throws -> MLMultiArray {
-        guard Int(position) < kvState.size else {
+        guard position >= 0, Int(position) < kvState.size else {
             throw CoreMLModelError.positionOutOfRange(
                 position: Int(position), cacheSize: kvState.size
             )

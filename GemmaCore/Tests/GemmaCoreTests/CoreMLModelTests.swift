@@ -22,6 +22,10 @@ final class CoreMLModelTests: XCTestCase {
         return model
     }
 
+    private static func ring(_ kv: KVCacheState) -> [Int32] {
+        kv.ring.withUnsafeBufferPointer(ofType: Int32.self) { Array($0) }
+    }
+
     private static func floats(_ logits: MLMultiArray) -> [Float] {
         logits.withUnsafeBufferPointer(ofType: Float.self) { Array($0) }
     }
@@ -43,6 +47,32 @@ final class CoreMLModelTests: XCTestCase {
             )))
         }
         return out
+    }
+
+    /// A negative position used to pass the upper-bound check and index
+    /// `ring[-1]` (Swift's `%` keeps the sign). It must be rejected before
+    /// the ring — or anything else — is touched.
+    func testNegativePositionsAreRejectedBeforeTheRingIsTouched() async throws {
+        let model = try await Self.load()
+        let kv = try model.makeEmptyKVState()
+        let empty = Self.ring(kv)
+        XCTAssertTrue(empty.allSatisfy { $0 == -1 })
+
+        XCTAssertThrowsError(try model.decode(token: 1, position: -1, kvState: kv)) {
+            guard case CoreMLModelError.positionOutOfRange(let position, _) = $0 else {
+                return XCTFail("unexpected error \($0)")
+            }
+            XCTAssertEqual(position, -1)
+        }
+        XCTAssertThrowsError(try model.prefill(
+            tokens: [Int32](repeating: 1, count: model.chunkSize),
+            startPosition: -2, logitsRow: 0, kvState: kv
+        ))
+        XCTAssertEqual(Self.ring(kv), empty)
+
+        // The same cache still works from position 0.
+        _ = try model.decode(token: 1, position: 0, kvState: kv)
+        XCTAssertEqual(Self.ring(kv).filter { $0 >= 0 }, [0])
     }
 
     /// Every conversation shares the loaded functions — the chunks of its
