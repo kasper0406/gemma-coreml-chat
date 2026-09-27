@@ -232,9 +232,15 @@ public enum Sampling {
 
         /// Continue the walk into `band`: order it descending only as far as
         /// the running sum needs to reach `topP`, in growing chunks (64, 256,
-        /// 1024, ...) each selected by a partial sort of what is left. A band
-        /// of b keys whose walk takes c of them costs O(b·log(c)) scans plus
-        /// O(c·log c) ordering, never a sort of the whole band. Returns how
+        /// 1024, ...) each selected by a partial sort of what is left. When
+        /// the walk takes c of the band's b keys, that is O(log c) chunks, and
+        /// a chunk of k keys costs one pass over the rest of the band — a
+        /// comparison per key, plus an O(log k) heap replacement for each key
+        /// that beats the chunk's smallest so far — and a heap sort of its k
+        /// keys. The chunks order fewer than 4c + 64 keys (the last one
+        /// overshoots c), so the worst case, every key a replacement (a band
+        /// in ascending order), is O(b·log²c + c·log c); a whole-band sort
+        /// happens only when the walk needs about a quarter of it. Returns how
         /// many keys that took, or nil if the whole band did not reach it; the
         /// walked keys end up first in `band`, in descending order.
         private static func walk(
