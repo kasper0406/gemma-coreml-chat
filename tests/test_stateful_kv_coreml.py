@@ -64,9 +64,11 @@ def _trace_step():
 
     Argument order mirrors the real export: ``[N, pos, sliding, glob]`` — JAX
     prepends a dimension-variable argument for the symbolic global length.
-    Result order is ``[sliding_total, glob_total, sliding_out, glob_out]``; the
-    two sums are how the test observes cache contents once both caches are
-    state and nothing comes back out of the model.
+    Result order is ``[sliding_total, glob_total, glob_after, sliding_out,
+    glob_out]``; the sums are how the test observes cache contents once both
+    caches are state and nothing comes back out of the model.  ``glob_after``
+    reads the global cache after the write, as the attention does: a write
+    nothing reads is rejected by ``global_kv_caches_to_states``.
     """
     (N,) = jax_export.symbolic_shape("N", constraints=["N >= 1"])
 
@@ -83,7 +85,8 @@ def _trace_step():
         glob_out = jax.lax.dynamic_update_slice(glob, value, (0, pos, 0, 0))
         sliding_total = jnp.sum(sliding.astype(jnp.float32)).reshape(1)
         glob_total = jnp.sum(glob.astype(jnp.float32)).reshape(1)
-        return sliding_total, glob_total, sliding_out, glob_out
+        glob_after = jnp.sum(glob_out.astype(jnp.float32)).reshape(1)
+        return sliding_total, glob_total, glob_after, sliding_out, glob_out
 
     traced = jax.jit(step).trace(
         jax.ShapeDtypeStruct((1,), jnp.int32),                 # pos
@@ -109,8 +112,10 @@ def _build_dynamic_package(dest: Path) -> None:
     """Convert + rename + flex-shape + save, mirroring `export.py`."""
     module = _trace_step()
 
-    # arg 2 (`sliding`) becomes state, updated by result 2.
-    states = {2: StateSpec(output=2, name="sliding")}
+    # arg 2 (`sliding`) becomes state, updated by result 3.  The exporter
+    # names every cache `k_<slot>` / `v_<slot>`, the global one's write-back
+    # `k_<slot>_out` — the names `global_kv_caches_to_states` converts.
+    states = {2: StateSpec(output=3, name="k_0")}
     mil = hlo_to_mil(module, minimum_deployment_target=ct.target.iOS18, states=states)
     model = ct.convert(
         mil,
@@ -127,21 +132,21 @@ def _build_dynamic_package(dest: Path) -> None:
     # this stage; only materialization makes its shape concrete enough to be
     # state.
     assert len(spec.description.input) == 3, [i.name for i in spec.description.input]
-    assert len(spec.description.output) == 3, [o.name for o in spec.description.output]
-    assert [s.name for s in spec.description.state] == ["sliding"]
+    assert len(spec.description.output) == 4, [o.name for o in spec.description.output]
+    assert [s.name for s in spec.description.state] == ["k_0"]
 
-    for feat, new in zip(list(spec.description.input), ["N", "pos", "glob"]):
+    for feat, new in zip(list(spec.description.input), ["N", "pos", "k_1"]):
         if feat.name != new:
             rename_feature(spec, feat.name, new, rename_outputs=False)
     for feat, new in zip(
-        list(spec.description.output), ["sliding_total", "glob_total", "glob_out"],
+        list(spec.description.output), ["sliding_total", "glob_total", "glob_after", "k_1_out"],
     ):
         if feat.name != new:
             rename_feature(spec, feat.name, new, rename_inputs=False)
 
     default_shape = (1, SIZES[0], 1, HEAD_DIM)
     for feat in list(spec.description.input) + list(spec.description.output):
-        if feat.name in ("glob", "glob_out"):
+        if feat.name in ("k_1", "k_1_out"):
             _apply_flexible_dim1(feat, 1, max(SIZES), default_shape)
 
     if dest.exists():
@@ -190,12 +195,12 @@ def test_materialize_makes_every_cache_a_state(materialized_package):
     by_name = {fd.name: fd for fd in spec.description.functions}
     for size in SIZES:
         fd = by_name[f"step_{size}"]
-        assert [s.name for s in fd.state] == ["sliding", "glob"]
+        assert [s.name for s in fd.state] == ["k_0", "k_1"]
         assert [i.name for i in fd.input] == ["pos"]
-        assert [o.name for o in fd.output] == ["sliding_total", "glob_total"]
-        glob = next(s for s in fd.state if s.name == "glob")
+        assert [o.name for o in fd.output] == ["sliding_total", "glob_total", "glob_after"]
+        glob = next(s for s in fd.state if s.name == "k_1")
         assert list(glob.type.stateType.arrayType.shape) == [1, size, 1, HEAD_DIM]
-        sliding = next(s for s in fd.state if s.name == "sliding")
+        sliding = next(s for s in fd.state if s.name == "k_0")
         # The sliding cache is size-independent; the global one is not, which is
         # why the runtime cannot reuse one state across sizes any more.
         assert list(sliding.type.stateType.arrayType.shape) == [1, WINDOW, 1, HEAD_DIM]
@@ -287,7 +292,7 @@ def test_state_is_shared_across_prefill_and_decode_of_one_size(merged_package):
     names = {fd.name for fd in spec.description.functions}
     assert names == {f"{p}_{s}" for p in ("prefill", "decode") for s in SIZES}
     for fd in spec.description.functions:
-        assert [s.name for s in fd.state] == ["sliding", "glob"], fd.name
+        assert [s.name for s in fd.state] == ["k_0", "k_1"], fd.name
         assert [i.name for i in fd.input] == ["pos"], fd.name
 
     size = SIZES[0]
