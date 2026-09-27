@@ -2,6 +2,7 @@
 
 Due to KV-sharing, only **15** caches are needed for the 35-layer E2B model:
   - 12 sliding ring-buffer caches (layers 0-3, 5-8, 10-13)  shape (1, win, nkv, hd_s)
+    (exported with ``sliding_ring_length`` = win + CHUNK_SIZE rows — see there)
   - 3  global growing caches      (layers 4, 9, 14)           shape (1, Lmax, nkv, hd_g)
 
 Layers 15-34 are KV-shared: they read from layer 13 (sliding) or 14 (global) — no
@@ -27,8 +28,19 @@ from typing import Dict, List, Tuple
 import jax.numpy as jnp
 import numpy as np
 
-from gemma_chat.config import E2B_CONFIG, MAX_SEQ_LEN
+from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN
 from gemma_chat.model import AttentionType, Gemma4Config
+
+
+def sliding_ring_length(cfg: Gemma4Config = E2B_CONFIG) -> int:
+    """Rows of an exported sliding cache (and of ``sliding_pos_ring``).
+
+    The window plus one prefill chunk: a chunk is written into the ring before
+    its rows attend, and ``CHUNK_SIZE`` spare rows are what keep it from
+    overwriting positions its first rows still need.  The attention span stays
+    ``sliding_window_size`` — the mask enforces it (``decode_coreml``).
+    """
+    return cfg.sliding_window_size + CHUNK_SIZE
 
 
 @dataclasses.dataclass(frozen=True)

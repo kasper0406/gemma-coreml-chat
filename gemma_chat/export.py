@@ -130,7 +130,7 @@ from gemma_chat.weight_mapper import load_params
 from gemma_chat.decode_coreml import (
     LayerChunk, decode_chunk, layer_chunks, logits_head, prefill_chunk,
 )
-from gemma_chat.cache_spec import build_cache_specs
+from gemma_chat.cache_spec import build_cache_specs, sliding_ring_length
 from gemma_chat import host_embeddings
 
 
@@ -199,10 +199,11 @@ class _IOPlan:
 
 
 def _cache_spec_for(config: Gemma4Config, slot: int, N):
-    """Trace spec of cache slot ``slot``: sliding ones are ``(1, W, nkv, hd)``,
-    global ones ``(1, N, nkv, hd)`` with ``N`` symbolic."""
+    """Trace spec of cache slot ``slot``: sliding ones are ``(1, R, nkv, hd)``
+    (``R = sliding_ring_length``), global ones ``(1, N, nkv, hd)`` with ``N``
+    symbolic."""
     spec = build_cache_specs(config, 1)[slot]
-    length = N if spec.attn_type == AttentionType.GLOBAL else spec.cache_len
+    length = N if spec.attn_type == AttentionType.GLOBAL else sliding_ring_length(config)
     return jax.ShapeDtypeStruct((1, length, spec.num_kv_heads, spec.head_dim), jnp.float16)
 
 
@@ -261,7 +262,7 @@ def _chunk_io_plan(
             else:
                 states[base + 2 * j + half] = StateSpec(output=out, name=name)
     if uses_ring:
-        arg_specs.append(jax.ShapeDtypeStruct((1, config.sliding_window_size), jnp.int32))
+        arg_specs.append(jax.ShapeDtypeStruct((1, sliding_ring_length(config)), jnp.int32))
         input_names.append("sliding_pos_ring")
     return _IOPlan(arg_specs, has_global, states, input_names, output_names, flexible)
 

@@ -13,10 +13,23 @@ KV cache layout
 ---------------
 Only 15 of the 35 layers store their own KV (layers 15-34 are KV-shared).
 
-- **Sliding layers** (12 caches): ring-buffer shape ``(1, sliding_window_size, nkv, hd)``.
-  Slot index = ``position % sliding_window_size``.  A companion
-  ``sliding_pos_ring`` array ``(1, sliding_window_size)`` int32 tracks
-  which absolute position each slot holds (``-1`` = empty).
+- **Sliding layers** (12 caches): ring-buffer shape ``(1, R, nkv, hd)`` with
+  ``R = sliding_window_size + CHUNK_SIZE`` rows (``cache_spec.sliding_ring_length``).
+  Slot index = ``position % R``.  A companion ``sliding_pos_ring`` array
+  ``(1, R)`` int32 tracks which absolute position each slot holds (``-1`` =
+  empty), and the attention mask admits a slot only if its position lies in
+  the query's window, ``q - W < p <= q``.
+
+  Why ``W + CHUNK_SIZE`` rows rather than ``W``: a prefill call writes its
+  whole chunk into the ring before any of its rows attend.  With a ring of
+  exactly ``W`` rows, the chunk at positions ``s .. s+C-1`` overwrote positions
+  ``s-W .. s-W+C-1`` — history its *first* rows still need (row ``s`` attends
+  back to ``s-W+1``) — so every prompt longer than the window lost up to
+  ``C - 1`` positions of context per row.  With ``C`` more rows the chunk
+  overwrites only ``s-W-C .. s-W-1``, which no row of the chunk can see, and a
+  KV-shared layer in a later layer chunk still finds every position it needs
+  in the state.  Decode is one row, so it never had the problem; it pays
+  ``C/W`` = 25% more sliding keys for sharing the layout.
 - **Global layers** (3 caches): linear shape ``(1, max_seq_len, nkv, hd)``.
   Slot index = absolute position.
 
@@ -122,7 +135,7 @@ import numpy as np
 
 from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, LAYER_CHUNK_STARTS
 from gemma_chat.model import AttentionType, Gemma4Config, _apply_rope
-from gemma_chat.cache_spec import kv_shared_sources
+from gemma_chat.cache_spec import kv_shared_sources, sliding_ring_length
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +143,22 @@ from gemma_chat.cache_spec import kv_shared_sources
 # ---------------------------------------------------------------------------
 
 def empty_pos_ring(cfg: Gemma4Config = E2B_CONFIG) -> jnp.ndarray:
-    """Return (1, sliding_window_size) int32 filled with -1 (no entries)."""
-    return jnp.full((1, cfg.sliding_window_size), -1, dtype=jnp.int32)
+    """Return (1, sliding_ring_length) int32 filled with -1 (no entries)."""
+    return jnp.full((1, sliding_ring_length(cfg)), -1, dtype=jnp.int32)
+
+
+def _sliding_mask(pos_ring, pos_q, window: int):
+    """Which ring slots each query may attend: ``(len(pos_q), R)`` bool.
+
+    A slot holds absolute position ``p = pos_ring[0, slot]`` (``-1`` when
+    empty); query ``q`` sees it iff ``q - window < p <= q`` — the reference
+    model's causal sliding window (``model.GemmaAttention``).  The ring holds
+    more than ``window`` positions (see the module docstring), so the lower
+    bound is what keeps the span exact.
+    """
+    pk = pos_ring[0][jnp.newaxis, :]    # (1, R)
+    q = pos_q[:, jnp.newaxis]           # (Q, 1)
+    return (pk >= 0) & (pk <= q) & (pk > q - window)
 
 
 def _row_write(cache, value, slot):
@@ -151,9 +178,9 @@ def _row_write(cache, value, slot):
     return jnp.where(mask, value, cache)
 
 
-def _sliding_ring_write(cache, value, position, window: int):
-    """Write ``value`` into ring slot ``position % window`` of ``cache``."""
-    return _row_write(cache, value, position % window)
+def _sliding_ring_write(cache, value, position):
+    """Write ``value`` into ring slot ``position % R`` of the ``R``-row ``cache``."""
+    return _row_write(cache, value, position % cache.shape[1])
 
 
 def _chunk_write(cache, value, slots):
@@ -290,10 +317,10 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
     x: (1, 1, D)
     position: () int32 traced — absolute position of this new token
     k_cache, v_cache: (1, cache_len, nkv, hd)
-        cache_len = sliding_window_size for sliding, max_seq_len for global.
+        cache_len = sliding_ring_length for sliding, max_seq_len for global.
     shared_kv: optional (k_cache, v_cache) from source layer; if given,
                this layer reads from source and does NOT update its own cache.
-    pos_ring: (1, sliding_window_size) int32 — absolute position stored
+    pos_ring: (1, sliding_ring_length) int32 — absolute position stored
               at each ring-buffer slot.  Required for LOCAL_SLIDING layers.
 
     Returns (attn_out (1,1,D), k_cache_updated, v_cache_updated).
@@ -332,9 +359,8 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
         # k_new/v_new are already fp16 — the norms and `_apply_rope` are both
         # dtype-preserving — so they go straight into the fp16 caches.
         if is_sliding:
-            W = cfg.sliding_window_size
-            k_updated = _sliding_ring_write(k_cache, k_new, position, W)
-            v_updated = _sliding_ring_write(v_cache, v_new, position, W)
+            k_updated = _sliding_ring_write(k_cache, k_new, position)
+            v_updated = _sliding_ring_write(v_cache, v_new, position)
         else:
             # Global: linear write, row index = absolute position.
             k_updated = _row_write(k_cache, k_new, position)
@@ -343,9 +369,8 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
 
     # Attention validity mask
     if is_sliding:
-        # Ring-buffer mask: use pos_ring to find valid entries.
-        pr = pos_ring[0]  # (W,)
-        valid = (pr >= 0) & (pr <= position)
+        # Ring-buffer mask: the slots whose position is in this token's window.
+        valid = _sliding_mask(pos_ring, position[jnp.newaxis], cfg.sliding_window_size)[0]
     else:
         # Global linear mask: slot index == absolute position.
         valid = jnp.arange(max_len, dtype=jnp.int32) <= position
@@ -442,16 +467,16 @@ def layer_chunks(cfg: Gemma4Config) -> List[LayerChunk]:
     return chunks
 
 
-def ring_with_positions(ring, positions, window: int):
+def ring_with_positions(ring, positions):
     """``sliding_pos_ring`` after tokens at ``positions`` enter the ring.
 
     The **host** does this before every call (``KVCacheState`` in GemmaCore):
-    ring slot ``p % window`` records that it now holds position ``p``.  The
-    exported functions only read the ring, to build the sliding masks.  This is
-    the reference the runtime has to match.
+    ring slot ``p % R`` (``R`` the ring's length) records that it now holds
+    position ``p``.  The exported functions only read the ring, to build the
+    sliding masks.  This is the reference the runtime has to match.
     """
     positions = jnp.atleast_1d(positions)
-    return ring.at[0, positions % window].set(positions)
+    return ring.at[0, positions % ring.shape[1]].set(positions)
 
 
 def _layer(lp, i: int, x, ple_slice, attend, cfg: Gemma4Config):
@@ -516,7 +541,7 @@ def decode_chunk(params, chunk: LayerChunk, hidden, token_embed, ple_rows,
                      its raw per-layer-embedding columns for these layers.
         position:    () int32 — absolute position of the token.
         caches:      {slot: (k, v)} for every slot in ``chunk.slots``.
-        sliding_pos_ring: (1, W) int32 — already updated for ``position`` by
+        sliding_pos_ring: (1, R) int32 — already updated for ``position`` by
                      the host (see :func:`ring_with_positions`).
 
     Returns ``(hidden (1, 1, D), {slot: (k, v)} for chunk.writes)``; the
@@ -562,7 +587,7 @@ def decode_step(params, token_embed, ple_rows, position, kv_flat, sliding_pos_ri
 
     Returns ``(logits (vocab,), kv_flat_new, sliding_pos_ring_new)``.
     """
-    ring = ring_with_positions(sliding_pos_ring, position, cfg.sliding_window_size)
+    ring = ring_with_positions(sliding_pos_ring, position)
     caches = {s: (kv_flat[2 * s], kv_flat[2 * s + 1]) for s in range(len(kv_flat) // 2)}
     d = cfg.per_layer_input_dim
     hidden = token_embed
@@ -589,7 +614,7 @@ def _attn_chunk(lp, x, positions, cfg: Gemma4Config, attn_type: str,
     x: (1, C, D)  — C = CHUNK_SIZE tokens
     positions: (1, C) int32  — absolute positions
     k_cache, v_cache: (1, cache_len, nkv, hd)
-    pos_ring: (1, W) int32 — ring position tracker (required for sliding layers)
+    pos_ring: (1, R) int32 — ring position tracker (required for sliding layers)
 
     Returns (attn_out (1, C, D), k_cache_updated, v_cache_updated).
     """
@@ -619,8 +644,10 @@ def _attn_chunk(lp, x, positions, cfg: Gemma4Config, attn_type: str,
     abs_pos = positions[0]  # (C,)
     # Sliding layers wrap into the ring; global layers write at the absolute
     # position.  Either way one whole-tensor scatter (see module docstring).
+    # The ring is W + C rows long, so the chunk overwrites nothing any of its
+    # rows still attends to (see the module docstring).
     # k_new/v_new are already fp16 (the norms and `_apply_rope` preserve dtype).
-    slots = abs_pos % cfg.sliding_window_size if is_sliding else abs_pos
+    slots = abs_pos % max_len if is_sliding else abs_pos
     k_updated = _chunk_write(k_cache, k_new, slots)
     v_updated = _chunk_write(v_cache, v_new, slots)
 
@@ -637,9 +664,7 @@ def _attn_chunk(lp, x, positions, cfg: Gemma4Config, attn_type: str,
 
     pos_q = positions[0]  # (C,)
     if is_sliding:
-        # Ring-buffer mask: use pos_ring to determine validity.
-        pk = pos_ring[0]  # (W,)
-        mask = (pk[jnp.newaxis, :] >= 0) & (pk[jnp.newaxis, :] <= pos_q[:, jnp.newaxis])
+        mask = _sliding_mask(pos_ring, pos_q, cfg.sliding_window_size)  # (C, R)
     else:
         # Global linear mask.
         pos_k = jnp.arange(max_len, dtype=jnp.int32)
@@ -690,8 +715,7 @@ def _attn_chunk_shared(lp, x, positions, cfg: Gemma4Config, attn_type: str,
 
     pos_q = positions[0]
     if is_sliding:
-        pk = pos_ring[0]  # (W,)
-        mask = (pk[jnp.newaxis, :] >= 0) & (pk[jnp.newaxis, :] <= pos_q[:, jnp.newaxis])
+        mask = _sliding_mask(pos_ring, pos_q, cfg.sliding_window_size)
     else:
         pos_k = jnp.arange(max_len, dtype=jnp.int32)
         mask = pos_k[jnp.newaxis, :] <= pos_q[:, jnp.newaxis]

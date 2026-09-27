@@ -10,9 +10,13 @@
 ///
 /// The one piece of cache bookkeeping that is not state is `sliding_pos_ring`
 /// (CoreML states must be floating point): which absolute position each
-/// sliding-window slot holds, `-1` when empty. The host owns it — every step
+/// sliding-cache slot holds, `-1` when empty. The host owns it — every step
 /// records its positions in it before the chunks run (``markRing(start:count:)``)
-/// and the chunks only read it to mask their sliding layers.
+/// and the chunks only read it to mask their sliding layers. The ring (like
+/// the sliding caches) has one prefill chunk more rows than the attention
+/// window, so a chunk never overwrites a position its own rows still attend
+/// to; the chunks' masks enforce the window itself. The host only needs the
+/// ring's length, which it takes from the model.
 ///
 /// A materialized function bakes its state shapes in, so an `MLState` belongs
 /// to exactly one size N: it is created from the `state_N` function and only
@@ -142,15 +146,16 @@ public final class KVCacheState: @unchecked Sendable {
     }
 
     /// Record that positions `start ..< start + count` now occupy their
-    /// sliding slots (`p % window`), before the chunks that write them run —
-    /// the step's own tokens are visible to its sliding attention, exactly as
-    /// the graph used to update the ring itself.
+    /// sliding slots (`p % ring length`), before the chunks that write them
+    /// run — the step's own tokens are visible to its sliding attention,
+    /// exactly as the graph used to update the ring itself. `start` must not
+    /// be negative; ``CoreMLModel`` rejects such a position before it gets here.
     func markRing(start: Int32, count: Int) {
         ring.withUnsafeMutableBufferPointer(ofType: Int32.self) { ptr, _ in
-            let window = Int32(ptr.count)
+            let length = Int32(ptr.count)
             for i in 0..<Int32(count) {
                 let p = start + i
-                ptr[Int(p % window)] = p
+                ptr[Int(p % length)] = p
             }
         }
     }
