@@ -404,8 +404,9 @@ def layer_chunks(cfg: Gemma4Config) -> List[LayerChunk]:
 
     A chunk without a global-attention layer would not depend on the cache
     size at all, and every exported function except ``head`` is one per size
-    — so such a chunk (only possible in a ``--num-layers`` truncation) is
-    merged into the one before it.
+    — so such a chunk is merged into the one before it, or, when it leads the
+    model, into the one after it.  A model with no global layer at all cannot
+    be exported.
     """
     n = cfg.num_layers
     kv_shared_start = n - cfg.num_kv_shared_layers
@@ -413,14 +414,23 @@ def layer_chunks(cfg: Gemma4Config) -> List[LayerChunk]:
     starts = [s for s in LAYER_CHUNK_STARTS if 0 < s < n]
     bounds = [0] + starts + [n]
     ranges: List[range] = []
+    first = 0  # start of the next chunk: a leading sliding-only range waits here
     for a, b in zip(bounds, bounds[1:]):
         has_global = any(
             cfg.attention_types[i] == AttentionType.GLOBAL for i in range(a, b)
         )
-        if ranges and not has_global:
+        if has_global:
+            ranges.append(range(first, b))
+        elif ranges:
             ranges[-1] = range(ranges[-1].start, b)
         else:
-            ranges.append(range(a, b))
+            continue
+        first = b
+    if not ranges:
+        raise ValueError(
+            "the model has no global-attention layer, so no layer chunk depends "
+            "on the cache size; the export needs at least one"
+        )
 
     chunks = []
     for layers in ranges:

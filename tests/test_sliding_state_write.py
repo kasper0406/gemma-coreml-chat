@@ -212,6 +212,32 @@ def test_a_chunk_without_a_global_layer_joins_the_one_before(monkeypatch):
     assert [(c.layers.start, c.layers.stop) for c in chunks] == [(0, 4), (4, 7)]
 
 
+def test_a_leading_chunk_without_a_global_layer_joins_the_one_after(monkeypatch):
+    """A leading sliding-only chunk has no cache-size-dependent input, so it
+    used to be exported as a size-less ``decode_c0`` next to ``decode_c1_<N>``
+    — a layout the runtime cannot load.  Every chunk must hold a global layer."""
+    from gemma_chat.export import _chunk_io_plan
+
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 2, 3))
+    cfg = _kv_shared_config()  # S S G S G S G
+    chunks = decode_coreml.layer_chunks(cfg)
+    assert [(c.layers.start, c.layers.stop) for c in chunks] == [(0, 3), (3, 7)]
+    for k, chunk in enumerate(chunks):
+        assert _chunk_io_plan(cfg, chunk, first=k == 0, tokens=1, N=24).has_global
+
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 4))
+    assert [(c.layers.start, c.layers.stop) for c in decode_coreml.layer_chunks(E2B_CONFIG)] \
+        == [(0, E2B_CONFIG.num_layers)]
+
+
+def test_a_model_without_a_global_layer_is_rejected():
+    cfg = dataclasses.replace(
+        Gemma4Config(), attention_types=(AttentionType.LOCAL_SLIDING,) * 3,
+    )
+    with pytest.raises(ValueError, match="no global-attention layer"):
+        decode_coreml.layer_chunks(cfg)
+
+
 def test_the_shipped_chunks_all_hold_a_global_layer():
     chunks = decode_coreml.layer_chunks(E2B_CONFIG)
     assert [i for c in chunks for i in c.layers] == list(range(E2B_CONFIG.num_layers))
