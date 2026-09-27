@@ -29,6 +29,13 @@
 /// ``grownToFit(_:needed:)`` migrates the contents when the conversation
 /// outgrows it. Artifacts from before the layer chunks, the cache states or
 /// the host lookups are rejected at load — re-run `gemma-export`.
+///
+/// Every loaded function is shared: all conversations of a size run the same
+/// chunk functions, and every size runs the same `head`. Core ML's synchronous
+/// prediction is not safe to call concurrently on one `MLModel`, so each
+/// function is a ``SerialFunction`` that lets one prediction at a time through
+/// — two conversations (or a specialization warming a new size while another
+/// generates) interleave step by step rather than race.
 
 import CoreML
 import CryptoKit
@@ -92,7 +99,7 @@ public final class CoreMLModel: @unchecked Sendable {
     /// The tables the embedding-row inputs are looked up in.
     private let embeddings: HostEmbeddings
     /// The logit head, shared by every size and both phases.
-    private let head: MLModel
+    private let head: SerialFunction
 
     /// Tokens per prefill call, read from the prefill chunks' `token_embed`.
     ///
@@ -134,13 +141,6 @@ public final class CoreMLModel: @unchecked Sendable {
     /// Compute units used for all function loads.
     private let computeUnits: MLComputeUnits
 
-    /// `MLModel` isn't `Sendable`, so we can't use `Task<MLModel, Error>`
-    /// directly. Wrap it in an @unchecked-Sendable box: CoreML's own loading
-    /// is already thread-safe, and we never mutate the model instance.
-    private struct SendableMLModel: @unchecked Sendable {
-        let model: MLModel
-    }
-
     /// Per-function state: either fully loaded, or a pending load Task that
     /// concurrent callers can join rather than re-issuing the load.
     ///
@@ -149,8 +149,8 @@ public final class CoreMLModel: @unchecked Sendable {
     /// evicts, C starts T2, then B's eviction removes T2's entry and D starts
     /// T3 — two concurrent multi-GB loads of the same function.
     private enum LoadState {
-        case loaded(MLModel)
-        case loading(id: UInt64, task: Task<SendableMLModel, Error>)
+        case loaded(SerialFunction)
+        case loading(id: UInt64, task: Task<SerialFunction, Error>)
     }
 
     /// Function state keyed by function name (e.g. "decode_c0_512").
@@ -169,7 +169,7 @@ public final class CoreMLModel: @unchecked Sendable {
         ringShape: [NSNumber],
         stateNames: [String],
         embeddings: HostEmbeddings,
-        head: MLModel,
+        head: SerialFunction,
         chunkSize: Int,
         materializedSizes: [Int],
         isDecodeOnly: Bool,
@@ -177,7 +177,7 @@ public final class CoreMLModel: @unchecked Sendable {
         sourceURL: URL,
         sourceFingerprint: String?,
         computeUnits: MLComputeUnits,
-        initialFunctions: [String: MLModel]
+        initialFunctions: [String: SerialFunction]
     ) {
         self.prefillIO = prefillIO
         self.decodeIO = decodeIO
@@ -234,10 +234,10 @@ public final class CoreMLModel: @unchecked Sendable {
     /// stale K/V that a re-populated `sliding_pos_ring` marks valid again.
     public func makeEmptyKVState(size requested: Int? = nil) throws -> KVCacheState {
         let target = cacheSizePolicy.size(forNeeded: requested ?? materializedSizes[0])
-        guard let model = loadedFunction(named: Self.stateFunctionName(size: target)) else {
+        guard let function = loadedFunction(named: Self.stateFunctionName(size: target)) else {
             throw KVCacheError.functionNotLoaded(size: target)
         }
-        return try KVCacheState(size: target, caches: model.makeState(), ringShape: ringShape)
+        return try KVCacheState(size: target, caches: function.makeState(), ringShape: ringShape)
     }
 
     /// Return a cache big enough for `needed` tokens, migrating `kv` into a
@@ -553,13 +553,13 @@ public final class CoreMLModel: @unchecked Sendable {
         let bootSize = retainedSizes[0]
 
         // Serial loads keep the bootstrap's peak to one function load at a time.
-        func load(_ name: String) async throws -> MLModel {
+        func load(_ name: String) async throws -> SerialFunction {
             try await loadFunction(url: url, computeUnits: computeUnits, function: name)
         }
         let head = try await load(headFunctionName)
         let stateName = stateFunctionName(size: bootSize)
-        var loaded: [String: MLModel] = [stateName: try await load(stateName)]
-        var chunkModels: [Phase: [MLModel]] = [:]
+        var loaded: [String: SerialFunction] = [stateName: try await load(stateName)]
+        var chunkModels: [Phase: [SerialFunction]] = [:]
         for phase in effectiveDecodeOnly ? [Phase.decode] : [.decode, .prefill] {
             for k in 0..<layerChunkCount {
                 let name = chunkFunctionName(phase, chunk: k, size: bootSize)
@@ -570,13 +570,13 @@ public final class CoreMLModel: @unchecked Sendable {
         }
         Log.info("[CoreML] Loaded head + \(loaded.count) functions of size \(bootSize) (serial)")
 
-        let stateNames = loaded[stateName]!.modelDescription.stateDescriptionsByName.keys.sorted()
-        let headIO = try classifyHead(model: head)
+        let stateNames = loaded[stateName]!.model.modelDescription.stateDescriptionsByName.keys.sorted()
+        let headIO = try classifyHead(model: head.model)
         var ringShape: [NSNumber]?
         func classify(_ phase: Phase) throws -> PhaseIO {
             let names = (0..<layerChunkCount).map { chunkFunctionName(phase, chunk: $0, size: bootSize) }
             let io = try classifyPhase(
-                models: chunkModels[phase]!, names: names, stateNames: Set(stateNames),
+                models: chunkModels[phase]!.map(\.model), names: names, stateNames: Set(stateNames),
                 ringShape: &ringShape
             )
             guard io.hiddenShape[2] == headIO.inputShape[2] else {
@@ -632,12 +632,12 @@ public final class CoreMLModel: @unchecked Sendable {
     /// Load a single function by name.
     private static func loadFunction(
         url: URL, computeUnits: MLComputeUnits, function: String
-    ) async throws -> MLModel {
+    ) async throws -> SerialFunction {
         let config = MLModelConfiguration()
         config.computeUnits = computeUnits
         config.functionName = function
         do {
-            return try await MLModel.load(contentsOf: url, configuration: config)
+            return SerialFunction(try await MLModel.load(contentsOf: url, configuration: config))
         } catch {
             throw CoreMLModelError.functionLoadFailed(
                 function: function, computeUnits: computeUnitsTag(computeUnits), underlying: error
@@ -722,8 +722,8 @@ public final class CoreMLModel: @unchecked Sendable {
 
     // MARK: - Function Resolution
 
-    /// The loaded model for `name`, or nil if it hasn't been loaded yet.
-    private func loadedFunction(named name: String) -> MLModel? {
+    /// The loaded function `name`, or nil if it hasn't been loaded yet.
+    private func loadedFunction(named name: String) -> SerialFunction? {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         if case .loaded(let model) = functions[name] { return model }
@@ -732,7 +732,7 @@ public final class CoreMLModel: @unchecked Sendable {
 
     /// The loaded chunk functions of `phase` at `size`, in order, or a clear
     /// error naming the call the caller skipped.
-    private func chunkModels(_ phase: Phase, size: Int) throws -> [MLModel] {
+    private func chunkModels(_ phase: Phase, size: Int) throws -> [SerialFunction] {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return try (0..<layerChunkCount).map { k in
@@ -793,8 +793,8 @@ public final class CoreMLModel: @unchecked Sendable {
     /// load Task (either newly started by us or one a concurrent caller had
     /// already kicked off).
     private enum CacheLookup {
-        case existing(MLModel)
-        case pending(id: UInt64, task: Task<SendableMLModel, Error>)
+        case existing(SerialFunction)
+        case pending(id: UInt64, task: Task<SerialFunction, Error>)
     }
 
     /// Atomically look up `name`; if absent, start a new load Task and record
@@ -811,10 +811,8 @@ public final class CoreMLModel: @unchecked Sendable {
         }
         let url = modelURL
         let units = computeUnits
-        let task: Task<SendableMLModel, Error> = Task {
-            SendableMLModel(
-                model: try await Self.loadFunction(url: url, computeUnits: units, function: name)
-            )
+        let task: Task<SerialFunction, Error> = Task {
+            try await Self.loadFunction(url: url, computeUnits: units, function: name)
         }
         nextLoadID += 1
         let id = nextLoadID
@@ -822,7 +820,7 @@ public final class CoreMLModel: @unchecked Sendable {
         return .pending(id: id, task: task)
     }
 
-    private func markLoaded(name: String, model: MLModel) {
+    private func markLoaded(name: String, model: SerialFunction) {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         functions[name] = .loaded(model)
@@ -843,13 +841,13 @@ public final class CoreMLModel: @unchecked Sendable {
     /// Load a single function by name. Concurrent callers for the same name
     /// share one in-flight Task instead of issuing duplicate loads.
     @discardableResult
-    private func loadIfNeeded(name: String) async throws -> MLModel {
+    private func loadIfNeeded(name: String) async throws -> SerialFunction {
         switch lookupOrStart(name: name) {
         case .existing(let model):
             return model
         case .pending(let id, let task):
             do {
-                let model = try await task.value.model
+                let model = try await task.value
                 markLoaded(name: name, model: model)
                 Log.info("[CoreML] Function '\(name)' loaded.")
                 return model
@@ -1131,7 +1129,7 @@ public final class CoreMLModel: @unchecked Sendable {
         _ step: StepScratch,
         tokens: some Collection<Int32>,
         position: Int32,
-        models: [MLModel],
+        models: [SerialFunction],
         kvState: KVCacheState
     ) throws -> MLMultiArray {
         try embeddings.fill(tokens: tokens, tokenEmbed: step.tokenEmbed, pleRows: step.pleRows)
@@ -1297,6 +1295,48 @@ public final class CoreMLModel: @unchecked Sendable {
         guard !digits.isEmpty else { return false }
         let rest = String(chars.dropFirst(digits.count))
         return rest.isEmpty || rest == "_out"
+    }
+}
+
+// MARK: - Serial functions
+
+/// One loaded function, predicting one call at a time.
+///
+/// Core ML's synchronous `prediction` is not safe to call concurrently on one
+/// `MLModel`, and every conversation shares the loaded functions (see
+/// ``CoreMLModel``). The lock is uncontended in a single conversation — tens
+/// of nanoseconds against milliseconds of prediction — and when two callers do
+/// meet on a function, the second waits for the first's step to finish, which
+/// is all the hardware underneath could offer it anyway.
+final class SerialFunction: @unchecked Sendable {
+    /// For reading the description only; predict through the methods below.
+    let model: MLModel
+    private let lock = NSLock()
+
+    init(_ model: MLModel) {
+        self.model = model
+    }
+
+    func prediction(
+        from input: MLFeatureProvider, using state: MLState, options: MLPredictionOptions
+    ) throws -> MLFeatureProvider {
+        lock.lock()
+        defer { lock.unlock() }
+        return try model.prediction(from: input, using: state, options: options)
+    }
+
+    func prediction(
+        from input: MLFeatureProvider, options: MLPredictionOptions
+    ) throws -> MLFeatureProvider {
+        lock.lock()
+        defer { lock.unlock() }
+        return try model.prediction(from: input, options: options)
+    }
+
+    func makeState() -> MLState {
+        lock.lock()
+        defer { lock.unlock() }
+        return model.makeState()
     }
 }
 
