@@ -216,6 +216,9 @@ final class ChatViewModel {
         generateTask = Task { [weak self] in
             guard let self else { return }
 
+            var genIDs: [Int32] = []
+            var textStream = TextStream(tokenizer: tokenizer)
+            var failure: Error?
             do {
                 // Get prefill state (finishes any pending eager prefill)
                 let history = messages.filter { $0.role != .system }
@@ -236,8 +239,6 @@ final class ChatViewModel {
                     context: genContext
                 )
 
-                var genIDs: [Int32] = []
-                var textStream = TextStream(tokenizer: tokenizer)
                 for try await tokenID in stream {
                     if Task.isCancelled { break }
 
@@ -246,7 +247,18 @@ final class ChatViewModel {
                     streamingText += textStream.push(tokenID)
                     generatedTokenCount = genIDs.count
                 }
+            } catch {
+                failure = error
+            }
+            // However generation ended, show what the stream still held.
+            streamingText += textStream.finish()
 
+            if let failure {
+                messages.append(ChatMessage(
+                    role: .system,
+                    content: "Error: \(failure.localizedDescription)"
+                ))
+            } else {
                 // Finalize
                 let reply = tokenizer.decode(genIDs.map { Int($0) })
                 messages.append(ChatMessage(role: .assistant, content: reply))
@@ -254,12 +266,6 @@ final class ChatViewModel {
 
                 // Seed eager prefill with post-generation KV state for next turn
                 await eagerPrefill.seedFromGeneration(genContext)
-
-            } catch {
-                messages.append(ChatMessage(
-                    role: .system,
-                    content: "Error: \(error.localizedDescription)"
-                ))
             }
 
             isGenerating = false
