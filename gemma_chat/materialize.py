@@ -60,7 +60,10 @@ import coremltools as ct
 import gemma_chat.weight_shards  # noqa: F401  — caps blob files below 2 GiB
 from gemma_chat import host_embeddings
 from gemma_chat.mil_passes.concretize_cache_length import concretize_cache_length
-from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
+from gemma_chat.mil_passes.global_cache_states import (
+    check_state_writes_are_read,
+    global_kv_caches_to_states,
+)
 from gemma_chat.mil_passes.transpose_matmul_weights import transpose_matmul_weights
 
 
@@ -257,6 +260,7 @@ def _materialize_single_function(
     # runs ~2.2x slower.  See the pass docstring.
     transpose_matmul_weights().apply(prog)
     _run_dce(prog)
+    check_state_writes_are_read(prog)
 
     # After materialization, point the default at one of the new functions.
     # (The upstream helper hard-codes "main", which breaks for non-"main"
@@ -460,6 +464,8 @@ def _materialize_multifunction_source(
     # rewrite, but nothing else runs dce this late (``skip_all_passes`` is set
     # below), so without this every rewritten weight is serialized twice.
     _run_dce(prog)
+    # The final program: no state write may have lost its reader on the way.
+    check_state_writes_are_read(prog)
 
     # The source's default at the smallest size — least work on load.
     default = spec.description.defaultFunctionName or src_specs[0][0]

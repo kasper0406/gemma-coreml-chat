@@ -40,8 +40,11 @@ the 512 one is unaffected.
 A written value that only reaches the output through an ``identity`` alias
 (``updated -> attention``, ``identity(updated) -> k_4_out``) is written where
 ``updated`` is produced, not after the alias — after it, nothing would read the
-write.  And every write the pass inserts must end up with a reader: the pass
-fails the export rather than emit a sink.
+write.  And every write must end up with a reader: :func:`check_state_writes_are_read`
+fails the export rather than let a sink through.  It judges the program *after*
+dead-code elimination — a reader that DCE later removes (say, a cast nothing
+uses) would otherwise pass for one — so the pass runs DCE before checking, and
+``materialize`` checks the final program once more.
 
 Read-only caches
 ----------------
@@ -133,19 +136,36 @@ def _unaliased(var: Var) -> Var:
     return var
 
 
-def _has_live_reader(var: Var, block_outputs: set[Var]) -> bool:
-    """Whether anything that survives dead-code elimination reads ``var``.
+def check_state_writes_are_read(prog: Program) -> None:
+    """Fail if any ``coreml_update_state`` in ``prog`` has a result nothing reads.
 
-    An ``identity`` whose own result nobody reads does not count: it is what
-    is left of an output alias once the output is dropped.
+    Such a "sink" write makes ANECompiler fail the whole model (see the module
+    docstring).  Only meaningful on a program dead-code elimination has just
+    seen: until then, a dead op (an unused cast, an orphaned output alias)
+    still counts as a reader.
     """
-    for op in var.child_ops:
-        if op.op_type != "identity":
-            return True
-        out = op.outputs[0]
-        if out in block_outputs or _has_live_reader(out, block_outputs):
-            return True
-    return False
+    sinks = {
+        fname: [
+            op.name for op in func.operations
+            if op.op_type == "coreml_update_state"
+            and not op.outputs[0].child_ops
+            and op.outputs[0] not in func.outputs
+        ]
+        for fname, func in prog.functions.items()
+    }
+    sinks = {fname: names for fname, names in sinks.items() if names}
+    if sinks:
+        raise ValueError(
+            f"state writes with no reader: {sinks}; a coreml_update_state "
+            "nothing consumes makes ANECompiler fail the whole model (see "
+            "mil_passes.global_cache_states)"
+        )
+
+
+def _run_dce(prog: Program) -> None:
+    from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
+
+    PASS_REGISTRY["common::dead_code_elimination"](prog)
 
 
 @block_context_manager
@@ -209,12 +229,6 @@ def _statify_function(func: Function, caches: list[tuple[str, Var | None]]) -> N
         func.replace_uses_of_var_after_op(
             anchor_op=written.op, old_var=updated, new_var=written,
         )
-        if not _has_live_reader(written, set(func.outputs)):
-            raise ValueError(
-                f"the write-back of cache {in_name} has no reader; a "
-                "coreml_update_state nothing consumes makes ANECompiler fail "
-                "the whole model (see the module docstring)"
-            )
 
 
 @register_pass(namespace="common")
@@ -240,6 +254,10 @@ class global_kv_caches_to_states(AbstractGraphPass):
 
         if not converted:
             return
+        # Whether each write has a reader is only decidable once the dead
+        # readers are gone.
+        _run_dce(prog)
+        check_state_writes_are_read(prog)
         names = sorted({n for v in converted.values() for n in v})
         print(
             f"  global_kv_caches_to_states: {len(names)} caches → state "

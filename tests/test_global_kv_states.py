@@ -34,7 +34,7 @@ LEN = 8       # cache length ("materialized" global cache size)
 HEAD_DIM = 2
 
 
-def _build_program(alias: bool = False, reader: bool = True):
+def _build_program(alias: bool = False, reader: str = "live"):
     """A one-cache step: read the cache, write ``pos + 1`` into row ``pos``.
 
     Mirrors the materialized export in miniature: ``k_0`` in, ``k_0_out`` out,
@@ -43,7 +43,8 @@ def _build_program(alias: bool = False, reader: bool = True):
     it has just written — a reader of the updated cache (``after``).
 
     ``alias`` routes the output through an ``identity``, the way a converter
-    may name an output; ``reader=False`` leaves the write a sink.
+    may name an output; ``reader="none"`` leaves the write a sink, and
+    ``reader="dead"`` gives it only a reader dead-code elimination removes.
     """
 
     @mb.program(
@@ -73,7 +74,10 @@ def _build_program(alias: bool = False, reader: bool = True):
             name="updated" if alias else "k_0_out",
         )
         out = mb.identity(x=updated, name="k_0_out") if alias else updated
-        if not reader:
+        if reader == "none":
+            return entry, out
+        if reader == "dead":
+            mb.cast(x=updated, dtype="fp32", name="unused")
             return entry, out
         after = mb.reduce_sum(
             x=mb.cast(x=updated, dtype="fp32"), axes=[0, 1, 2, 3], keep_dims=True,
@@ -218,9 +222,12 @@ def test_the_later_readers_see_the_written_cache(statified_model):
         assert result["after"][0] == pytest.approx(running), f"at pos {pos}"
 
 
-def test_a_write_nothing_reads_fails_the_pass():
-    with pytest.raises(ValueError, match="has no reader"):
-        global_kv_caches_to_states().apply(_build_program(reader=False))
+@pytest.mark.parametrize("reader", ["none", "dead"])
+def test_a_write_nothing_reads_fails_the_pass(reader):
+    """Including a write whose only reader is dead code: dead-code elimination
+    would remove the unused cast and leave the write a sink."""
+    with pytest.raises(ValueError, match="no reader"):
+        global_kv_caches_to_states().apply(_build_program(reader=reader))
 
 
 def test_an_output_alias_is_written_where_the_value_is_produced():

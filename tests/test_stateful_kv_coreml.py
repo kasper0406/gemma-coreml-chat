@@ -64,11 +64,11 @@ def _trace_step():
 
     Argument order mirrors the real export: ``[N, pos, sliding, glob]`` — JAX
     prepends a dimension-variable argument for the symbolic global length.
-    Result order is ``[sliding_total, glob_total, glob_after, sliding_out,
-    glob_out]``; the sums are how the test observes cache contents once both
-    caches are state and nothing comes back out of the model.  ``glob_after``
-    reads the global cache after the write, as the attention does: a write
-    nothing reads is rejected by ``global_kv_caches_to_states``.
+    Result order is ``[sliding_total, sliding_after, glob_total, glob_after,
+    sliding_out, glob_out]``; the sums are how the test observes cache contents
+    once both caches are state and nothing comes back out of the model.  The
+    ``*_after`` sums read each cache after its write, as the attention does: a
+    write nothing reads is rejected by ``global_kv_caches_to_states``.
     """
     (N,) = jax_export.symbolic_shape("N", constraints=["N >= 1"])
 
@@ -84,9 +84,10 @@ def _trace_step():
         sliding_out = jnp.where(mask, value, sliding)
         glob_out = jax.lax.dynamic_update_slice(glob, value, (0, pos, 0, 0))
         sliding_total = jnp.sum(sliding.astype(jnp.float32)).reshape(1)
+        sliding_after = jnp.sum(sliding_out.astype(jnp.float32)).reshape(1)
         glob_total = jnp.sum(glob.astype(jnp.float32)).reshape(1)
         glob_after = jnp.sum(glob_out.astype(jnp.float32)).reshape(1)
-        return sliding_total, glob_total, glob_after, sliding_out, glob_out
+        return sliding_total, sliding_after, glob_total, glob_after, sliding_out, glob_out
 
     traced = jax.jit(step).trace(
         jax.ShapeDtypeStruct((1,), jnp.int32),                 # pos
@@ -115,7 +116,7 @@ def _build_dynamic_package(dest: Path) -> None:
     # arg 2 (`sliding`) becomes state, updated by result 3.  The exporter
     # names every cache `k_<slot>` / `v_<slot>`, the global one's write-back
     # `k_<slot>_out` — the names `global_kv_caches_to_states` converts.
-    states = {2: StateSpec(output=3, name="k_0")}
+    states = {2: StateSpec(output=4, name="k_0")}
     mil = hlo_to_mil(module, minimum_deployment_target=ct.target.iOS18, states=states)
     model = ct.convert(
         mil,
@@ -132,14 +133,15 @@ def _build_dynamic_package(dest: Path) -> None:
     # this stage; only materialization makes its shape concrete enough to be
     # state.
     assert len(spec.description.input) == 3, [i.name for i in spec.description.input]
-    assert len(spec.description.output) == 4, [o.name for o in spec.description.output]
+    assert len(spec.description.output) == 5, [o.name for o in spec.description.output]
     assert [s.name for s in spec.description.state] == ["k_0"]
 
     for feat, new in zip(list(spec.description.input), ["N", "pos", "k_1"]):
         if feat.name != new:
             rename_feature(spec, feat.name, new, rename_outputs=False)
     for feat, new in zip(
-        list(spec.description.output), ["sliding_total", "glob_total", "glob_after", "k_1_out"],
+        list(spec.description.output),
+        ["sliding_total", "sliding_after", "glob_total", "glob_after", "k_1_out"],
     ):
         if feat.name != new:
             rename_feature(spec, feat.name, new, rename_inputs=False)
@@ -197,7 +199,9 @@ def test_materialize_makes_every_cache_a_state(materialized_package):
         fd = by_name[f"step_{size}"]
         assert [s.name for s in fd.state] == ["k_0", "k_1"]
         assert [i.name for i in fd.input] == ["pos"]
-        assert [o.name for o in fd.output] == ["sliding_total", "glob_total", "glob_after"]
+        assert [o.name for o in fd.output] == [
+            "sliding_total", "sliding_after", "glob_total", "glob_after",
+        ]
         glob = next(s for s in fd.state if s.name == "k_1")
         assert list(glob.type.stateType.arrayType.shape) == [1, size, 1, HEAD_DIM]
         sliding = next(s for s in fd.state if s.name == "k_0")
