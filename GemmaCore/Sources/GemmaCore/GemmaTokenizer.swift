@@ -70,7 +70,7 @@ public final class GemmaTokenizer: @unchecked Sendable {
         var start = history.startIndex
         var ids = encodeChatPrompt(history: history[start...], systemPrompt: systemPrompt)
         while ids.count > budget,
-              let next = history[(start + 1)...].firstIndex(where: { $0.role == .user }) {
+              let next = history[start...].dropFirst().firstIndex(where: { $0.role == .user }) {
             start = next
             ids = encodeChatPrompt(history: history[start...], systemPrompt: systemPrompt)
         }

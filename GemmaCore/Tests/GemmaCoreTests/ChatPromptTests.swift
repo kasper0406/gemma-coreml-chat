@@ -46,4 +46,25 @@ final class ChatPromptTests: XCTestCase {
             XCTAssertEqual(Array(ids.suffix(8)), Array(full.suffix(8)))
         }
     }
+
+    /// With nothing left to drop, a prompt over its budget comes back whole
+    /// (the engine then refuses it) instead of trapping.
+    func testAPromptThatCannotShrinkComesBackWhole() async throws {
+        let tokenizer = try await exportedTokenizer()
+        let long = String(repeating: "The quick brown fox jumps over the lazy dog. ", count: 40)
+
+        let empty = tokenizer.encodeChatPrompt(history: [], budget: .max)
+        XCTAssertEqual(tokenizer.encodeChatPrompt(history: [], budget: 0), empty)
+
+        let system = tokenizer.encodeChatPrompt(history: [], systemPrompt: long, budget: .max)
+        XCTAssertGreaterThan(system.count, 400)
+        XCTAssertEqual(tokenizer.encodeChatPrompt(history: [], systemPrompt: long, budget: 10), system)
+
+        let huge = [ChatMessage(role: .user, content: long)]
+        let message = tokenizer.encodeChatPrompt(history: huge, budget: .max)
+        XCTAssertGreaterThan(message.count, 400)
+        XCTAssertEqual(tokenizer.encodeChatPrompt(history: huge, budget: 10), message)
+        let withSystem = tokenizer.encodeChatPrompt(history: huge, systemPrompt: long, budget: .max)
+        XCTAssertEqual(tokenizer.encodeChatPrompt(history: huge, systemPrompt: long, budget: 10), withSystem)
+    }
 }
