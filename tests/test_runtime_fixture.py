@@ -15,11 +15,13 @@ step that ran on the wrong state or a torn input shows up in the logits.
 
 The checked-in copy lives at ``GemmaCore/Tests/GemmaCoreTests/TinyModel.mlpackage``;
 regenerate it with ``uv run python tests/test_runtime_fixture.py``.
-``test_fixture_is_current`` compares the signatures.
+``test_fixture_is_current`` compares its content — programs, weights and
+embedding tables — with a freshly generated one.
 """
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 from pathlib import Path
@@ -29,6 +31,7 @@ import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
+from coremltools.proto import Model_pb2
 
 from gemma_chat import host_embeddings
 
@@ -141,14 +144,32 @@ def write_fixture(out: Path) -> None:
     host_embeddings.write_tables(tables, 1536, out / host_embeddings.DIR_NAME)
 
 
-def _signature(package: Path) -> str:
-    return str(ct.models.MLModel(str(package), skip_model_load=True)._spec.description)
+def _content_digest(package: Path) -> str:
+    """SHA-256 of everything the runtime reads from ``package``.
+
+    The spec (every function's program and signature) is hashed through
+    protobuf's deterministic serialization — ``model.mlmodel``'s own bytes
+    differ from save to save in map order — and every other file byte for
+    byte, except ``Manifest.json``, whose item ids are fresh UUIDs each time.
+    """
+    digest = hashlib.sha256()
+    spec = Model_pb2.Model()
+    for path in sorted(p for p in package.rglob("*") if p.is_file()):
+        rel = path.relative_to(package).as_posix()
+        if rel == "Manifest.json":
+            continue
+        data = path.read_bytes()
+        if path.name == "model.mlmodel":
+            spec.ParseFromString(data)
+            data = spec.SerializeToString(deterministic=True)
+        digest.update(rel.encode() + b"\0" + hashlib.sha256(data).digest())
+    return digest.hexdigest()
 
 
 def test_fixture_is_current(tmp_path):
     fresh = tmp_path / "TinyModel.mlpackage"
     write_fixture(fresh)
-    assert _signature(fresh) == _signature(FIXTURE), (
+    assert _content_digest(fresh) == _content_digest(FIXTURE), (
         "GemmaCore's TinyModel.mlpackage is stale; regenerate it with "
         "`uv run python tests/test_runtime_fixture.py`"
     )
