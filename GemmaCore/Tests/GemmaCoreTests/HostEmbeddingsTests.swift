@@ -29,7 +29,7 @@ final class HostEmbeddingsTests: XCTestCase {
         let pleRows = try MLMultiArray(
             shape: [1, NSNumber(value: n), NSNumber(value: embeddings.perLayer.cols)], dataType: .float16
         )
-        try embeddings.fill(tokens: expected.tokens, tokenEmbed: tokenEmbed, pleRows: pleRows)
+        try embeddings.fill(tokens: expected.tokens, tokenEmbed: tokenEmbed, pleRows: [pleRows])
 
         for (array, rows, name) in [
             (tokenEmbed, expected.token_embed, "token_embed"),
@@ -50,7 +50,41 @@ final class HostEmbeddingsTests: XCTestCase {
             shape: [1, 1, NSNumber(value: embeddings.perLayer.cols)], dataType: .float16
         )
         XCTAssertThrowsError(try embeddings.fill(
-            tokens: [Int32(embeddings.token.rows)], tokenEmbed: row, pleRows: pleRow
+            tokens: [Int32(embeddings.token.rows)], tokenEmbed: row, pleRows: [pleRow]
+        ))
+    }
+
+    /// Each layer chunk takes the per-layer columns of its own layers: slices
+    /// filled one after another must reproduce the whole row.
+    func testPerLayerSlicesTileTheRow() throws {
+        let fixtures = try XCTUnwrap(Bundle.module.url(forResource: "Fixtures", withExtension: nil))
+        let embeddings = try HostEmbeddings(packageURL: fixtures)
+        let tokens: [Int32] = [0, 3, 1]
+        let cols = embeddings.perLayer.cols
+        let tokenEmbed = try MLMultiArray(
+            shape: [1, 3, NSNumber(value: embeddings.token.cols)], dataType: .float16
+        )
+        let whole = try MLMultiArray(shape: [1, 3, NSNumber(value: cols)], dataType: .float16)
+        try embeddings.fill(tokens: tokens, tokenEmbed: tokenEmbed, pleRows: [whole])
+
+        let widths = [EmbeddingTable.groupSize, cols - EmbeddingTable.groupSize]
+        let slices = try widths.map {
+            try MLMultiArray(shape: [1, 3, NSNumber(value: $0)], dataType: .float16)
+        }
+        try embeddings.fill(tokens: tokens, tokenEmbed: tokenEmbed, pleRows: slices)
+        let bits = { (a: MLMultiArray) in a.withUnsafeBufferPointer(ofType: Float16.self) { $0.map(\.bitPattern) } }
+        let wholeBits = bits(whole)
+        for t in 0..<tokens.count {
+            var row: [UInt16] = []
+            for (slice, width) in zip(slices, widths) {
+                row += bits(slice)[(t * width)..<((t + 1) * width)]
+            }
+            XCTAssertEqual(row, Array(wholeBits[(t * cols)..<((t + 1) * cols)]), "token \(t)")
+        }
+
+        // Slices that do not cover the row are rejected.
+        XCTAssertThrowsError(try embeddings.fill(
+            tokens: tokens, tokenEmbed: tokenEmbed, pleRows: [slices[0]]
         ))
     }
 

@@ -64,7 +64,7 @@ final class ChatViewModel {
         // the next turn just re-prefills.
         Task { await eagerPrefill?.reset() }
         genContext.reset()
-        // TODO: also evict cached `MLModel` function pairs, which dwarf the KV
+        // TODO: also evict cached `MLModel` functions, which dwarf the KV
         // caches. Not done here because `CoreMLModel.getFunction` is a
         // synchronous `fatalError`-on-miss lookup: evicting while the detached
         // generate task is between `ensureLoaded` and `decode` crashes the app.
@@ -72,10 +72,10 @@ final class ChatViewModel {
         // eviction barrier that waits for in-flight predictions) first.
     }
 
-    /// Largest materialized function pair to keep resident on device.
+    /// Largest materialized size to keep resident on device.
     ///
-    /// Every retained size is a separate `MLModel`; `CoreMLModel.load`'s own
-    /// docs note that loading all 16 exported pairs OOMs on iPhone. A chat turn
+    /// Every retained size is a separate set of `MLModel`s; loading every
+    /// exported size OOMs on iPhone. A chat turn
     /// plus `maxNewTokens` fits comfortably inside 2048 tokens, and the engine
     /// truncates the prompt to `effectiveMaxSeqLen` if a conversation runs long.
     private static let deviceMaxContextSize = 2048

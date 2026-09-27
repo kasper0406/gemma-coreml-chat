@@ -175,7 +175,7 @@ struct GemmaBenchMain {
         }
 
         // A bench run's context length is fixed and known up front, so cap the
-        // materialized function pairs at the largest cache this run can touch
+        // materialized sizes at the largest cache this run can touch
         // (prompt + decode + one sampled token, plus warmup slack). Without the
         // cap every exported size stays resident, which on a 16 GB machine
         // swaps hard enough to distort the timings we're here to measure.
@@ -203,7 +203,7 @@ struct GemmaBenchMain {
             exit(3)
         }
 
-        // Bring up exactly the function pairs this run will touch, so nothing
+        // Bring up exactly the sizes this run will touch, so nothing
         // loads lazily once we are measuring.
         var neededSizes = Set<Int>()
         if args.warmup {

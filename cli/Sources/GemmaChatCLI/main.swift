@@ -21,10 +21,10 @@ private let flagsWithValue: Set<String> = [
     "--model", "--compute-units", "--log-file", "--max-context",
 ]
 
-/// Default cap on retained materialized function pairs.
+/// Default cap on retained materialized sizes.
 ///
-/// A materialized export ships a pair per size up to `GemmaConfig.maxSeqLen`,
-/// and each retained pair is a separate resident `MLModel`. Keeping all of them
+/// A materialized export ships a function set per size up to
+/// `GemmaConfig.maxSeqLen`, each function a separate resident `MLModel`. Keeping all of them
 /// swap-thrashes a 16 GB Mac, and an interactive chat session's context is
 /// bounded well below the export's ceiling anyway. Raise it with
 /// `--max-context` when you actually need a longer conversation.
@@ -73,7 +73,7 @@ struct GemmaChatCLI {
 
         // --- First-run warm-up ---
         // If the ANE / E5RT cache has never been populated for this model +
-        // compute units, compile all function pairs up front rather than
+        // compute units, compile all functions up front rather than
         // stalling mid-chat when the user crosses a context-size boundary.
         if !model.isWarmed {
             print("First launch: compiling all functions for this device (this may take a few minutes)...")

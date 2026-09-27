@@ -1,8 +1,9 @@
 /// Host-side embedding lookups for the exported model.
 ///
 /// The exported functions take embedding *rows*, not token ids: `token_embed`
-/// `[1, L, embed_dim]` and `ple_rows` `[1, L, num_layers × per_layer_dim]`,
-/// both fp16. The exporter ships the two int4 tables they come from in the
+/// `[1, L, embed_dim]` and `ple_rows` — each layer chunk the
+/// `[1, L, its_layers × per_layer_dim]` columns of the per-layer row for its
+/// own layers — both fp16. The exporter ships the two int4 tables they come from in the
 /// package's `Embeddings/` directory (see `gemma_chat/host_embeddings.py` for
 /// the format), and this type memory-maps them and dequantizes one row per
 /// token — exactly the values the old in-graph `gather` produced:
@@ -78,13 +79,18 @@ struct EmbeddingTable {
         }
     }
 
-    /// Dequantize row `token` into `out[0 ..< cols]`.
-    func writeRow(_ token: Int32, into out: UnsafeMutablePointer<Float16>) throws {
+    /// Dequantize columns `columns` of row `token` into
+    /// `out[0 ..< columns.count]`. `columns` must lie within `0 ..< cols` on
+    /// whole scale groups; the caller checks.
+    func writeRow(
+        _ token: Int32, columns: Range<Int>, into out: UnsafeMutablePointer<Float16>
+    ) throws {
         let row = Int(token)
         guard row >= 0, row < rows else {
             throw HostEmbeddingsError.tokenOutOfRange(token: token, rows: rows)
         }
         let groups = cols / Self.groupSize
+        let firstGroup = columns.lowerBound / Self.groupSize
         let bytesPerGroup = Self.groupSize / 2
         let mult = Float(multiplier)
         let scaled = multiplier != 1
@@ -94,10 +100,10 @@ struct EmbeddingTable {
                     + row * (cols / 2)
                 let s = scaleBytes.baseAddress!.assumingMemoryBound(to: Float16.self)
                     + row * groups
-                for g in 0..<groups {
+                for g in firstGroup..<(columns.upperBound / Self.groupSize) {
                     let scale = Float(s[g])
                     let src = q + g * bytesPerGroup
-                    let dst = out + g * Self.groupSize
+                    let dst = out + (g - firstGroup) * Self.groupSize
                     for j in 0..<bytesPerGroup {
                         let byte = src[j]
                         // Sign-extend each nibble: shift it to the top of an
@@ -161,26 +167,48 @@ struct HostEmbeddings: Sendable {
         self.perLayer = try table(Self.perLayerInputName)
     }
 
-    /// Fill `tokenEmbed` `[1, L, cols]` and `pleRows` `[1, L, cols]` with the
-    /// rows of `tokens` (`tokens.count == L`).
-    func fill(tokens: some Collection<Int32>, tokenEmbed: MLMultiArray, pleRows: MLMultiArray) throws {
-        try Self.fill(table: token, tokens: tokens, into: tokenEmbed)
-        try Self.fill(table: perLayer, tokens: tokens, into: pleRows)
+    /// Fill `tokenEmbed` `[1, L, cols]` with the rows of `tokens`
+    /// (`tokens.count == L`), and `pleRows` — each `[1, L, width]` — with
+    /// consecutive column slices of their per-layer rows: the first array gets
+    /// the first `width` columns, the next the following ones, and so on. The
+    /// widths must add up to the table's; each layer chunk takes the columns
+    /// of its own layers.
+    func fill(
+        tokens: some Collection<Int32>, tokenEmbed: MLMultiArray, pleRows: [MLMultiArray]
+    ) throws {
+        try Self.fill(table: token, columns: 0..<token.cols, tokens: tokens, into: tokenEmbed)
+        var start = 0
+        for array in pleRows {
+            let width = array.shape.last?.intValue ?? 0
+            guard width % EmbeddingTable.groupSize == 0, start + width <= perLayer.cols else {
+                throw KVCacheError.unexpectedBufferLayout(
+                    "per-layer slice \(array.shape) at column \(start) does not fit whole scale groups of the \(perLayer.cols)-column table"
+                )
+            }
+            try Self.fill(table: perLayer, columns: start..<(start + width), tokens: tokens, into: array)
+            start += width
+        }
+        guard start == perLayer.cols else {
+            throw KVCacheError.unexpectedBufferLayout(
+                "per-layer slices cover \(start) of the table's \(perLayer.cols) columns"
+            )
+        }
     }
 
     private static func fill(
-        table: EmbeddingTable, tokens: some Collection<Int32>, into array: MLMultiArray
+        table: EmbeddingTable, columns: Range<Int>, tokens: some Collection<Int32>,
+        into array: MLMultiArray
     ) throws {
-        guard array.dataType == .float16, array.count == tokens.count * table.cols else {
+        guard array.dataType == .float16, array.count == tokens.count * columns.count else {
             throw KVCacheError.unexpectedBufferLayout(
-                "embedding input \(array.shape) (dtype \(array.dataType.rawValue)) cannot hold \(tokens.count) rows of \(table.cols)"
+                "embedding input \(array.shape) (dtype \(array.dataType.rawValue)) cannot hold \(tokens.count) rows of \(columns.count)"
             )
         }
         try PredictionBuffer.requireTightlyPacked(array, what: "embedding input")
         try array.withUnsafeMutableBufferPointer(ofType: Float16.self) { ptr, _ in
             guard let base = ptr.baseAddress else { return }
             for (i, t) in tokens.enumerated() {
-                try table.writeRow(t, into: base + i * table.cols)
+                try table.writeRow(t, columns: columns, into: base + i * columns.count)
             }
         }
     }

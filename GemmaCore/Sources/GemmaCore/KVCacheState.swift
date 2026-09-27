@@ -2,24 +2,29 @@
 ///
 /// Every KV cache is a CoreML **state** feature: the sliding-window caches and
 /// the global-attention ones (`k_4`/`v_4`, `k_9`/`v_9`, `k_14`/`v_14`) alike.
-/// The model reads them with `read_state` and writes them back with
-/// `coreml_update_state`, so no cache tensor crosses the prediction boundary —
-/// which is what makes decode cost independent of context length. The one
-/// exception is `sliding_pos_ring`: CoreML states must be floating point, so
-/// the int32 ring stays an ordinary input/output.
+/// The layer-chunk functions read them with `read_state` and write the ones
+/// their layers own back with `coreml_update_state`, so no cache tensor
+/// crosses the prediction boundary — which is what makes decode cost
+/// independent of context length. Core ML shares states across a package's
+/// functions by name, so the one `MLState` here serves every chunk.
+///
+/// The one piece of cache bookkeeping that is not state is `sliding_pos_ring`
+/// (CoreML states must be floating point): which absolute position each
+/// sliding-window slot holds, `-1` when empty. The host owns it — every step
+/// records its positions in it before the chunks run (``markRing(start:count:)``)
+/// and the chunks only read it to mask their sliding layers.
 ///
 /// A materialized function bakes its state shapes in, so an `MLState` belongs
-/// to exactly one size N: it is created from the `decode_N` / `prefill_N`
-/// handle and no other pair will accept it. Growing the context therefore means
-/// allocating a state on the *next* size's handle and migrating the contents —
-/// see ``CoreMLModel/grownToFit(_:needed:)``.
+/// to exactly one size N: it is created from the `state_N` function and only
+/// that size's chunks accept it. Growing the context therefore means
+/// allocating a state for the *next* size and migrating the contents — see
+/// ``CoreMLModel/grownToFit(_:needed:)``.
 ///
-/// This object also owns the per-conversation prediction scratch: the ring
-/// double buffer, the reusable embedding-row and position input buffers, and
-/// the logits output backings. Keeping them here rather than on
-/// ``CoreMLModel`` is what lets two caches coexist (iOS runs an eager-prefill
-/// cache alongside the one the current generation is decoding into) without
-/// writing over each other.
+/// This object also owns the per-conversation prediction scratch: the ring,
+/// the reusable input buffers and feature providers, and the output backings.
+/// Keeping them here rather than on ``CoreMLModel`` is what lets two caches
+/// coexist (iOS runs an eager-prefill cache alongside the one the current
+/// generation is decoding into) without writing over each other.
 ///
 /// A conversation reset means a *fresh* `KVCacheState`, never a reused one with
 /// a cleared ring: stale K/V left in a sliding slot becomes valid again the
@@ -31,8 +36,8 @@ import Foundation
 
 /// Errors raised while allocating, migrating, or feeding the KV cache.
 public enum KVCacheError: Error, LocalizedError {
-    /// A state can only be made from the function pair it belongs to, and that
-    /// pair has not been loaded yet.
+    /// A state can only be made from the size it belongs to, and that size's
+    /// functions have not been loaded yet.
     case functionNotLoaded(size: Int)
     /// Could not allocate a prediction buffer of the requested shape.
     case bufferAllocationFailed(shape: [Int], dataType: MLMultiArrayDataType)
@@ -90,108 +95,94 @@ public struct KVCacheSizePolicy: Sendable {
 /// Live KV cache for one conversation, bound to one materialized size.
 ///
 /// Predictions mutate it in place (the `MLState` buffers by the model itself,
-/// the ring by the double-buffer swap below), so callers hold one instance for
-/// as long as the conversation lives rather than threading snapshots around.
+/// the ring by the host), so callers hold one instance for as long as the
+/// conversation lives rather than threading snapshots around.
 public final class KVCacheState: @unchecked Sendable {
-    /// Materialized cache length this state is bound to. Only the
-    /// `decode_<size>` / `prefill_<size>` pair accepts it.
+    /// Materialized cache length this state is bound to. Only that size's
+    /// functions accept it.
     public let size: Int
 
-    /// All KV caches, sliding and global, updated in place by every prediction.
+    /// All KV caches, sliding and global, updated in place by the chunks.
     let caches: MLState
 
-    /// `sliding_pos_ring`, double-buffered: `ring` holds the live contents fed
-    /// to the next prediction and `ringSpare` is handed to CoreML as that same
-    /// prediction's output backing. One buffer cannot be both — CoreML would be
-    /// reading the ring while overwriting it.
-    private var ringBuffers: [MLMultiArray]
-    private var ringIndex = 0
+    /// `sliding_pos_ring`: the absolute position each sliding slot holds.
+    let ring: MLMultiArray
 
-    /// Reusable int32 scalar for the position input. Allocating inputs per
-    /// decode step showed up as pure overhead once the KV caches stopped
-    /// crossing the boundary.
+    /// Reusable int32 scalar for the `position` input.
     let positionScalar: MLMultiArray
 
-    /// Reusable fp16 `token_embed` / `ple_rows` inputs, one pair per function
-    /// kind, allocated on first use — a cache that only ever decodes never
-    /// pays for the `[1, chunk, …]` prefill pair.
-    private var decodeEmbeddingInputs: EmbeddingInputs?
-    private var prefillEmbeddingInputs: EmbeddingInputs?
+    /// Per-phase input buffers, providers and output backings, built on first
+    /// use — a cache that only ever decodes never pays for the prefill ones.
+    private var steps: [CoreMLModel.Phase: StepScratch] = [:]
 
-    /// Decode logits output backings, alternating so the array returned by step
-    /// N survives until step N+1 has been sampled. Allocated on first decode,
-    /// so a cache that only ever prefills never pays for them.
-    private var decodeLogitsBackings: [MLMultiArray] = []
-    private var decodeLogitsIndex = 0
-
-    /// Prefill logits output backing (`[chunkSize, vocab]`), allocated on first
-    /// prefill. Single, not double: the caller copies the one row it wants out
-    /// before the next chunk runs.
-    private var prefillLogitsBacking: MLMultiArray?
+    /// Logits output backings with their prediction options, alternating so
+    /// the array returned by step N survives until step N+1 has been sampled.
+    private var logits: [(backing: MLMultiArray, options: MLPredictionOptions)] = []
+    private var logitsIndex = 0
 
     /// Set once CoreML has been seen to ignore an output backing, so the
     /// diagnostic is logged a single time per conversation instead of per step.
     private var warnedAboutIgnoredBacking = false
 
-    init(
-        size: Int,
-        caches: MLState,
-        ringShape: [NSNumber],
-        ringDataType: MLMultiArrayDataType
-    ) throws {
+    init(size: Int, caches: MLState, ringShape: [NSNumber]) throws {
         self.size = size
         self.caches = caches
         // -1 is the "empty slot" sentinel: a zeroed ring would claim position 0
         // is live in every sliding slot.
-        self.ringBuffers = [
-            try PredictionBuffer.make(shape: ringShape, dataType: ringDataType, fill: -1),
-            try PredictionBuffer.make(shape: ringShape, dataType: ringDataType, fill: -1),
-        ]
+        self.ring = try PredictionBuffer.make(shape: ringShape, dataType: .int32, fill: -1)
         self.positionScalar = try MLMultiArray(shape: [1], dataType: .int32)
     }
 
     // MARK: - Prediction scratch
 
-    /// The ring contents to feed the next prediction.
-    var ring: MLMultiArray { ringBuffers[ringIndex] }
-
-    /// The buffer to hand CoreML as the next prediction's ring output backing.
-    var ringSpare: MLMultiArray { ringBuffers[1 - ringIndex] }
-
-    /// Take `produced` — whatever the prediction actually returned for the ring
-    /// output — as the new live ring. When CoreML honoured our backing this is
-    /// a pointer swap; when it allocated its own buffer we copy into the spare,
-    /// because the framework's buffer may be recycled by the next prediction.
-    func adoptRing(_ produced: MLMultiArray) throws {
-        if produced !== ringSpare {
-            noteIgnoredBacking("sliding_pos_ring")
-            try PredictionBuffer.copyPrefix(from: produced, to: ringSpare, what: "sliding_pos_ring")
+    func setPosition(_ position: Int32) {
+        positionScalar.withUnsafeMutableBufferPointer(ofType: Int32.self) { ptr, _ in
+            ptr[0] = position
         }
-        ringIndex = 1 - ringIndex
     }
 
-    /// Next decode logits backing, alternating between two buffers.
-    func nextDecodeLogitsBacking(
-        shape: [NSNumber], dataType: MLMultiArrayDataType
-    ) throws -> MLMultiArray {
-        if decodeLogitsBackings.isEmpty {
-            decodeLogitsBackings = [
-                try PredictionBuffer.make(shape: shape, dataType: dataType),
-                try PredictionBuffer.make(shape: shape, dataType: dataType),
-            ]
+    /// Record that positions `start ..< start + count` now occupy their
+    /// sliding slots (`p % window`), before the chunks that write them run —
+    /// the step's own tokens are visible to its sliding attention, exactly as
+    /// the graph used to update the ring itself.
+    func markRing(start: Int32, count: Int) {
+        ring.withUnsafeMutableBufferPointer(ofType: Int32.self) { ptr, _ in
+            let window = Int32(ptr.count)
+            for i in 0..<Int32(count) {
+                let p = start + i
+                ptr[Int(p % window)] = p
+            }
         }
-        decodeLogitsIndex = 1 - decodeLogitsIndex
-        return decodeLogitsBackings[decodeLogitsIndex]
     }
 
-    /// The prefill logits backing, allocated on first use.
-    func prefillLogits(
-        shape: [NSNumber], dataType: MLMultiArrayDataType
-    ) throws -> MLMultiArray {
-        if let existing = prefillLogitsBacking { return existing }
-        let fresh = try PredictionBuffer.make(shape: shape, dataType: dataType)
-        prefillLogitsBacking = fresh
+    /// The reusable buffers and feature providers for `phase`.
+    func step(
+        _ phase: CoreMLModel.Phase, io: CoreMLModel.PhaseIO, headIO: CoreMLModel.HeadIO
+    ) throws -> StepScratch {
+        if let existing = steps[phase] { return existing }
+        let fresh = try StepScratch(
+            phase: phase, io: io, headIO: headIO, position: positionScalar, ring: ring
+        )
+        steps[phase] = fresh
         return fresh
+    }
+
+    /// Next logits backing and the options that hand it to `head`.
+    func nextLogits(
+        _ headIO: CoreMLModel.HeadIO
+    ) throws -> (backing: MLMultiArray, options: MLPredictionOptions) {
+        if logits.isEmpty {
+            logits = try (0..<2).map { _ in
+                let backing = try PredictionBuffer.make(
+                    shape: headIO.logitsShape, dataType: headIO.logitsDataType
+                )
+                let options = MLPredictionOptions()
+                options.outputBackings = [CoreMLModel.Feature.logits: backing]
+                return (backing, options)
+            }
+        }
+        logitsIndex = 1 - logitsIndex
+        return logits[logitsIndex]
     }
 
     /// Log once per conversation that CoreML declined a preallocated backing —
@@ -200,27 +191,6 @@ public final class KVCacheState: @unchecked Sendable {
         guard !warnedAboutIgnoredBacking else { return }
         warnedAboutIgnoredBacking = true
         Log.info("[CoreML] Output backing for '\(feature)' was not used by the framework — predictions will allocate their own buffers")
-    }
-
-    /// Write a scalar into one of the reusable int32 inputs.
-    func setScalar(_ value: Int32, in array: MLMultiArray) {
-        array.withUnsafeMutableBufferPointer(ofType: Int32.self) { ptr, _ in
-            ptr[0] = value
-        }
-    }
-
-    /// The reusable embedding-row inputs for `io`, the prefill or decode
-    /// function's signature.
-    func embeddingInputs(prefill: Bool, io: CoreMLModel.FunctionIO) throws -> EmbeddingInputs {
-        if let existing = prefill ? prefillEmbeddingInputs : decodeEmbeddingInputs {
-            return existing
-        }
-        let fresh = EmbeddingInputs(
-            tokenEmbed: try PredictionBuffer.make(shape: io.tokenEmbedShape, dataType: .float16),
-            pleRows: try PredictionBuffer.make(shape: io.pleRowsShape, dataType: .float16)
-        )
-        if prefill { prefillEmbeddingInputs = fresh } else { decodeEmbeddingInputs = fresh }
-        return fresh
     }
 
     // MARK: - Growth
@@ -247,10 +217,51 @@ public final class KVCacheState: @unchecked Sendable {
     }
 }
 
-/// One function's `token_embed` / `ple_rows` input buffers, fp16.
-struct EmbeddingInputs {
+/// One phase's reusable prediction plumbing: the input buffers the host fills,
+/// each chunk's output backing, and feature providers / prediction options
+/// built once around them. Chunk `k` reads `hidden[k - 1]` and writes
+/// `hidden[k]`; `head` reads `headInput`.
+final class StepScratch {
     let tokenEmbed: MLMultiArray
-    let pleRows: MLMultiArray
+    /// One per chunk: that chunk's columns of the per-layer rows.
+    let pleRows: [MLMultiArray]
+    /// One per chunk: its `hidden_out` backing, `[1, L, D]`.
+    let hidden: [MLMultiArray]
+    let chunkInputs: [MLFeatureProvider]
+    let chunkOptions: [MLPredictionOptions]
+    /// `head`'s input: decode reads the last chunk's output directly; prefill
+    /// copies the one row it needs into a `[1, 1, D]` buffer of its own.
+    let headInput: MLMultiArray
+    let headInputs: MLFeatureProvider
+
+    init(
+        phase: CoreMLModel.Phase, io: CoreMLModel.PhaseIO, headIO: CoreMLModel.HeadIO,
+        position: MLMultiArray, ring: MLMultiArray
+    ) throws {
+        typealias F = CoreMLModel.Feature
+        tokenEmbed = try PredictionBuffer.make(shape: io.hiddenShape, dataType: .float16)
+        pleRows = try io.chunks.map { try PredictionBuffer.make(shape: $0.pleRowsShape, dataType: .float16) }
+        hidden = try io.chunks.map { _ in try PredictionBuffer.make(shape: io.hiddenShape, dataType: .float16) }
+        var inputs: [MLFeatureProvider] = []
+        var options: [MLPredictionOptions] = []
+        for (k, chunk) in io.chunks.enumerated() {
+            var values: [String: MLMultiArray] = [
+                F.tokenEmbed: tokenEmbed, F.pleRows: pleRows[k], F.position: position,
+            ]
+            if chunk.takesHidden { values[F.hidden] = hidden[k - 1] }
+            if chunk.takesRing { values[F.ring] = ring }
+            inputs.append(CoreMLInputProvider(values: values))
+            let o = MLPredictionOptions()
+            o.outputBackings = [F.hiddenOut: hidden[k]]
+            options.append(o)
+        }
+        chunkInputs = inputs
+        chunkOptions = options
+        headInput = phase == .decode
+            ? hidden[hidden.count - 1]
+            : try PredictionBuffer.make(shape: headIO.inputShape, dataType: .float16)
+        headInputs = CoreMLInputProvider(values: [F.hidden: headInput])
+    }
 }
 
 // MARK: - Prediction buffers
@@ -262,9 +273,8 @@ enum PredictionBuffer {
     /// fp16 buffers are IOSurface-backed (via `CVPixelBuffer`), so a GPU or ANE
     /// prediction writes its result straight into memory we already own instead
     /// of into a framework surface we then copy out of. Everything else — the
-    /// int32 ring, and fp32 logits from an export that hasn't moved to fp16 —
-    /// gets a page-aligned allocation, the layout CoreML documents for
-    /// user-allocated backings.
+    /// int32 ring and the fp32 logits — gets a page-aligned allocation, the
+    /// layout CoreML documents for user-allocated backings.
     ///
     /// Either way the result is tightly packed: an IOSurface whose row pitch
     /// forced padding is rejected in favour of the aligned allocation, so the
@@ -359,6 +369,27 @@ enum PredictionBuffer {
             dst.withUnsafeMutableBytes { destination, _ in
                 guard let s = source.baseAddress, let d = destination.baseAddress else { return }
                 memcpy(d, s, bytes)
+            }
+        }
+    }
+
+    /// Copy row `row` of `[…, rows, width]` `src` into `dst`, which holds
+    /// exactly one row of the same dtype.
+    static func copyRow(_ row: Int, of src: MLMultiArray, into dst: MLMultiArray) throws {
+        try requireTightlyPacked(src, what: "row source")
+        try requireTightlyPacked(dst, what: "row destination")
+        let width = src.shape.last?.intValue ?? src.count
+        guard src.dataType == dst.dataType, dst.count == width,
+              row >= 0, row < src.count / max(width, 1) else {
+            throw KVCacheError.unexpectedBufferLayout(
+                "cannot copy row \(row) of \(src.shape) into \(dst.shape)"
+            )
+        }
+        let bytes = width * bytesPerElement(of: src.dataType)
+        src.withUnsafeBytes { source in
+            dst.withUnsafeMutableBytes { destination, _ in
+                guard let s = source.baseAddress, let d = destination.baseAddress else { return }
+                memcpy(d, s.advanced(by: row * bytes), bytes)
             }
         }
     }
