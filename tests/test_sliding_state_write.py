@@ -334,43 +334,85 @@ def test_state_io_plan_declares_every_cache_read_only():
 # ── 5. The sliding window is exact, prefill and decode alike ──────────────
 
 
-def _run_prefill_then_decode(params, cfg, tokens, chunk_size, max_seq_len):
-    """Prefill ``tokens[:, :P]`` chunk by chunk (P the largest multiple of the
-    chunk that leaves a token to decode), decode the rest one by one, the way
-    the runtime does, and return every position's logits."""
-    token_embed, ple_rows = _host_rows(params, tokens, cfg)
-    caches = _empty_caches(cfg, max_seq_len)
-    ring = empty_pos_ring(cfg)
-    d = cfg.per_layer_input_dim
-    T = tokens.shape[1]
-    P = (T - 1) // chunk_size * chunk_size
+class _Runtime:
+    """The GemmaCore runtime's cache handling (``InferenceEngine`` /
+    ``KVCacheState`` / ``CoreMLModel.grownToFit``) over the JAX chunk
+    functions, for one conversation.
 
-    def run(step, start, count, extra):
-        nonlocal ring
-        ring = decode_coreml.ring_with_positions(ring, start + jnp.arange(count))
-        rows = slice(start, start + count)
-        hidden = token_embed[:, rows]
+    * Prefill runs whole chunks from a chunk boundary: the final one is
+      right-padded with token 0, and the padding is written into the caches
+      and marked in the ring like any token.  Only the last real row's logits
+      are kept.
+    * Decode writes one position at a time — over the padding, first.
+    * The global caches have one of ``sizes`` rows; outgrowing it copies them
+      into zeroed caches of the next size (the first rows, as
+      ``PredictionBuffer.copyPrefix`` does) and keeps the sliding caches and
+      the ring unchanged.
+    """
+
+    def __init__(self, params, cfg, chunk_size, sizes):
+        self.params, self.cfg, self.chunk_size, self.sizes = params, cfg, chunk_size, sizes
+        self.size = sizes[0]
+        self.caches = _empty_caches(cfg, self.size)
+        self.ring = empty_pos_ring(cfg)
+        self.grown = []
+
+    def grow_to_fit(self, needed):
+        size = next(s for s in self.sizes if s >= needed)
+        if size == self.size:
+            return
+        fresh = _empty_caches(self.cfg, size)
+        for slot, pair in self.caches.items():
+            rows = pair[0].shape[1]
+            fresh[slot] = tuple(new.at[:, :rows].set(old) for old, new in zip(pair, fresh[slot]))
+        self.caches, self.size = fresh, size
+        self.grown.append(size)
+
+    def _run(self, step, tokens, start, extra):
+        cfg, d = self.cfg, self.cfg.per_layer_input_dim
+        count = tokens.shape[1]
+        self.ring = decode_coreml.ring_with_positions(self.ring, start + jnp.arange(count))
+        token_embed, ple_rows = _host_rows(self.params, tokens, cfg)
+        hidden = token_embed
         for chunk in decode_coreml.layer_chunks(cfg):
-            cols = ple_rows[:, rows, chunk.layers.start * d:chunk.layers.stop * d]
+            cols = ple_rows[:, :, chunk.layers.start * d:chunk.layers.stop * d]
             hidden, written = step(
-                params, chunk, hidden, token_embed[:, rows], cols, jnp.int32(start),
-                {s: caches[s] for s in chunk.slots}, ring, cfg, **extra,
+                self.params, chunk, hidden, token_embed, cols, jnp.int32(start),
+                {s: self.caches[s] for s in chunk.slots}, self.ring, cfg, **extra,
             )
-            caches.update(written)
-        return [decode_coreml.logits_head(params, hidden[:, r:r + 1], cfg) for r in range(count)]
+            self.caches.update(written)
+        return hidden
 
-    logits = []
-    for start in range(0, P, chunk_size):
-        logits += run(decode_coreml.prefill_chunk, start, chunk_size, {"chunk_size": chunk_size})
-    for position in range(P, T):
-        logits += run(decode_coreml.decode_chunk, position, 1, {})
-    return np.stack([np.asarray(x, np.float32) for x in logits])
+    def prefill(self, ids, offset):
+        """``continuePrefill``: ``ids[:, offset:]`` from the chunk holding
+        ``offset``; returns the last real token's logits."""
+        C, n = self.chunk_size, ids.shape[1]
+        padded_len = -(-n // C) * C
+        padded = jnp.concatenate([ids, jnp.zeros((1, padded_len - n), jnp.int32)], axis=1)
+        self.grow_to_fit(padded_len)
+        for start in range(offset // C * C, padded_len, C):
+            hidden = self._run(decode_coreml.prefill_chunk, padded[:, start:start + C],
+                               start, {"chunk_size": C})
+        real = n - (padded_len - C)
+        return decode_coreml.logits_head(self.params, hidden[:, real - 1:real], self.cfg)
+
+    def decode(self, token, position):
+        self.grow_to_fit(position + 1)
+        hidden = self._run(decode_coreml.decode_chunk, token, position, {})
+        return decode_coreml.logits_head(self.params, hidden, self.cfg)
 
 
 @pytest.mark.parametrize("starts", [(0,), (0, 3, 5)])
-def test_every_row_attends_exactly_its_window(monkeypatch, small_ring, starts):
-    """Chunked prefill + decode against the reference model's full-sequence
-    attention, far past the window.
+@pytest.mark.parametrize("prompt", [13, 15, 16])
+def test_every_row_attends_exactly_its_window(monkeypatch, small_ring, starts, prompt):
+    """A two-turn conversation through the runtime's cache handling against
+    the reference model's full-sequence attention, far past the window.
+
+    Turn one prefills ``prompt`` tokens (the final chunk holding 1, 3 or 4
+    real rows), decodes over the padding and grows the global caches from 16
+    to 32 rows mid-reply; turn two prefills from the chunk its new tokens
+    start in and decodes on.  Every position the runtime produces logits for
+    is compared.
 
     A prefill chunk is written into the sliding ring before its rows attend.
     With a ring of exactly ``window`` rows the chunk overwrote positions its
@@ -386,14 +428,29 @@ def test_every_row_attends_exactly_its_window(monkeypatch, small_ring, starts):
     monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", starts)
     cfg = _kv_shared_config()  # window 8
     params = _tiny_params(cfg)
-    tokens = jnp.asarray(
-        np.random.default_rng(1).integers(0, cfg.num_embed, (1, 27)), jnp.int32,
+    reply, turn_two, reply_two = 9, 6, 5
+    total = prompt + reply + turn_two + reply_two
+    ids = jnp.asarray(
+        np.random.default_rng(1).integers(1, cfg.num_embed, (1, total)), jnp.int32,
     )
 
     model = Gemma4Transformer(config=cfg, rngs=nnx.Rngs(params=0))
     load_params_into_model(model, params, cfg)
-    want = np.asarray(model(tokens)[0], np.float32)
+    want = np.asarray(model(ids)[0], np.float32)
 
-    got = _run_prefill_then_decode(params, cfg, tokens, small_ring, max_seq_len=32)
-    err = np.abs(got - want).max(axis=-1)
-    assert err.max() < 0.1, f"per-position max |logit error|: {np.round(err, 3)}"
+    rt = _Runtime(params, cfg, small_ring, sizes=(16, 32, 64))
+    got = {}
+
+    def converse(prompt_end, offset, reply_len):
+        got[prompt_end - 1] = rt.prefill(ids[:, :prompt_end], offset)
+        for p in range(prompt_end, prompt_end + reply_len):
+            got[p] = rt.decode(ids[:, p:p + 1], p)
+
+    converse(prompt, 0, reply)
+    assert rt.grown == [32], "turn one has to grow the cache mid-reply"
+    converse(prompt + reply + turn_two, prompt + reply, reply_two)
+
+    positions = sorted(got)
+    err = np.abs(np.stack([np.asarray(got[p], np.float32) for p in positions])
+                 - want[positions]).max(axis=-1)
+    assert err.max() < 0.1, f"max |logit error| at {positions}: {np.round(err, 3)}"
