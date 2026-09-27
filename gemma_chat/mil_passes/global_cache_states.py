@@ -136,23 +136,30 @@ def _unaliased(var: Var) -> Var:
     return var
 
 
+def _unread_state_writes(block) -> list[str]:
+    """Names of the ``coreml_update_state`` ops in ``block`` — and in every
+    block nested in its ops (``cond`` branches, loop bodies) — whose result
+    nothing in their own block reads and that block does not return."""
+    sinks = []
+    for op in block.operations:
+        for inner in op.blocks:
+            sinks += _unread_state_writes(inner)
+        if (op.op_type == "coreml_update_state" and not op.outputs[0].child_ops
+                and op.outputs[0] not in block.outputs):
+            sinks.append(op.name)
+    return sinks
+
+
 def check_state_writes_are_read(prog: Program) -> None:
-    """Fail if any ``coreml_update_state`` in ``prog`` has a result nothing reads.
+    """Fail if any ``coreml_update_state`` in ``prog``, at any block depth, has
+    a result nothing reads.
 
     Such a "sink" write makes ANECompiler fail the whole model (see the module
     docstring).  Only meaningful on a program dead-code elimination has just
     seen: until then, a dead op (an unused cast, an orphaned output alias)
     still counts as a reader.
     """
-    sinks = {
-        fname: [
-            op.name for op in func.operations
-            if op.op_type == "coreml_update_state"
-            and not op.outputs[0].child_ops
-            and op.outputs[0] not in func.outputs
-        ]
-        for fname, func in prog.functions.items()
-    }
+    sinks = {fname: _unread_state_writes(func) for fname, func in prog.functions.items()}
     sinks = {fname: names for fname, names in sinks.items() if names}
     if sinks:
         raise ValueError(

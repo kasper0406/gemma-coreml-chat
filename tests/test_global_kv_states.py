@@ -28,7 +28,10 @@ import pytest
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 
-from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
+from gemma_chat.mil_passes.global_cache_states import (
+    check_state_writes_are_read,
+    global_kv_caches_to_states,
+)
 
 LEN = 8       # cache length ("materialized" global cache size)
 HEAD_DIM = 2
@@ -228,6 +231,44 @@ def test_a_write_nothing_reads_fails_the_pass(reader):
     would remove the unused cast and leave the write a sink."""
     with pytest.raises(ValueError, match="no reader"):
         global_kv_caches_to_states().apply(_build_program(reader=reader))
+
+
+@pytest.mark.parametrize("read", [False, True])
+def test_a_write_inside_a_nested_block_is_checked_too(read):
+    """A write in a ``cond`` branch is judged in its own block: read there, or
+    returned from it, it is consumed; otherwise it is a sink."""
+
+    @mb.program(
+        input_specs=[
+            mb.TensorSpec((1,), dtype=types.bool),
+            mb.StateTensorSpec((1, LEN, 1, HEAD_DIM), dtype=types.fp16),
+        ],
+        opset_version=ct.target.iOS18,
+    )
+    def prog(flag, k_0):
+        cache = mb.read_state(input=k_0)
+
+        def write():
+            written = mb.coreml_update_state(
+                state=k_0, value=mb.add(x=cache, y=np.float16(1)),
+            )
+            return mb.reduce_sum(x=written, keep_dims=False) if read \
+                else mb.reduce_sum(x=cache, keep_dims=False)
+
+        def keep():
+            return mb.reduce_sum(x=cache, keep_dims=False)
+
+        return mb.cond(pred=mb.squeeze(x=flag), _true_fn=write, _false_fn=keep, name="out")
+
+    nested = [op for op in prog.functions["main"].operations if op.blocks]
+    assert nested and any(
+        o.op_type == "coreml_update_state" for b in nested[0].blocks for o in b.operations
+    )
+    if read:
+        check_state_writes_are_read(prog)
+    else:
+        with pytest.raises(ValueError, match="no reader"):
+            check_state_writes_are_read(prog)
 
 
 def test_an_output_alias_is_written_where_the_value_is_produced():
