@@ -23,7 +23,7 @@ import pytest
 
 from gemma_chat import decode_coreml
 from gemma_chat.cache_spec import build_cache_specs
-from gemma_chat.config import E2B_CONFIG, MAX_SEQ_LEN
+from gemma_chat.config import E2B_CONFIG
 from gemma_chat.decode_coreml import _sliding_ring_write, decode_step, empty_pos_ring
 from gemma_chat.model import AttentionType, Gemma4Config, _embed_lookup
 
@@ -184,65 +184,103 @@ def test_decode_step_unchanged_by_the_reformulation(monkeypatch):
     assert any(np.any(c != 0) for c in new_kv)
 
 
-# ── 3. The export-side state mapping ───────────────────────────────────────
+# ── 3. Layer chunks compose to the whole model ────────────────────────────
 
 
-def test_kv_export_plan_indices_and_names():
-    from gemma_chat.export import _LEADING_INPUTS, _kv_export_plan
-
-    specs = build_cache_specs(E2B_CONFIG, MAX_SEQ_LEN)
-    sliding = [i for i, s in enumerate(specs)
-               if s.attn_type == AttentionType.LOCAL_SLIDING]
-    globals_ = [i for i, s in enumerate(specs)
-                if s.attn_type == AttentionType.GLOBAL]
-    assert (len(sliding), len(globals_)) == (12, 3)
-
-    leading = _LEADING_INPUTS["decode"]
-    assert leading == _LEADING_INPUTS["prefill"][:2] + ["position"]
-    states, kv_in, kv_out = _kv_export_plan(specs, has_global=True,
-                                            num_leading=len(leading))
-
-    # Traced args: [N, token_embed, ple_rows, position] + kv_flat + [sliding_pos_ring]
-    # Traced outs: [logits] + kv_flat_out + [sliding_pos_ring_out]
-    base = 4
-    n_args = base + 2 * len(specs) + 1
-    n_outs = 1 + 2 * len(specs) + 1
-
-    assert set(states) == {
-        base + 2 * slot + half for slot in sliding for half in (0, 1)
-    }
-    for slot in sliding:
-        k_spec = states[base + 2 * slot]
-        v_spec = states[base + 2 * slot + 1]
-        assert (k_spec.name, k_spec.output) == (f"k_{slot}", 1 + 2 * slot)
-        assert (v_spec.name, v_spec.output) == (f"v_{slot}", 2 + 2 * slot)
-
-    assert kv_in == [f"{p}_{slot}" for slot in globals_ for p in ("k", "v")]
-    assert kv_out == [f"{n}_out" for n in kv_in]
-
-    # Every argument is either state or a remaining input, exactly once.
-    remaining_inputs = ["N"] + leading + kv_in + ["sliding_pos_ring"]
-    assert len(remaining_inputs) + len(states) == n_args
-    # Same for outputs.
-    remaining_outputs = ["logits"] + kv_out + ["sliding_pos_ring_out"]
-    consumed = {spec.output for spec in states.values()}
-    assert len(consumed) == len(states)
-    assert len(remaining_outputs) + len(consumed) == n_outs
-    assert 0 not in consumed and (n_outs - 1) not in consumed
-
-
-def test_kv_export_plan_without_global_layers():
-    """A truncated all-sliding export has no `N` argument, shifting the base."""
-    from gemma_chat.export import _kv_export_plan
-
-    cfg = dataclasses.replace(
-        Gemma4Config(),
-        attention_types=(AttentionType.LOCAL_SLIDING,) * 2,
+def _kv_shared_config() -> Gemma4Config:
+    """7 layers, the last two KV-shared (reading layers 3 and 4), window 8."""
+    S, G = AttentionType.LOCAL_SLIDING, AttentionType.GLOBAL
+    return dataclasses.replace(
+        Gemma4Config(), attention_types=(S, S, G, S, G, S, G),
+        num_kv_shared_layers=2, sliding_window_size=8,
     )
-    specs = build_cache_specs(cfg, 32)
-    states, kv_in, kv_out = _kv_export_plan(specs, has_global=False, num_leading=3)
 
-    assert kv_in == [] and kv_out == []
-    assert set(states) == {3, 4, 5, 6}
-    assert states[3].name == "k_0" and states[3].output == 1
-    assert states[6].name == "v_1" and states[6].output == 4
+
+def test_layer_chunks_cover_the_model_and_share_the_right_caches(monkeypatch):
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 3, 5))
+    chunks = decode_coreml.layer_chunks(_kv_shared_config())
+    assert [(c.layers.start, c.layers.stop) for c in chunks] == [(0, 3), (3, 5), (5, 7)]
+    assert [c.writes for c in chunks] == [(0, 1, 2), (3, 4), ()]
+    assert [c.reads for c in chunks] == [(), (), (3, 4)]
+
+
+def test_a_chunk_without_a_global_layer_joins_the_one_before(monkeypatch):
+    """Every exported function but the head is one per cache size."""
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 3, 4))
+    chunks = decode_coreml.layer_chunks(_kv_shared_config())
+    # Layer 3 alone is sliding-only.
+    assert [(c.layers.start, c.layers.stop) for c in chunks] == [(0, 4), (4, 7)]
+
+
+def test_the_shipped_chunks_all_hold_a_global_layer():
+    chunks = decode_coreml.layer_chunks(E2B_CONFIG)
+    assert [i for c in chunks for i in c.layers] == list(range(E2B_CONFIG.num_layers))
+    for c in chunks:
+        assert any(E2B_CONFIG.attention_types[i] == AttentionType.GLOBAL for i in c.layers)
+
+
+def test_chunked_decode_matches_a_single_chunk(monkeypatch):
+    """Splitting the layers — with the KV-shared ones in a chunk of their own,
+    reading caches an earlier chunk wrote — changes nothing."""
+    cfg = _kv_shared_config()
+    params = _tiny_params(cfg)
+    one_logits, one_kv, one_ring = _run_decode(params, cfg, 24, 12)
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 3, 5))
+    three_logits, three_kv, three_ring = _run_decode(params, cfg, 24, 12)
+    for a, b in zip(one_logits, three_logits):
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-5)
+    for a, b in zip(one_kv, three_kv):
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-3)
+    np.testing.assert_array_equal(one_ring, three_ring)
+
+
+# ── 4. The export-side signatures ──────────────────────────────────────────
+
+
+def test_chunk_io_plan_maps_every_argument_and_result():
+    from gemma_chat.export import _chunk_io_plan
+
+    cfg = _kv_shared_config()
+    specs = build_cache_specs(cfg, 24)
+    is_global = {s: spec.attn_type == AttentionType.GLOBAL for s, spec in enumerate(specs)}
+    for k, chunk in enumerate(decode_coreml.layer_chunks(cfg)):
+        plan = _chunk_io_plan(cfg, chunk, first=k == 0, tokens=1, N=24)
+        leading = (["hidden"] if k else []) + ["token_embed", "ple_rows", "position"]
+        base = 1 + len(leading)  # N first: every chunk holds a global layer
+        assert plan.has_global
+        assert plan.input_names[:base] == ["N"] + leading
+
+        # Traced results: [hidden_out] + k/v of every written slot.
+        results = ["hidden_out"] + [f"{p}_{s}_out" for s in chunk.writes for p in "kv"]
+        for j, slot in enumerate(chunk.slots):
+            for half, prefix in enumerate("kv"):
+                name, arg = f"{prefix}_{slot}", base + 2 * j + half
+                written = results.index(f"{name}_out") if slot in chunk.writes else None
+                if is_global[slot]:
+                    assert arg not in plan.states and name in plan.input_names
+                    assert name in plan.flexible
+                else:
+                    assert plan.states[arg].name == name
+                    assert plan.states[arg].output == written
+        state_outputs = {spec.output for spec in plan.states.values()} - {None}
+        assert plan.output_names == [r for i, r in enumerate(results) if i not in state_outputs]
+        assert plan.input_names[-1] == "sliding_pos_ring"
+        # Every traced argument is either state or a named input (``N`` is
+        # JAX's own, not in ``arg_specs``).
+        assert len(plan.arg_specs) + 1 == len(plan.input_names) + len(plan.states)
+
+
+def test_state_io_plan_declares_every_cache_read_only():
+    from gemma_chat.export import _state_io_plan
+
+    cfg = _kv_shared_config()
+    plan = _state_io_plan(cfg, N=24)
+    specs = build_cache_specs(cfg, 24)
+    sliding = [s for s, spec in enumerate(specs) if spec.attn_type == AttentionType.LOCAL_SLIDING]
+    assert sorted(spec.name for spec in plan.states.values()) == sorted(
+        f"{p}_{s}" for s in sliding for p in "kv"
+    )
+    assert all(spec.output is None for spec in plan.states.values())
+    assert plan.input_names == ["N"] + [
+        f"{p}_{s}" for s in range(len(specs)) if s not in sliding for p in "kv"
+    ]

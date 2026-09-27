@@ -41,12 +41,14 @@ consumes the tensor (see :func:`_quantize_weight`):
   performance choice: in the [N, K] / ``transpose_y=True`` orientation Core ML's
   int8 *per-channel* matmul returns uncorrelated garbage once N >= 65536 and
   M >= 5 (measured relRMS 1.0 against fp16 at N=65536 for M=5 and M=128; correct
-  at M <= 4, at N <= 49152, and for block-32 at every M).  Prefill runs this head
-  at M = CHUNK_SIZE = 128, so per-channel would silently corrupt every prompt
-  while looking ~5x faster.  Block-32 is unaffected.
+  at M <= 4, at N <= 49152, and for block-32 at every M).  The ``head``
+  function only ever runs at M = 1 now (prefill runs it on the one row it
+  needs), but block-32 stays: it is also what keeps the head off the Neural
+  Engine, which is not eligible for blockwise scales — int8 per-channel runs
+  there at 13.6 ms against ~4 ms for block-32 on the CPU (M4 Pro, macOS 27).
 
-  Cost: the head shrinks 805 MB -> 403 MB and gets *faster* in both phases —
-  3.58 -> 2.11 ms at M=1, 55.5 -> 43.1 ms at M=128.
+  Cost: the head shrinks 805 MB -> 403 MB and gets *faster* —
+  3.58 -> 2.11 ms at M=1.
 """
 
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
@@ -75,9 +77,6 @@ _VOCAB_SIZE = 262144
 # Reset by apply() before each run.
 _counter_int4: list = [0, 0]   # [count, total_bytes_original]
 
-# Set per program in ``apply``: True while quantizing a decode graph, False for
-# prefill.  The logit head is int8 only for decode -- see ``_classify_quantize``.
-_quantize_logit_head: list = [False]
 _counter_skip: list = [0]      # [count] — skipped (already constexpr)
 
 
@@ -118,17 +117,10 @@ def _classify_quantize(op):
         return None
     if val.ndim < 2 or val.size < _WEIGHT_THRESHOLD:
         return None
-    # The logit projection stays a plain fp16 const.  It is far over the size
-    # threshold, so it has to be excluded explicitly — quantizing it at all is
-    # what makes the first prediction of every function cost ~17 s under
-    # MPSGraph (int8) or the logits inaccurate (int4).  See module docstring.
+    # The logit projection gets int8 block-32, not the int4 of every other
+    # weight: int4 cannot carry the logits.  See the module docstring.
     if _is_logit_projection(val):
-        # Decode only.  In situ the int8 head is worth ~+4% decode but costs
-        # ~22% of prefill (measured 1117 -> 870 tok/s at ctx 400), because
-        # prefill runs it at M = CHUNK_SIZE while decode runs it at M = 1.
-        # Prefill therefore keeps the plain fp16 const.  The two phases are
-        # converted separately, so they simply end up with different weights.
-        return "int8_logit" if _quantize_logit_head[0] else None
+        return "int8_logit"
     # Don't re-compress what is already feeding a constexpr_* op
     for child_op in op.outputs[0].child_ops:
         if child_op.op_type.startswith("constexpr_"):
@@ -262,9 +254,9 @@ def _quantize_weight(val: np.ndarray):
         # weight in its final [N, K] / transpose_y=True orientation, Core ML's
         # int8 per-channel matmul returns uncorrelated garbage once N >= 65536
         # and M >= 5 (measured: relRMS 1.0 vs fp16 at N=65536/M=5 and M=128,
-        # correct at M<=4, at N<=49152, and for block-32 at every M).  Prefill
-        # runs this head at M = CHUNK_SIZE = 128, so per-channel would silently
-        # corrupt every prompt.
+        # correct at M<=4, at N<=49152, and for block-32 at every M), and on
+        # the ANE it is 3x slower than block-32 on the CPU.  See the module
+        # docstring.
         return _quantize_symmetric_embedding_blocks(val, bits=8)
     if _is_embedding(val):
         return _quantize_symmetric_embedding_blocks(val)
@@ -367,7 +359,7 @@ class quantize_const_weights(AbstractGraphPass):
     block spanning the whole contraction axis — the only granularity the ANE
     accepts.  The [vocab_size, dim] embedding tables keep block-32 int4: their
     gathers run on the CPU either way, so per-channel would only cost accuracy.
-    The [dim, vocab_size] logit projection is left alone as a plain fp16 const.
+    The [dim, vocab_size] logit projection gets int8 block-32.
 
     Inserted at position 0 in the pass pipeline so that all subsequent
     passes work on the compressed model.
@@ -376,16 +368,6 @@ class quantize_const_weights(AbstractGraphPass):
     def apply(self, prog):
         _counter_int4[0] = _counter_int4[1] = 0
         _counter_skip[0] = 0
-        # A decode graph embeds a single token, prefill a chunk -- that is the
-        # only signal here, since both phases convert as "main".  Both take a
-        # `token_embed` input of shape (1, L, D), with L = 1 for decode.  Match
-        # the name on a prefix: this early in the pipeline the inputs may still
-        # carry their pre-rename names, and a match that silently never fires
-        # quietly leaves the head fp16 in both phases.
-        _quantize_logit_head[0] = any(
-            name.startswith("token_embed") and var.shape[1] == 1
-            for f in prog.functions.values() for name, var in f.inputs.items()
-        )
         for f in prog.functions.values():
             _quantize_consts_in_block(f)
         if _counter_int4[0] or _counter_skip[0]:

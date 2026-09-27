@@ -5,7 +5,7 @@ Why the input is still there after materialization
 ``N`` is the dimension-variable argument JAX adds for the symbolic global cache
 length (see ``export._kv_export_plan``).  It is a *value*, not a shape, so
 ``materialize_symbolic_shape_program`` — which only rewrites shapes — leaves it
-as a runtime ``int32[1]`` input in every ``{prefill,decode}_N`` function, even
+as a runtime ``int32[1]`` input in every per-size function, even
 though every one of those functions has exactly one possible value for it.
 
 The cost is not the input itself but the ops hanging off it.  The global

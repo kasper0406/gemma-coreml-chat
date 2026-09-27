@@ -1,8 +1,13 @@
-"""JAX-traceable chunk_prefill and decode_step for CoreML export.
+"""JAX-traceable layer chunks and logit head for CoreML export.
 
-Both functions close over ``params`` and are designed to be lowered with
-``jax.jit(...).lower(shape_specs).compiler_ir('stablehlo')`` and converted
-to CoreML .mlpackage files via the same pipeline as export.py.
+The exported model runs every step as a sequence of **layer chunks** — one
+function per contiguous layer range (:func:`layer_chunks`), each taking the
+hidden state from the one before — followed by the logit head
+(:func:`logits_head`), a function of its own.  :func:`prefill_chunk` and
+:func:`decode_chunk` are what ``export.py`` traces for each chunk; they close
+over ``params`` and lower with ``jax.jit(...).trace(specs).lower()``.
+:func:`decode_step` composes the pieces into the whole model the way the
+runtime does, as a reference.
 
 KV cache layout
 ---------------
@@ -20,12 +25,13 @@ Layer order: 0, 1, 2, 3 (LOCAL_SLIDING), 4 (GLOBAL), 5-8, 9, 10-13, 14.
 
 Core ML state
 -------------
-Both functions still take and return all 30 caches, but ``export.py`` binds the
-**sliding** ones to Core ML *state* (they have static shapes, which Core ML
-states require) so they never cross the model boundary at run time.  The global
-caches keep their symbolic dim-1 and stay ordinary inputs/outputs, and
-``sliding_pos_ring`` stays I/O because it is int32 (states must be floating
-point).
+A chunk takes the caches of every slot it touches and returns the ones it
+writes, but ``export.py`` binds the **sliding** ones to Core ML *state* (they
+have static shapes, which Core ML states require) so they never cross the model
+boundary at run time.  The global caches keep their symbolic dim-1 through
+conversion and become state after materialization.  ``sliding_pos_ring`` is
+int32 (states must be floating point): the host keeps it up to date
+(:func:`ring_with_positions`) and the chunks only read it.
 
 That is why every cache write below is a whole-tensor ``jnp.where`` rather than
 ``jax.lax.dynamic_update_slice``.  Two independent reasons, one per cache kind:
@@ -53,14 +59,15 @@ int4 block-32 tables the exporter ships next to the model (see
 
 * ``token_embed`` ``(1, L, embed_dim)`` fp16 — the token's embedding row,
   already multiplied by ``fp16(sqrt(embed_dim))`` in fp16, and
-* ``ple_rows`` ``(1, L, num_layers * per_layer_input_dim)`` fp16 — the raw PLE
-  row; the ``sqrt(per_layer_input_dim)`` scaling, the projection of
-  ``token_embed`` and its norm stay in the graph (:func:`_ple_from_rows`).
+* ``ple_rows`` ``(1, L, len(chunk.layers) * per_layer_input_dim)`` fp16 — the
+  chunk's own columns of the raw PLE row; the ``sqrt(per_layer_input_dim)``
+  scaling, the projection of ``token_embed`` and its norm stay in the graph
+  (:func:`_ple_from_rows`).
 
 ``L`` is 1 for decode and ``CHUNK_SIZE`` for prefill.  The two gathers were
 the costliest ops of an ANE plan (~45% of its estimated cost, on the CPU, from
 ~1.5 GB of tables); a host lookup is one row per token.  The tied logit head
-still reads ``params['embed_tokens']`` in the graph.
+still reads ``params['embed_tokens']``, in :func:`logits_head`.
 
 Prompts are right-padded: real tokens at positions 0..T-1, the rows of the pad
 token (id 0) at T..L-1.
@@ -86,11 +93,12 @@ range genuinely needs it:
 * **RoPE angles** (``model._apply_rope``): positions run to 65535, which fp16
   cannot represent exactly; the sinusoid argument, ``sin`` and ``cos`` are
   computed in fp32 and cast to fp16 before the rotation itself.
-* **The prefill ring-position scatter**, for the same range reason — see the
-  comment at its ``jnp.dot``.
 * **The logits**, from the output matmul onward: fp16 dot against the fp16
   embedding table, fp32 out (upcasting the *weight* instead would put a 1.6 GB
-  fp32 constant in the graph — see the note in :func:`decode_step`).
+  fp32 constant in the graph — see :func:`logits_head`).
+
+(The prefill ring update was an fp32 scatter for the same range reason as the
+RoPE angles; it is gone from the graph now that the host keeps the ring.)
 
 Everything else stays fp16 end to end, which matters because the decode graph is
 dispatch-bound: any op that returns fp32 drags its consumers up with it.  A
@@ -103,49 +111,23 @@ attention intermediates in every step.  Long-axis sums inside `matmul` and
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import List, Tuple
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.special
+import numpy as np
 
-from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, MAX_SEQ_LEN
+from gemma_chat.config import CHUNK_SIZE, E2B_CONFIG, LAYER_CHUNK_STARTS
 from gemma_chat.model import AttentionType, Gemma4Config, _apply_rope
-from gemma_chat.cache_spec import build_cache_specs, kv_shared_sources
+from gemma_chat.cache_spec import kv_shared_sources
 
 
 # ---------------------------------------------------------------------------
 # KV cache helpers
 # ---------------------------------------------------------------------------
-
-def kv_non_shared_layers(cfg: Gemma4Config) -> List[int]:
-    """Layer indices that own a KV cache slot (0 .. kv_shared_start-1)."""
-    return list(range(cfg.num_layers - cfg.num_kv_shared_layers))
-
-
-def kv_cache_shapes(cfg: Gemma4Config, max_seq_len: int) -> List[Tuple]:
-    """One shape per non-shared layer; k and v share the same shape.
-
-    Sliding layers use ``sliding_window_size`` (ring buffer);
-    global layers use ``max_seq_len``.
-    """
-    specs = build_cache_specs(cfg, max_seq_len)
-    return [(1, s.cache_len, s.num_kv_heads, s.head_dim) for s in specs]
-
-
-def empty_kv_cache(
-    cfg: Gemma4Config = E2B_CONFIG,
-    max_seq_len: int = MAX_SEQ_LEN,
-    dtype=jnp.float16,
-) -> List[jnp.ndarray]:
-    """Return 30 zero JAX arrays: [k0, v0, k1, v1, ..., k14, v14]."""
-    flat = []
-    for shape in kv_cache_shapes(cfg, max_seq_len):
-        flat.append(jnp.zeros(shape, dtype=dtype))
-        flat.append(jnp.zeros(shape, dtype=dtype))
-    return flat
-
 
 def empty_pos_ring(cfg: Gemma4Config = E2B_CONFIG) -> jnp.ndarray:
     """Return (1, sliding_window_size) int32 filled with -1 (no entries)."""
@@ -248,25 +230,33 @@ def _rmsnorm(x, scale=None):
     return y.astype(jnp.float16).reshape(shape)
 
 
-def _ple_from_rows(params, token_embed, ple_rows, cfg: Gemma4Config):
-    """Per-layer inputs from the host-gathered embedding rows.
+def _ple_from_rows(params, token_embed, ple_rows, layers: range, cfg: Gemma4Config):
+    """Per-layer inputs of ``layers`` from the host-gathered embedding rows.
 
     token_embed: (B, L, D) fp16, already multiplied by sqrt(D).
-    ple_rows:    (B, L, num_layers * per_layer_input_dim) fp16, raw table rows.
+    ple_rows:    (B, L, len(layers) * per_layer_input_dim) fp16 — the columns
+                 of the raw table rows that belong to ``layers``.
 
-    Returns (B, L, num_layers * per_layer_input_dim).
+    The projection of ``token_embed`` is sliced to the same columns; its norm
+    is per layer (over ``per_layer_input_dim``), so a slice computes exactly
+    what the full projection would for those layers.
+
+    Returns (B, L, len(layers) * per_layer_input_dim).
     """
     B, L = token_embed.shape[:2]
     d = cfg.per_layer_input_dim
+    n = len(layers)
 
     ple_embed = ple_rows * jnp.sqrt(float(d)).astype(ple_rows.dtype)
 
-    W_proj = params['per_layer_model_projection']['kernel']  # (D, NL*d)
-    ple_proj = jnp.dot(token_embed, W_proj) * (cfg.embed_dim ** -0.5)  # (B, L, NL*d)
+    # numpy slice at trace time: only these columns become a graph constant.
+    W_proj = np.asarray(params['per_layer_model_projection']['kernel'])
+    W_proj = W_proj[:, layers.start * d:layers.stop * d]              # (D, n*d)
+    ple_proj = jnp.dot(token_embed, W_proj) * (cfg.embed_dim ** -0.5)  # (B, L, n*d)
 
     scale = params['per_layer_projection_norm']['scale']   # (d,)
-    ple_proj = _rmsnorm(ple_proj.reshape(B, L, cfg.num_layers, d), scale)
-    ple_proj = ple_proj.reshape(B, L, cfg.num_layers * d)
+    ple_proj = _rmsnorm(ple_proj.reshape(B, L, n, d), scale)
+    ple_proj = ple_proj.reshape(B, L, n * d)
 
     return (ple_proj + ple_embed) * (2.0 ** -0.5)
 
@@ -386,117 +376,196 @@ def _attn_decode(lp, x, position, cfg: Gemma4Config, attn_type: str,
 
 
 # ---------------------------------------------------------------------------
-# Decode step: single-token forward with KV cache read/write
+# Layer chunks: the unit every exported function covers
 # ---------------------------------------------------------------------------
 
-def decode_step(
-    params,
-    token_embed,
-    ple_rows,
-    position,
-    kv_flat,
-    sliding_pos_ring,
-    cfg: Gemma4Config = E2B_CONFIG,
-):
-    """Single-token autoregressive decode with KV cache.
+@dataclasses.dataclass(frozen=True)
+class LayerChunk:
+    """A contiguous range of layers, exported as one function per phase and size.
 
-    Args:
-        params:    Flax param tree from load_params().
-        token_embed: (1, 1, D) fp16 — the new token's embedding row, already
-                   multiplied by sqrt(D) (see the module docstring).
-        ple_rows:  (1, 1, num_layers * per_layer_input_dim) fp16 — its raw
-                   per-layer-embedding row.
-        position:  () int32 — absolute position of this token (= T + step).
-        kv_flat:   List of 30 cache arrays (per-layer shapes, float16).
-                   Global cache dim 1 may vary (symbolic/flexible shapes).
-        sliding_pos_ring: (1, sliding_window_size) int32 — ring position tracker.
-        cfg:       Model config.
-
-    Returns:
-        logits: (vocab_size,)
-        kv_flat_new: Updated list of 30 cache arrays.
-        sliding_pos_ring_new: Updated (1, sliding_window_size) int32.
+    ``writes`` are the cache slots of the chunk's own layers (read and
+    written); ``reads`` are the slots its KV-shared layers read but an earlier
+    chunk owns.  A slot is the index of its layer (layers 0..14 own slots
+    0..14), and the exported state features are named ``k_<slot>`` /
+    ``v_<slot>``.
     """
-    x = token_embed                                          # (1, 1, D)
-    ple_all = _ple_from_rows(params, token_embed, ple_rows, cfg)  # (1, 1, NL*d)
+    layers: range
+    writes: Tuple[int, ...]
+    reads: Tuple[int, ...]
 
-    # Update sliding_pos_ring for this position (shared by all sliding layers).
-    W = cfg.sliding_window_size
-    ring_slot = position % W
-    ring_mask = (jnp.arange(W, dtype=jnp.int32) == ring_slot)[None, :]
-    sliding_pos_ring = jnp.where(ring_mask, position, sliding_pos_ring)
+    @property
+    def slots(self) -> Tuple[int, ...]:
+        """Every cache slot the chunk touches, ascending."""
+        return tuple(sorted(self.writes + self.reads))
 
+
+def layer_chunks(cfg: Gemma4Config) -> List[LayerChunk]:
+    """Split ``cfg``'s layers at :data:`config.LAYER_CHUNK_STARTS`.
+
+    A chunk without a global-attention layer would not depend on the cache
+    size at all, and every exported function except ``head`` is one per size
+    — so such a chunk (only possible in a ``--num-layers`` truncation) is
+    merged into the one before it.
+    """
     n = cfg.num_layers
     kv_shared_start = n - cfg.num_kv_shared_layers
-    shared_sources = kv_shared_sources(cfg)
-
-    # Unpack flat KV into per-layer dicts
-    kv_own = {}   # layer_idx → (k_cache, v_cache) — mutable during this step
-    for slot, layer_idx in enumerate(range(kv_shared_start)):
-        kv_own[layer_idx] = (kv_flat[slot * 2], kv_flat[slot * 2 + 1])
-
-    attn_types = list(cfg.attention_types)
-
-    for i, attn_type in enumerate(attn_types):
-        lp = params[f'layers.{i}']
-        is_shared = i >= kv_shared_start
-
-        d = cfg.per_layer_input_dim
-        ple_slice = ple_all[:, :, i * d:(i + 1) * d]  # (1, 1, d)
-
-        # Attention sub-layer
-        residual = x
-        x_ln = _rmsnorm(x, lp['input_layernorm']['scale'])
-
-        if is_shared:
-            src = shared_sources[i]
-            k_src, v_src = kv_own[src]
-            pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
-            attn_out, _, _ = _attn_decode(lp, x_ln, position, cfg, attn_type,
-                                           k_src, v_src, shared_kv=(k_src, v_src),
-                                           pos_ring=pr)
+    sources = kv_shared_sources(cfg)
+    starts = [s for s in LAYER_CHUNK_STARTS if 0 < s < n]
+    bounds = [0] + starts + [n]
+    ranges: List[range] = []
+    for a, b in zip(bounds, bounds[1:]):
+        has_global = any(
+            cfg.attention_types[i] == AttentionType.GLOBAL for i in range(a, b)
+        )
+        if ranges and not has_global:
+            ranges[-1] = range(ranges[-1].start, b)
         else:
-            k_old, v_old = kv_own[i]
-            pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
-            attn_out, k_new, v_new = _attn_decode(lp, x_ln, position, cfg, attn_type,
-                                                    k_old, v_old, pos_ring=pr)
-            kv_own[i] = (k_new, v_new)
+            ranges.append(range(a, b))
 
-        attn_out = _rmsnorm(attn_out, lp['post_attention_layernorm']['scale'])
-        x = residual + attn_out
+    chunks = []
+    for layers in ranges:
+        writes = tuple(i for i in layers if i < kv_shared_start)
+        reads = tuple(sorted(
+            {sources[i] for i in layers if i >= kv_shared_start} - set(writes)
+        ))
+        chunks.append(LayerChunk(layers=layers, writes=writes, reads=reads))
+    return chunks
 
-        # FFN sub-layer
-        residual = x
-        x_ln = _rmsnorm(x, lp['pre_feedforward_layernorm']['scale'])
-        ffn_out = _ffn(lp, x_ln, cfg.effective_hidden_dim(i))
-        ffn_out = _rmsnorm(ffn_out, lp['post_feedforward_layernorm']['scale'])
-        x = residual + ffn_out
 
-        # PLE gate
-        x = _ple_gate(lp, x, ple_slice)
+def ring_with_positions(ring, positions, window: int):
+    """``sliding_pos_ring`` after tokens at ``positions`` enter the ring.
 
-        x = x * lp['layer_scalar']
+    The **host** does this before every call (``KVCacheState`` in GemmaCore):
+    ring slot ``p % window`` records that it now holds position ``p``.  The
+    exported functions only read the ring, to build the sliding masks.  This is
+    the reference the runtime has to match.
+    """
+    positions = jnp.atleast_1d(positions)
+    return ring.at[0, positions % window].set(positions)
 
-    x = _rmsnorm(x, params['norm']['scale'])
-    # fp16 matmul, fp32 only from the logits onward.  Upcasting the weight
-    # instead would put a [dim, vocab] *fp32* constant in the graph — 1.6 GB
-    # that no pass can shrink, since the export leaves this tensor unquantized
-    # (see ``mil_passes/quantize_const_weights``: int4 cannot carry the logits
-    # and int8 is what MPSGraph constant-folds on every first prediction).
-    logits = jnp.dot(x[0, 0],
-                     params['embed_tokens'].T).astype(jnp.float32)  # (vocab,)
+
+def _layer(lp, i: int, x, ple_slice, attend, cfg: Gemma4Config):
+    """One decoder layer around ``attend(x_ln) -> attn_out``."""
+    residual = x
+    x_ln = _rmsnorm(x, lp['input_layernorm']['scale'])
+    attn_out = _rmsnorm(attend(x_ln), lp['post_attention_layernorm']['scale'])
+    x = residual + attn_out
+
+    residual = x
+    x_ln = _rmsnorm(x, lp['pre_feedforward_layernorm']['scale'])
+    ffn_out = _ffn(lp, x_ln, cfg.effective_hidden_dim(i))
+    ffn_out = _rmsnorm(ffn_out, lp['post_feedforward_layernorm']['scale'])
+    x = residual + ffn_out
+
+    x = _ple_gate(lp, x, ple_slice)
+    return x * lp['layer_scalar']
+
+
+def _run_chunk(params, chunk: LayerChunk, hidden, token_embed, ple_rows, caches,
+               attend_own, attend_shared, cfg: Gemma4Config):
+    """The layers of ``chunk``; the final norm too if it is the last one.
+
+    ``caches`` maps every slot in ``chunk.slots`` to its ``(k, v)``; returns
+    the new hidden state and ``{slot: (k, v)}`` for ``chunk.writes``.
+    """
+    ple_all = _ple_from_rows(params, token_embed, ple_rows, chunk.layers, cfg)
+    kv_shared_start = cfg.num_layers - cfg.num_kv_shared_layers
+    sources = kv_shared_sources(cfg)
+    d = cfg.per_layer_input_dim
+    caches = dict(caches)
+
+    x = hidden
+    for j, i in enumerate(chunk.layers):
+        attn_type = cfg.attention_types[i]
+        ple_slice = ple_all[:, :, j * d:(j + 1) * d]
+        if i >= kv_shared_start:
+            src = caches[sources[i]]
+            attend = lambda x_ln, lp=params[f'layers.{i}'], t=attn_type, src=src: \
+                attend_shared(lp, x_ln, t, src)
+        else:
+            def attend(x_ln, lp=params[f'layers.{i}'], t=attn_type, i=i):
+                out, k, v = attend_own(lp, x_ln, t, *caches[i])
+                caches[i] = (k, v)
+                return out
+        x = _layer(params[f'layers.{i}'], i, x, ple_slice, attend, cfg)
+
+    if chunk.layers.stop == cfg.num_layers:
+        x = _rmsnorm(x, params['norm']['scale'])
+    return x, {slot: caches[slot] for slot in chunk.writes}
+
+
+def decode_chunk(params, chunk: LayerChunk, hidden, token_embed, ple_rows,
+                 position, caches, sliding_pos_ring, cfg: Gemma4Config = E2B_CONFIG):
+    """One decode step through the layers of ``chunk``.
+
+    Args:
+        hidden:      (1, 1, D) fp16 — the residual stream entering the chunk
+                     (``token_embed`` itself for the first chunk).
+        token_embed: (1, 1, D) fp16 — the token's embedding row × sqrt(D).
+        ple_rows:    (1, 1, len(chunk.layers) * per_layer_input_dim) fp16 —
+                     its raw per-layer-embedding columns for these layers.
+        position:    () int32 — absolute position of the token.
+        caches:      {slot: (k, v)} for every slot in ``chunk.slots``.
+        sliding_pos_ring: (1, W) int32 — already updated for ``position`` by
+                     the host (see :func:`ring_with_positions`).
+
+    Returns ``(hidden (1, 1, D), {slot: (k, v)} for chunk.writes)``; the
+    hidden state is final-normed when the chunk ends the model.
+    """
+    def own(lp, x_ln, attn_type, k, v):
+        pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
+        return _attn_decode(lp, x_ln, position, cfg, attn_type, k, v, pos_ring=pr)
+
+    def shared(lp, x_ln, attn_type, src):
+        pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
+        out, _, _ = _attn_decode(lp, x_ln, position, cfg, attn_type, *src,
+                                 shared_kv=src, pos_ring=pr)
+        return out
+
+    return _run_chunk(params, chunk, hidden, token_embed, ple_rows, caches,
+                      own, shared, cfg)
+
+
+def logits_head(params, hidden, cfg: Gemma4Config = E2B_CONFIG):
+    """The tied logit head: final-normed hidden (1, 1, D) fp16 → (vocab,) fp32.
+
+    Its own function in the export, shared by decode and prefill (the host
+    picks the prefill row it needs).  fp16 matmul, fp32 only from the logits
+    onward: upcasting the weight instead would put a [dim, vocab] *fp32*
+    constant in the graph — 1.6 GB.  The export stores the weight as int8
+    block-32 (see ``mil_passes/quantize_const_weights``).
+    """
+    logits = jnp.dot(hidden[0, 0], params['embed_tokens'].T).astype(jnp.float32)
     if cfg.final_logit_softcap is not None:
         cap = cfg.final_logit_softcap
         logits = jnp.tanh(logits / cap) * cap
+    return logits
 
-    # Repack updated caches into flat list
-    kv_flat_new = []
-    for layer_idx in range(kv_shared_start):
-        k, v = kv_own[layer_idx]
-        kv_flat_new.append(k)
-        kv_flat_new.append(v)
 
-    return logits, kv_flat_new, sliding_pos_ring
+def decode_step(params, token_embed, ple_rows, position, kv_flat, sliding_pos_ring,
+                cfg: Gemma4Config = E2B_CONFIG):
+    """The whole model for one token, as the runtime composes it.
+
+    Ring update (host), every layer chunk in order, then the head.  Only a
+    reference for tests: the export traces the pieces.  ``kv_flat`` is
+    ``[k_0, v_0, k_1, v_1, ...]``, one pair per cache slot.
+
+    Returns ``(logits (vocab,), kv_flat_new, sliding_pos_ring_new)``.
+    """
+    ring = ring_with_positions(sliding_pos_ring, position, cfg.sliding_window_size)
+    caches = {s: (kv_flat[2 * s], kv_flat[2 * s + 1]) for s in range(len(kv_flat) // 2)}
+    d = cfg.per_layer_input_dim
+    hidden = token_embed
+    for chunk in layer_chunks(cfg):
+        cols = ple_rows[:, :, chunk.layers.start * d:chunk.layers.stop * d]
+        hidden, written = decode_chunk(
+            params, chunk, hidden, token_embed, cols, position,
+            {s: caches[s] for s in chunk.slots}, ring, cfg,
+        )
+        caches.update(written)
+    logits = logits_head(params, hidden, cfg)
+    kv_new = [c for s in sorted(caches) for c in caches[s]]
+    return logits, kv_new, ring
 
 
 # ---------------------------------------------------------------------------
@@ -625,135 +694,32 @@ def _attn_chunk_shared(lp, x, positions, cfg: Gemma4Config, attn_type: str,
 
 
 # ---------------------------------------------------------------------------
-# Chunked prefill: process CHUNK_SIZE tokens with KV cache read/write
+# Chunked prefill: CHUNK_SIZE tokens through one layer chunk
 # ---------------------------------------------------------------------------
 
-def chunk_prefill_step(
-    params,
-    token_embed,
-    ple_rows,
-    start_position,
-    kv_flat,
-    sliding_pos_ring,
-    cfg: Gemma4Config = E2B_CONFIG,
-    chunk_size: int = CHUNK_SIZE,
-):
-    """Process a chunk of tokens through the full model, updating KV caches.
+def prefill_chunk(params, chunk: LayerChunk, hidden, token_embed, ple_rows,
+                  start_position, caches, sliding_pos_ring,
+                  cfg: Gemma4Config = E2B_CONFIG, chunk_size: int = CHUNK_SIZE):
+    """``chunk_size`` tokens through the layers of ``chunk``.
 
-    Args:
-        params:         Flax param tree from load_params().
-        token_embed:    (1, chunk_size, D) fp16 — the chunk's embedding rows,
-                        already multiplied by sqrt(D); a short final chunk is
-                        right-padded with the rows of token 0.
-        ple_rows:       (1, chunk_size, num_layers * per_layer_input_dim) fp16 —
-                        the chunk's raw per-layer-embedding rows, padded alike.
-        start_position: () int32 — absolute position of the first token in this chunk.
-        kv_flat:        List of 30 cache arrays (per-layer shapes, float16).
-                        Global cache dim 1 may vary (symbolic/flexible shapes).
-        sliding_pos_ring: (1, sliding_window_size) int32 — ring position tracker.
-        cfg:            Model config.
-        chunk_size:     Number of tokens per chunk (must match token_embed.shape[1]).
+    As :func:`decode_chunk`, with ``L = chunk_size`` rows per input and
+    ``start_position`` the absolute position of the first token.  A short
+    final prompt chunk is right-padded with the rows of token 0; the padding
+    is written into the caches like any token, and the host marks its
+    positions in ``sliding_pos_ring`` too, exactly as it does for real ones.
 
-    Returns:
-        logits: (chunk_size, vocab_size) float32 — logits at all chunk positions.
-        kv_flat_new: Updated list of 30 cache arrays.
-        sliding_pos_ring_new: Updated (1, sliding_window_size) int32.
+    Returns ``(hidden (1, chunk_size, D), {slot: (k, v)} for chunk.writes)``.
+    The runtime runs the head on the one row it needs (the last real token).
     """
-    C = chunk_size
-    positions = start_position + jnp.arange(C, dtype=jnp.int32)
-    positions = positions[jnp.newaxis]  # (1, C)
+    positions = (start_position + jnp.arange(chunk_size, dtype=jnp.int32))[jnp.newaxis]
 
-    x = token_embed                                          # (1, C, D)
-    ple_all = _ple_from_rows(params, token_embed, ple_rows, cfg)  # (1, C, NL*d)
+    def own(lp, x_ln, attn_type, k, v):
+        pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
+        return _attn_chunk(lp, x_ln, positions, cfg, attn_type, k, v, pos_ring=pr)
 
-    # Update sliding_pos_ring for this chunk (shared by all sliding layers).
-    W = cfg.sliding_window_size
-    abs_pos = positions[0]  # (C,)
-    ring_slots = abs_pos % W  # (C,)
-    write_mask = (jnp.arange(W, dtype=jnp.int32)[:, None]
-                  == ring_slots[None, :])  # (W, C)
-    any_written = write_mask.any(axis=1)  # (W,)
-    # MPS has no int32 matmul, so the scatter runs as a float dot — but it has
-    # to be **fp32**, not fp16: these are absolute positions running up to
-    # max_seq_len-1 = 65535, and fp16 only represents integers exactly below
-    # 2048.  In fp16 every position past 2048 lands in the ring rounded (off by
-    # 2 at 4096), and 65535 rounds to 65536 — past fp16's 65504 max — so the
-    # top size bucket writes inf and the int32 cast turns the whole ring to
-    # garbage.  Either way the `pk <= pos_q` validity test is corrupted.  fp32
-    # is exact for every position (integers are exact below 2^24).  This is the
-    # one deliberately-fp32 tensor left in the graph; it is a single
-    # [W, C] x [C] product per prefill call.
-    new_ring_vals = jnp.dot(
-        write_mask.astype(jnp.float32), abs_pos.astype(jnp.float32)
-    ).astype(jnp.int32)  # (W,)
-    sliding_pos_ring = jnp.where(any_written[None, :], new_ring_vals[None, :],
-                                 sliding_pos_ring)
+    def shared(lp, x_ln, attn_type, src):
+        pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
+        return _attn_chunk_shared(lp, x_ln, positions, cfg, attn_type, src, pos_ring=pr)
 
-    n = cfg.num_layers
-    kv_shared_start = n - cfg.num_kv_shared_layers
-    shared_sources = kv_shared_sources(cfg)
-
-    # Unpack flat KV into per-layer dicts
-    kv_own = {}
-    for slot, layer_idx in enumerate(range(kv_shared_start)):
-        kv_own[layer_idx] = (kv_flat[slot * 2], kv_flat[slot * 2 + 1])
-
-    attn_types = list(cfg.attention_types)
-
-    for i, attn_type in enumerate(attn_types):
-        lp = params[f'layers.{i}']
-        is_shared = i >= kv_shared_start
-
-        d = cfg.per_layer_input_dim
-        ple_slice = ple_all[:, :, i * d:(i + 1) * d]  # (1, C, d)
-
-        # Attention sub-layer
-        residual = x
-        x_ln = _rmsnorm(x, lp['input_layernorm']['scale'])
-
-        if is_shared:
-            src = shared_sources[i]
-            k_src, v_src = kv_own[src]
-            pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
-            attn_out = _attn_chunk_shared(lp, x_ln, positions, cfg, attn_type,
-                                          (k_src, v_src), pos_ring=pr)
-        else:
-            k_old, v_old = kv_own[i]
-            pr = sliding_pos_ring if attn_type == AttentionType.LOCAL_SLIDING else None
-            attn_out, k_new, v_new = _attn_chunk(lp, x_ln, positions, cfg,
-                                                  attn_type, k_old, v_old,
-                                                  pos_ring=pr)
-            kv_own[i] = (k_new, v_new)
-
-        attn_out = _rmsnorm(attn_out, lp['post_attention_layernorm']['scale'])
-        x = residual + attn_out
-
-        # FFN sub-layer
-        residual = x
-        x_ln = _rmsnorm(x, lp['pre_feedforward_layernorm']['scale'])
-        ffn_out = _ffn(lp, x_ln, cfg.effective_hidden_dim(i))
-        ffn_out = _rmsnorm(ffn_out, lp['post_feedforward_layernorm']['scale'])
-        x = residual + ffn_out
-
-        # PLE gate
-        x = _ple_gate(lp, x, ple_slice)
-
-        x = x * lp['layer_scalar']
-
-    x = _rmsnorm(x, params['norm']['scale'])
-    # fp16 matmul, fp32 from the logits onward — see the note in
-    # :func:`decode_step` on why the weight must not be upcast.
-    logits = jnp.dot(x[0],
-                     params['embed_tokens'].T).astype(jnp.float32)  # (C, vocab)
-    if cfg.final_logit_softcap is not None:
-        cap = cfg.final_logit_softcap
-        logits = jnp.tanh(logits / cap) * cap
-
-    # Repack updated caches into flat list
-    kv_flat_new = []
-    for layer_idx in range(kv_shared_start):
-        k, v = kv_own[layer_idx]
-        kv_flat_new.append(k)
-        kv_flat_new.append(v)
-
-    return logits, kv_flat_new, sliding_pos_ring
+    return _run_chunk(params, chunk, hidden, token_embed, ple_rows, caches,
+                      own, shared, cfg)

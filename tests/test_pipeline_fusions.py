@@ -442,7 +442,7 @@ def test_numerical_rmsnorm_and_gelu():
 
 # ── weight quantization: what gets a constexpr and what does not ─────────
 
-def test_logit_projection_int8_for_decode_fp16_for_prefill():
+def test_logit_projection_is_int8_block32():
     """The [dim, vocab] logit projection is quantized to int8 with block-32 scales.
 
     Both historical reasons for leaving it fp16 are tied to the old
@@ -453,18 +453,13 @@ def test_logit_projection_int8_for_decode_fp16_for_prefill():
       fresh-process first predict at N=262144: 16.3 s for [K,N]/ty=False vs
       0.06 s for [N,K]/ty=True, the same as fp16.
     * int4 is still too lossy for logits, and buys no speed over int8 here
-      (2.02 vs 2.11 ms at M=1; 43.2 vs 43.1 ms at M=128).
+      (2.02 vs 2.11 ms at M=1).
 
-    Block-32 rather than per-channel is a **correctness** requirement, not a
-    tuning choice: Core ML's int8 per-channel matmul in the
+    Block-32 rather than per-channel: Core ML's int8 per-channel matmul in the
     [N,K]/``transpose_y=True`` orientation returns uncorrelated garbage for
-    N >= 65536 once M >= 5 (relRMS 1.0 vs fp16), and prefill runs this head at
-    M = CHUNK_SIZE = 128.  This test pins the grouping.
-
-    Decode only: in situ the int8 head is worth ~+4% decode but costs ~22% of
-    prefill, which runs it at M = CHUNK_SIZE rather than M = 1.  The two phases
-    convert separately, so they simply get different weights; the pass tells
-    them apart by the length of the ``token_embed`` input.
+    N >= 65536 once M >= 5 (relRMS 1.0 vs fp16), and blockwise scales keep the
+    head off the Neural Engine, where int8 runs ~3x slower than block-32 does
+    on the CPU.  This test pins the grouping.
 
     The other [dim, *] weight in the same graph is the control: it stays int4.
     """
@@ -501,11 +496,3 @@ def test_logit_projection_int8_for_decode_fp16_for_prefill():
 
     assert {hidden.shape, hidden.T.shape} & set(by_shape), "the hidden weight stopped being quantized"
 
-    # ...and prefill keeps the plain fp16 const, because int8 costs it ~22%.
-    _, prefill_prog = _convert(logits_fn, jnp.zeros((1, 4, 32), jnp.float16))
-    prefill_shapes = {tuple(op.outputs[0].shape) for op in _ops(prefill_prog)
-                      if op.op_type == "constexpr_blockwise_shift_scale"}
-    assert not ({logit_w.shape, logit_w.T.shape} & prefill_shapes), (
-        "the prefill logit head was quantized; int8 costs ~22% of prefill"
-    )
-    assert {hidden.shape, hidden.T.shape} & prefill_shapes, "prefill hidden weight not quantized"

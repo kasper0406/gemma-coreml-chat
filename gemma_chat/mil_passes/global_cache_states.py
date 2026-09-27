@@ -8,8 +8,8 @@ static from the start.  The 3 global caches cannot take that route: before
 materialization their length dim is symbolic, and Core ML states must have a
 concrete shape.
 
-``materialize_symbolic_shape_program`` fixes that — every ``{prefill,decode}_N``
-function it emits has fully concrete shapes.  This pass runs right after it and
+``materialize_symbolic_shape_program`` fixes that — every per-size function
+it emits has fully concrete shapes.  This pass runs right after it and
 converts the leftover cache I/O into state:
 
 * the input ``k_4`` becomes an fp16 ``state_tensor_placeholder`` of the same

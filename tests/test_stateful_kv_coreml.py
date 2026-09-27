@@ -314,3 +314,84 @@ def test_state_is_shared_across_prefill_and_decode_of_one_size(merged_package):
     assert r["glob_total"][0] == pytest.approx(HEAD_DIM * 1)
     r = _predict(prefill, state, pos=2, size=size)
     assert r["glob_total"][0] == pytest.approx(HEAD_DIM * (1 + 2))
+
+
+# ── The chunked layout: a read-only reader and a size-independent head ──────
+
+
+def _build_reader_and_head(dest_dir: Path) -> tuple[Path, Path]:
+    """A function that only *reads* the global cache (as the KV-shared layer
+    chunks read layer 14's), and a head with no cache at all."""
+    (N,) = jax_export.symbolic_shape("N", constraints=["N >= 1"])
+
+    def read(glob):
+        return (jnp.sum(glob.astype(jnp.float32)) * 10).reshape(1)
+
+    module = jax.jit(read).trace(
+        jax.ShapeDtypeStruct((1, N, 1, HEAD_DIM), jnp.float16),
+    ).lower().compiler_ir("stablehlo")
+    reader = ct.convert(
+        hlo_to_mil(module, minimum_deployment_target=ct.target.iOS18),
+        source="milinternal", minimum_deployment_target=ct.target.iOS18,
+        compute_precision=ct.precision.FLOAT32, skip_model_load=True,
+    )
+    spec = reader._spec
+    for feat, new in zip(list(spec.description.input), ["N", "k_1"]):
+        rename_feature(spec, feat.name, new, rename_outputs=False)
+    rename_feature(spec, spec.description.output[0].name, "total", rename_inputs=False)
+    for feat in spec.description.input:
+        if feat.name == "k_1":
+            _apply_flexible_dim1(feat, 1, max(SIZES), (1, SIZES[0], 1, HEAD_DIM))
+    reader_path = dest_dir / "reader.mlpackage"
+    reader.save(str(reader_path))
+
+    head_module = jax.jit(lambda x: x * 2).trace(
+        jax.ShapeDtypeStruct((1, 4), jnp.float16),
+    ).lower().compiler_ir("stablehlo")
+    head = ct.convert(
+        hlo_to_mil(head_module, minimum_deployment_target=ct.target.iOS18),
+        source="milinternal", minimum_deployment_target=ct.target.iOS18,
+        compute_precision=ct.precision.FLOAT32, skip_model_load=True,
+    )
+    head_path = dest_dir / "head.mlpackage"
+    head.save(str(head_path))
+    return reader_path, head_path
+
+
+def test_read_only_reader_shares_the_state_and_the_head_is_kept_once(dynamic_package: Path):
+    from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
+    from gemma_chat.materialize import materialize_mlpackage
+
+    reader, head = _build_reader_and_head(dynamic_package.parent)
+    desc = MultiFunctionDescriptor()
+    desc.add_function(str(dynamic_package), src_function_name="main", target_function_name="decode")
+    desc.add_function(str(reader), src_function_name="main", target_function_name="reader")
+    desc.add_function(str(head), src_function_name="main", target_function_name="head")
+    desc.default_function_name = "decode"
+    combined = dynamic_package.parent / "chunked.mlpackage"
+    save_multifunction(desc, str(combined))
+    out = dynamic_package.parent / "chunked-mat.mlpackage"
+    materialize_mlpackage(combined, out, list(SIZES))
+
+    spec = ct.models.MLModel(str(out), skip_model_load=True)._spec
+    by_name = {fd.name: fd for fd in spec.description.functions}
+    assert set(by_name) == {f"{f}_{s}" for f in ("decode", "reader") for s in SIZES} | {"head"}
+    assert spec.description.defaultFunctionName == f"decode_{SIZES[0]}"
+    for size in SIZES:
+        fd = by_name[f"reader_{size}"]
+        assert [s.name for s in fd.state] == ["k_1"]
+        assert [i.name for i in fd.input] == []
+    # Size-independent, so carried over once and untouched.
+    assert len(by_name["head"].input) == 1 and not by_name["head"].state
+
+    size = SIZES[0]
+    load = lambda fn: ct.models.MLModel(
+        str(out), function_name=fn, compute_units=ct.ComputeUnit.CPU_ONLY,
+    )
+    decode, reader_fn = load(f"decode_{size}"), load(f"reader_{size}")
+    state = decode.make_state()
+    for pos in range(3):
+        _predict(decode, state, pos=pos, size=size)
+    # The reader sees what decode wrote into the shared global cache.
+    total = reader_fn.predict({}, state=state)["total"][0]
+    assert total == pytest.approx(10 * HEAD_DIM * (1 + 2 + 3))
