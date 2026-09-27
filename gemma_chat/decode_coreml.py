@@ -119,7 +119,13 @@ single fp32 leak in ``_apply_rope`` used to promote q, and through it SDPA, the
 attention output and o_proj — which forced the 35 o_proj weights to be
 re-materialized as fp32 constants at runtime (528 MB) and put ~1 GB of fp32
 attention intermediates in every step.  Long-axis sums inside `matmul` and
-``softmax`` are left to the backend, which accumulates them in fp32.
+``softmax`` are left to the backend.  The GPU accumulates matmuls in fp32; the
+CPU (BNNS, macOS 27) does not for many shapes — an fp16 matmul against an
+fp16 or int4 weight at M = 1..8 rows, and the M = 128 attention products, come
+back with ~10-40x the error of fp32 accumulation, growing with the contraction
+length.  That is why ``cpu-only`` lands further from the float reference than
+``cpu-and-gpu`` (last-token KL ~0.002-0.03 against ~0.0001 on long prompts,
+prefill and decode alike); the graph has no per-backend precision to ask for.
 """
 
 from __future__ import annotations
