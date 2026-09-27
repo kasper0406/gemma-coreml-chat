@@ -18,9 +18,11 @@ and, size-independent:
 * ``head`` — final-normed hidden ``[1, 1, D]`` → fp32 logits, used by decode
   and (on the row the runtime picks) prefill.
 
-Weights are quantized per-channel int4 for matmuls (blockwise scales are not
-ANE-eligible) and int8 block-32 for the logit head — see
-``mil_passes/quantize_const_weights`` — and deduplicated across functions.
+Matmul weights are quantized with per-channel scales (blockwise ones are not
+ANE-eligible): int4 in the layer chunks, int8 in ``head``, whose vocab is
+split into slices that keep the Neural Engine's weight DMA fast
+(``decode_coreml.head_slices``) — see ``mil_passes/quantize_const_weights`` —
+and deduplicated across functions.
 
 The embedding lookups are not in the graph: the functions take the embedding
 rows (``token_embed``, ``ple_rows``) and the runtime looks them up in the
@@ -330,12 +332,13 @@ def _rename_model_io(
             rename_feature(spec, feat.name, new_name, rename_inputs=False)
 
 
-def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
-    """Convert StableHLO to MIL with streaming int4 weight quantization.
+def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec], weight_bits: int):
+    """Convert StableHLO to MIL, quantizing weights as they stream past.
 
     ``states`` maps traced-argument indices to :class:`StateSpec` — see
-    :func:`_kv_export_plan`.  Those arguments become Core ML state features and
-    disappear from the model's inputs/outputs.
+    :func:`_chunk_io_plan`.  Those arguments become Core ML state features and
+    disappear from the model's inputs/outputs.  Every weight is quantized
+    per-channel, ``weight_bits`` wide.
 
     Returns the MIL program.  The caller should ``del hlo_module`` after
     this returns to free the MLIR IR (~3.5 GB) before the heavier
@@ -346,10 +349,7 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     import numpy as np
     from coremltools.converters.mil import Builder as mb
 
-    from gemma_chat.mil_passes.quantize_const_weights import (
-        _is_logit_projection,
-        _quantize_weight,
-    )
+    from gemma_chat.mil_passes.quantize_const_weights import _quantize_weight
     from gemma_chat.stablehlo_streaming_patch import (
         install_stablehlo_streaming_patch,
         set_streaming_quantizer,
@@ -364,7 +364,7 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     except Exception as _e:
         print(f"  [convert] malloc_zone_pressure_relief skipped: {_e}", flush=True)
 
-    # ── Streaming int4 quantization during HLO→MIL ──
+    # ── Streaming quantization during HLO→MIL ──
     # Returning None hands the constant back to the converter untouched, which
     # emits it as a plain ``mb.const`` — that is how a weight opts out.
     _WEIGHT_THRESHOLD = 2048
@@ -375,10 +375,6 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
             return None
         if arr.dtype not in (np.float16, np.float32):
             return None
-        # The logit projection is left to the ``quantize_const_weights`` pass,
-        # which gives it int8 block-32 rather than int4 per-channel.
-        if _is_logit_projection(arr):
-            return None
         # Weights reach here as fp16 (``_inplace_bf16_to_f16`` runs before the
         # trace); the downcast is just a guard.  There used to be a matching
         # ``mb.cast(..., dtype="fp32")`` on the way out for weights whose
@@ -387,23 +383,23 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
         # runtime (528 MB) got there from JAX's own dot-promotion, not from
         # here.  With the graph fp16 end to end they are consumed as fp16.
         arr = arr.astype(np.float16, copy=False)
-        q_data, scale = _quantize_weight(arr)
-        del arr
+        q_data, scale = _quantize_weight(arr, weight_bits)
         _stream_counter[0] += 1
-        _stream_counter[1] += q_data.nbytes * 2
+        _stream_counter[1] += arr.nbytes
+        del arr
         if _stream_counter[0] % 20 == 0:
             print(
-                f"    streaming-quantized {_stream_counter[0]} int4  "
+                f"    streaming-quantized {_stream_counter[0]} int{weight_bits}  "
                 f"({_stream_counter[1] / 1e9:.2f} GB)  RSS={_rss_mb():.0f} MB",
                 flush=True,
             )
         return mb.constexpr_blockwise_shift_scale(
-            data=q_data, scale=scale, name=name + "_int4",
+            data=q_data, scale=scale, name=f"{name}_int{weight_bits}",
         )
 
     install_stablehlo_streaming_patch()
     set_streaming_quantizer(_stream_quantize)
-    print("  [convert] streaming int4 quantization enabled", flush=True)
+    print(f"  [convert] streaming int{weight_bits} quantization enabled", flush=True)
 
     print(
         f"  [convert {_os.getpid()}] hlo_to_mil ({len(states)} state args) …",
@@ -419,7 +415,7 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     if _stream_counter[0]:
         print(
             f"  StableHLO→MIL done — streaming-quantized "
-            f"{_stream_counter[0]} tensors to int4 "
+            f"{_stream_counter[0]} tensors to int{weight_bits} "
             f"({_stream_counter[1] / 1e9:.2f} GB fp16).",
             flush=True,
         )
@@ -539,11 +535,12 @@ def _mil_to_mlpackage(
 # ── Phase export ───────────────────────────────────────────────────────────
 
 
-def _export_function(fn, plan: _IOPlan, output_path: Path) -> None:
-    """Trace ``fn`` against ``plan``, convert it and save one .mlpackage."""
+def _export_function(fn, plan: _IOPlan, output_path: Path, weight_bits: int = 4) -> None:
+    """Trace ``fn`` against ``plan``, convert it and save one .mlpackage, its
+    weights quantized per-channel to ``weight_bits``."""
     print(f"  Tracing {output_path.stem} …", flush=True)
     hlo_module = jax.jit(fn).trace(*plan.arg_specs).lower().compiler_ir("stablehlo")
-    mil_program = _hlo_to_mil_streaming(hlo_module, plan.states)
+    mil_program = _hlo_to_mil_streaming(hlo_module, plan.states, weight_bits)
     del hlo_module
     _release_malloc()
     _mil_to_mlpackage(
@@ -653,9 +650,10 @@ def export_phase(
                 [jax.ShapeDtypeStruct((1, 1, config.embed_dim), jnp.float16)],
                 False, {}, ["hidden"], ["logits"], [],
             )
+            # int8: int4 is too lossy for the logits (see ``logits_head``).
             _export_function(
                 lambda hidden: logits_head(params, hidden, config),
-                head_plan, output_dir / "head.mlpackage",
+                head_plan, output_dir / "head.mlpackage", weight_bits=8,
             )
 
             state_plan = _state_io_plan(config, N)

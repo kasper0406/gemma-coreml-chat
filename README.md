@@ -51,7 +51,7 @@ What the measurements (M4 Pro, macOS 27; `MLComputePlan` per function, with comp
 - **Chunks cost the GPU and buy the ANE nothing.** Decode at 512 tokens: 12.6 / 13.4 / 14.1 ms per token on `cpu-and-gpu` for one / two / three chunks, and 26.6 / 27.0 / 27.8 ms on `cpu-and-ne`. So the export ships **one** chunk; `(0, 18)` is the measured-eligible fallback for a device with a lower limit.
 - **Cache sizes of 32768 and up do not compile for the ANE**, whatever the chunking: every prefill function fails there in the one- and three-chunk layouts, and so does the decode chunk that owns two global caches. `cpu-and-ne` and `all` therefore stop at 16384 tokens (the CLI's default cap is 8192, the iOS app's 2048); `cpu-and-gpu` and `cpu-only` run every size.
 
-`head` (final hidden `[1, 1, 1536]` → fp32 logits, softcapped) is int8 block-32 (`mil_passes/quantize_const_weights.py`): blockwise scales are not ANE-eligible, so under `cpu-and-ne` it runs on the CPU, accurately, ~4 ms of each step. Prefill runs it too, on the one row the runtime needs — the last real token of the chunk — instead of on all 128 rows, which is what used to cost prefill its fp16 `[128, 262144]` matmul.
+`head` (final hidden `[1, 1, 1536]` → fp32 logits, softcapped) is int8 with one scale per vocab row — the granularity the Neural Engine accepts (block-32 scales kept it on the CPU) — split into **9 vocab slices** of 29136 rows, concatenated. The split is set by the ANE's weight DMA: each of its 16 cores streams `ceil(rows / 16) × 1536` bytes of a slice, and when that lands within ~16 KiB of a multiple of 1 MiB ([the "1 MiB notch"](https://eiln.github.io/posts/ane-dma.html)) streaming runs at about half speed. 8 slices of 32768 rows would be exactly 3 MiB per core (13.6 ms on the ANE); 9 are 2.67 MiB (5.7 ms). `decode_coreml.head_slices` picks the fewest slices of at most 32768 rows that stay clear of the notch. Measured alone (M4 Pro, macOS 27), the head takes 3.8 ms on `cpu-and-ne` (was 9.2 ms on the CPU), 2.5 ms on `cpu-and-gpu` (was 3.1) and 4.5 ms on `cpu-only` (was 11.3). Prefill runs it too, on the one row the runtime needs — the last real token of the chunk — instead of on all 128 rows, which is what used to cost prefill its fp16 `[128, 262144]` matmul.
 
 > **Re-export required.** Loading a `.mlpackage` exported before the layer chunks fails with *"it predates the layer chunks the runtime now expects"* — re-run `uv run gemma-export`.
 
@@ -100,7 +100,7 @@ swift build -c release
 | Flag | Default | Description |
 |---|---|---|
 | `--model <path>` | `./gemma4-e2b.mlpackage` | Path to a `.mlpackage` or pre-compiled `.mlmodelc` |
-| `--compute-units <units>` | `cpu-and-gpu` | `all` (includes ANE, slow first compile), `cpu-only`, `cpu-and-gpu`, `cpu-and-ne` (the Neural Engine: about half the GPU's decode rate at a fraction of its power; contexts up to 16384) |
+| `--compute-units <units>` | `cpu-and-gpu` | `all` (includes ANE, slow first compile), `cpu-only`, `cpu-and-gpu`, `cpu-and-ne` (the Neural Engine: ~21 ms per token against the GPU's ~13, at ~3 W instead of ~20; contexts up to 16384) |
 | `--verbose` | off | Show diagnostic logs on stderr |
 | `--log-file <path>` | — | Redirect diagnostic logs to a file |
 

@@ -106,9 +106,9 @@ range genuinely needs it:
 * **RoPE angles** (``model._apply_rope``): positions run to 65535, which fp16
   cannot represent exactly; the sinusoid argument, ``sin`` and ``cos`` are
   computed in fp32 and cast to fp16 before the rotation itself.
-* **The logits**, from the output matmul onward: fp16 dot against the fp16
-  embedding table, fp32 out (upcasting the *weight* instead would put a 1.6 GB
-  fp32 constant in the graph — see :func:`logits_head`).
+* **The logits**, from the output matmuls onward: fp16 dots against the
+  embedding table's vocab slices, fp32 out (upcasting the *weight* instead
+  would put a 1.6 GB fp32 constant in the graph — see :func:`logits_head`).
 
 (The prefill ring update was an fp32 scatter for the same range reason as the
 RoPE angles; it is gone from the graph now that the host keeps the ring.)
@@ -561,16 +561,75 @@ def decode_chunk(params, chunk: LayerChunk, hidden, token_embed, ple_rows,
                       own, shared, cfg)
 
 
+# The Neural Engine splits a matmul's output channels across its 16 cores, and
+# each core streams its share of the weight: ceil(N_out / 16) * K * bytes.  When
+# that lands within ~16 KiB of a multiple of 1 MiB, a DMA erratum roughly halves
+# the weight-streaming rate (https://eiln.github.io/posts/ane-dma.html;
+# stablehlo-coreml PR #110).  Measured on the full int8 per-channel head
+# (262144 x 1536, M4 Pro, macOS 27): 8 vocab slices = 3.000 MiB per core,
+# 13.6 ms; 9 slices = 2.667 MiB, 5.69 ms; 10 slices = 2.401 MiB, 5.76 ms;
+# 8 slices x 3 contracting splits = 1.000 MiB, 13.7 ms.
+_ANE_CORES = 16
+_ANE_NOTCH = 1 << 20
+_ANE_NOTCH_GUARD = 64 << 10   # 4x the measured notch width
+# Rows per head slice, at most.  Core ML's int8 per-channel matmul returns
+# garbage on the GPU for N_out >= 65536 once M >= 5 (the head runs at M = 1,
+# this is margin), and one ANE weight kernel may not pass 128 MiB (this is
+# 48 MiB at K = 1536).
+_HEAD_MAX_ROWS = 32768
+
+
+def ane_core_payload(rows: int, cols: int, bytes_per_weight: int = 1) -> int:
+    """Bytes one ANE core streams for a ``[rows, cols]`` matmul weight."""
+    return -(-rows // _ANE_CORES) * cols * bytes_per_weight
+
+
+def in_ane_notch(payload: int) -> bool:
+    """Whether a per-core payload sits in the slow band around a (nonzero)
+    multiple of 1 MiB."""
+    nearest = round(payload / _ANE_NOTCH) * _ANE_NOTCH
+    return nearest > 0 and abs(payload - nearest) < _ANE_NOTCH_GUARD
+
+
+def head_slices(vocab: int, dim: int) -> List[Tuple[int, int]]:
+    """Vocab ranges ``[(start, stop), ...]`` the int8 logit head is split into.
+
+    The fewest slices of at most ``_HEAD_MAX_ROWS`` rows (a multiple of 16, so
+    every core gets whole rows) whose per-core payloads all stay clear of the
+    ANE's DMA notch.  For E2B's 262144 x 1536 head that is 9: 8 would be
+    exactly 3 MiB per core.
+    """
+    slices = -(-vocab // _HEAD_MAX_ROWS)
+    while True:
+        rows = -(-vocab // slices)
+        rows = -(-rows // _ANE_CORES) * _ANE_CORES
+        bounds = list(range(0, vocab, rows)) + [vocab]
+        ranges = list(zip(bounds, bounds[1:]))
+        if not any(in_ane_notch(ane_core_payload(b - a, dim)) for a, b in ranges):
+            return ranges
+        slices += 1
+
+
 def logits_head(params, hidden, cfg: Gemma4Config = E2B_CONFIG):
     """The tied logit head: final-normed hidden (1, 1, D) fp16 → (vocab,) fp32.
 
     Its own function in the export, shared by decode and prefill (the host
-    picks the prefill row it needs).  fp16 matmul, fp32 only from the logits
-    onward: upcasting the weight instead would put a [dim, vocab] *fp32*
-    constant in the graph — 1.6 GB.  The export stores the weight as int8
-    block-32 (see ``mil_passes/quantize_const_weights``).
+    picks the prefill row it needs).  One fp16 matmul per vocab slice
+    (:func:`head_slices`), concatenated; fp32 only from the logits onward:
+    upcasting the weight instead would put a [dim, vocab] *fp32* constant in
+    the graph — 1.6 GB.
+
+    The export stores each slice as int8 with one scale per vocab row
+    (``export._export_function(weight_bits=8)``): per-channel scales are what
+    the Neural Engine accepts (block-32 ones kept the head on the CPU), and the
+    slicing keeps it out of the ANE's DMA notch.  int4 is too lossy here.
     """
-    logits = jnp.dot(hidden[0, 0], params['embed_tokens'].T).astype(jnp.float32)
+    # numpy slices at trace time: each becomes a [dim, rows] graph constant.
+    table = np.asarray(params['embed_tokens'])
+    h = hidden[0, 0]
+    logits = jnp.concatenate([
+        jnp.dot(h, table[a:b].T) for a, b in head_slices(*table.shape)
+    ]).astype(jnp.float32)
     if cfg.final_logit_softcap is not None:
         cap = cfg.final_logit_softcap
         logits = jnp.tanh(logits / cap) * cap

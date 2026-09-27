@@ -5,10 +5,10 @@
 MIL pass: quantize large float weight constants, replacing them with
 constexpr_blockwise_shift_scale (iOS18) ops that are immune to constant folding.
 
-Everything quantized here is **int4**; the scale granularity is picked by what
-consumes the tensor (see :func:`_quantize_weight`):
+The scale granularity is picked by what consumes the tensor (see
+:func:`_quantize_weight`):
 
-* **Per-channel int4** for matmul weights — one scale per *output* channel, each
+* **Per-channel** for matmul weights — one scale per *output* channel, each
   block spanning the whole input (contraction) axis.  Required for the ANE: the
   CoreML ANE backend refuses to run any op fed by a
   constexpr_blockwise_shift_scale whose scales are grouped along the contraction
@@ -16,7 +16,11 @@ consumes the tensor (see :func:`_quantize_weight`):
   onto the CPU.  Scales of shape [1, O] are ANE-eligible.
   These weights are laid out [input_dim, output_dim] — they feed ``matmul`` as
   the ``y`` operand with ``transpose_y=False`` — so the output axis is the last
-  one and the scale shape is [1, O].
+  one and the scale shape is [1, O].  **int4**, except for the logit head's
+  vocab slices, which are **int8**: int4 is too lossy for logits (KL ~0.19
+  against the unquantized head, ~0.0015 for int8).  The exporter picks the
+  width per function (``export._export_function``), quantizing while it
+  converts; this pass only catches what that missed, at int4.
 * **Block-32 int4** for [VOCAB_SIZE, dim] embedding lookup tables.  A lookup
   is a ``gather``, which never runs on the ANE anyway, so there is nothing to
   gain from per-channel scales and real accuracy to lose: one block would span
@@ -24,31 +28,6 @@ consumes the tensor (see :func:`_quantize_weight`):
   longer has such a table in the graph -- the host does the lookups -- but
   ``gemma_chat.host_embeddings`` quantizes the tables it ships with this same
   function, so the host reproduces the old in-graph lookup exactly.
-* **Block-32 int8** for the [dim, VOCAB_SIZE] logit projection.  This used to
-  be left as plain fp16, for two reasons that no longer hold now that weights
-  reach the matmul as [N, K] with ``transpose_y=True`` (see
-  ``mil_passes.transpose_matmul_weights``):
-
-  - *"int8 makes MPSGraph constant-fold on every first prediction."*  That is
-    specific to the old [K, N] / ``transpose_y=False`` orientation.  Measured on
-    a fresh process at N=262144: int8 per-channel takes **16.3 s** to first
-    predict in the old orientation and **0.06 s** in the new one, the same as
-    fp16.  There is nothing left to avoid.
-  - *"int4 is too lossy for logits."*  Still true, and int4 is no faster here:
-    2.02 vs 2.11 ms at M=1 and 43.2 vs 43.1 ms at M=128.  int8 it is.
-
-  Block-32 rather than per-channel is **load-bearing for correctness**, not a
-  performance choice: in the [N, K] / ``transpose_y=True`` orientation Core ML's
-  int8 *per-channel* matmul returns uncorrelated garbage once N >= 65536 and
-  M >= 5 (measured relRMS 1.0 against fp16 at N=65536 for M=5 and M=128; correct
-  at M <= 4, at N <= 49152, and for block-32 at every M).  The ``head``
-  function only ever runs at M = 1 now (prefill runs it on the one row it
-  needs), but block-32 stays: it is also what keeps the head off the Neural
-  Engine, which is not eligible for blockwise scales — int8 per-channel runs
-  there at 13.6 ms against ~4 ms for block-32 on the CPU (M4 Pro, macOS 27).
-
-  Cost: the head shrinks 805 MB -> 403 MB and gets *faster* —
-  3.58 -> 2.11 ms at M=1.
 """
 
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
@@ -89,24 +68,13 @@ def _is_embedding(val: np.ndarray) -> bool:
     return val.ndim == 2 and val.shape[0] == _VOCAB_SIZE
 
 
-def _is_logit_projection(val: np.ndarray) -> bool:
-    """True if this tensor is the [dim, VOCAB_SIZE] logit projection.
-
-    Vocab on the *last* axis, so it is the ``y`` operand of the final matmul
-    rather than a gather table.  It is left unquantized — see the module
-    docstring for why int4 is too lossy and int8 is unlowerable.
-    """
-    return (val.ndim == 2 and val.shape[-1] == _VOCAB_SIZE
-            and val.shape[0] != _VOCAB_SIZE)
-
-
 def _classify_quantize(op):
     """Classify a const op for quantization.
 
     Returns:
         'int4' — quantizable weight
         'skip_constexpr' — already feeds a constexpr op
-        None — not a quantizable const (wrong type, too small, logit projection)
+        None — not a quantizable const (wrong type, too small)
     """
     if op.op_type != "const":
         return None
@@ -117,10 +85,6 @@ def _classify_quantize(op):
         return None
     if val.ndim < 2 or val.size < _WEIGHT_THRESHOLD:
         return None
-    # The logit projection gets int8 block-32, not the int4 of every other
-    # weight: int4 cannot carry the logits.  See the module docstring.
-    if _is_logit_projection(val):
-        return "int8_logit"
     # Don't re-compress what is already feeding a constexpr_* op
     for child_op in op.outputs[0].child_ops:
         if child_op.op_type.startswith("constexpr_"):
@@ -128,9 +92,10 @@ def _classify_quantize(op):
     return "int4"
 
 
-def _quantize_symmetric_per_channel(val: np.ndarray):
+def _quantize_symmetric_per_channel(val: np.ndarray, bits: int = 4):
     """
-    Symmetric per-channel int4 quantization (round-to-nearest, range [-7, 7]).
+    Symmetric per-channel quantization (round-to-nearest, range [-7, 7] for
+    int4, [-127, 127] for int8).
 
     One scale per output channel: the last axis of `val` is the output axis
     (weights feed ``matmul`` as ``y`` with ``transpose_y=False``, i.e. they are
@@ -140,12 +105,15 @@ def _quantize_symmetric_per_channel(val: np.ndarray):
     contraction axis force the whole model onto the CPU.
 
     Returns:
-        quantized_data: int4-tagged int8 array with same shape as val
+        quantized_data: int8 array with same shape as val, int4-tagged for
+            ``bits=4``
         scale: float array, same rank as val, shape [1, ..., 1, O]
 
     Note: processes in chunks along axis 0 to avoid OOM on large tensors.
     """
-    max_val = 7
+    if bits not in (4, 8):
+        raise ValueError(f"bits must be 4 or 8, got {bits}")
+    max_val = 7 if bits == 4 else 127
 
     reduce_axes = tuple(range(val.ndim - 1))
     n_rows = val.shape[0]
@@ -182,13 +150,14 @@ def _quantize_symmetric_per_channel(val: np.ndarray):
     del chan_max_f32, scale_f32
     # Tag the int8 container with int4 metadata so coremltools serializes
     # the data as packed 4-bit (halving on-disk weight storage).
-    quantized = quantized.view(_INT4_NP_DTYPE)
+    if bits == 4:
+        quantized = quantized.view(_INT4_NP_DTYPE)
     return quantized, scale
 
 
-def _quantize_symmetric_embedding_blocks(val: np.ndarray, bits: int = 4):
+def _quantize_symmetric_embedding_blocks(val: np.ndarray):
     """
-    Symmetric block-wise int4 (or int8) quantization, 32 elements per group.
+    Symmetric block-wise int4 quantization, 32 elements per group.
 
     One scale per group of 32 elements along the row (embedding-dim) axis, so
     the scale is [V, D/32].  Deliberately *not* per-channel: these tensors feed
@@ -205,9 +174,7 @@ def _quantize_symmetric_embedding_blocks(val: np.ndarray, bits: int = 4):
     _GROUP = 32
     if val.ndim != 2:
         raise ValueError(f"table must be rank 2, got shape {val.shape}")
-    if bits not in (4, 8):
-        raise ValueError(f"bits must be 4 or 8, got {bits}")
-    max_val = 7 if bits == 4 else 127
+    max_val = 7
 
     n_rows, n_cols = val.shape
     pad = (-n_cols) % _GROUP
@@ -235,32 +202,20 @@ def _quantize_symmetric_embedding_blocks(val: np.ndarray, bits: int = 4):
 
     scale = scale_f32.astype(val.dtype)
     del scale_f32
-    if bits == 4:
-        quantized = quantized.view(_INT4_NP_DTYPE)
-    return quantized, scale
+    return quantized.view(_INT4_NP_DTYPE), scale
 
 
-def _quantize_weight(val: np.ndarray):
+def _quantize_weight(val: np.ndarray, bits: int = 4):
     """Quantize one weight tensor with the granularity its consumer requires.
 
-    Per-channel for matmul weights, so the ANE will accept the ops they feed;
-    block-32 for the [VOCAB_SIZE, dim] embedding tables, whose gathers run on
-    the CPU regardless and would only lose accuracy from per-channel scales.
-    Always int4 — callers must keep the logit projection away from here (see
-    :func:`_is_logit_projection`).
+    Per-channel (``bits`` wide) for matmul weights, so the ANE will accept the
+    ops they feed; block-32 int4 for the [VOCAB_SIZE, dim] embedding tables,
+    whose gathers run on the CPU regardless and would only lose accuracy from
+    per-channel scales.
     """
-    if _is_logit_projection(val):
-        # int8, block-32 along the contraction axis.  NOT per-channel: with the
-        # weight in its final [N, K] / transpose_y=True orientation, Core ML's
-        # int8 per-channel matmul returns uncorrelated garbage once N >= 65536
-        # and M >= 5 (measured: relRMS 1.0 vs fp16 at N=65536/M=5 and M=128,
-        # correct at M<=4, at N<=49152, and for block-32 at every M), and on
-        # the ANE it is 3x slower than block-32 on the CPU.  See the module
-        # docstring.
-        return _quantize_symmetric_embedding_blocks(val, bits=8)
     if _is_embedding(val):
         return _quantize_symmetric_embedding_blocks(val)
-    return _quantize_symmetric_per_channel(val)
+    return _quantize_symmetric_per_channel(val, bits)
 
 
 @block_context_manager
@@ -282,7 +237,7 @@ def _quantize_consts_in_block(block):
                 f"shape={val.shape}  dtype={val.dtype}  consumers={child_types}",
                 flush=True,
             )
-        elif cls in ("int4", "int8_logit"):
+        elif cls == "int4":
             ops_to_quantize.append(op)
 
     if not ops_to_quantize:
@@ -359,7 +314,6 @@ class quantize_const_weights(AbstractGraphPass):
     block spanning the whole contraction axis — the only granularity the ANE
     accepts.  The [vocab_size, dim] embedding tables keep block-32 int4: their
     gathers run on the CPU either way, so per-channel would only cost accuracy.
-    The [dim, vocab_size] logit projection gets int8 block-32.
 
     Inserted at position 0 in the pass pipeline so that all subsequent
     passes work on the compressed model.
