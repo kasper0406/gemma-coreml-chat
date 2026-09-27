@@ -1,6 +1,7 @@
 /// Streamed detokenization equals the decode of the whole reply: the pieces
 /// ``TextStream`` returns, plus what ``TextStream/finish()`` flushes, always
-/// concatenate to it, and nothing returned is ever taken back.
+/// concatenate to it, nothing returned is ever taken back, and only a few
+/// scalars are ever held.
 
 import Foundation
 import XCTest
@@ -20,7 +21,7 @@ final class TextStreamTests: XCTestCase {
         static let words = [
             "<special>", "Hello", "▁", ".", "X", "\u{FFFD}", "▁do", "▁n", "'t", "▁'", "s",
             "▁world", ",", "'", "ve", "re", "m", "!", "?", "\n", "▁▁", "n", "▁know", "I", "▁'s",
-            "\u{0301}",
+            "\u{0301}", "▁trees", "t",
         ]
         static let byteBase = words.count
         static let vocabulary = words + (0..<256).map { String(format: "<0x%02X>", $0) }
@@ -52,8 +53,10 @@ final class TextStreamTests: XCTestCase {
         func stream() -> TextStream { TextStream(decode: decode, isByteToken: isByteToken) }
     }
 
-    /// Streams `ids`, asserting that nothing returned is later contradicted,
-    /// and returns the pieces (the last one from `finish()`).
+    /// Streams `ids`, asserting that nothing returned is later contradicted
+    /// and that at most four scalars (and an unfinished byte-fallback
+    /// character) are held, and returns the pieces (the last one from
+    /// `finish()`).
     @discardableResult
     private func assertStreamsAsFullDecode(
         _ ids: [Int], decode: @escaping ([Int]) -> String, stream: TextStream,
@@ -63,12 +66,17 @@ final class TextStreamTests: XCTestCase {
         let full = decode(ids)
         var pieces: [String] = []
         var soFar = String.UnicodeScalarView()
-        for id in ids {
+        for (i, id) in ids.enumerated() {
             pieces.append(stream.push(Int32(id)))
             soFar.append(contentsOf: pieces.last!.unicodeScalars)
             XCTAssertTrue(full.unicodeScalars.starts(with: soFar),
                           "returned \(String(soFar).debugDescription), not a prefix of \(full.debugDescription) (ids \(ids))",
                           file: file, line: line)
+            let text = decode(Array(ids[...i])).unicodeScalars
+            let bytes = text.reversed().prefix { $0 == "\u{FFFD}" }.count
+            XCTAssertLessThanOrEqual(text.count - soFar.count, 4 + bytes,
+                                     "held too much of \(String(text).debugDescription) (ids \(ids))",
+                                     file: file, line: line)
         }
         pieces.append(stream.finish())
         XCTAssertEqual(pieces.joined(), full, "ids \(ids)", file: file, line: line)
@@ -99,6 +107,9 @@ final class TextStreamTests: XCTestCase {
         check([T.id("I"), T.id("▁do"), T.id("▁n"), T.id("'t"), T.id("▁know")])     // "I don't know"
         check([T.id("I"), T.id("▁'"), T.id("ve"), T.id("▁'"), T.id("▁world")])      // " 've", " ' "
         check([T.id("Hello"), T.id("▁'s"), T.id("▁'"), T.id("re")])
+        // " ' " leaves the space before it in front of "'s": "  ' s" -> " 's" -> "'s".
+        XCTAssertEqual(check([T.id("I"), T.id("▁▁"), T.id("'"), T.id("▁"), T.id("s")]),
+                       ["I", "", "", "", "", "'s"])
     }
 
     func testACombiningMarkUndoesACleanup() {
@@ -106,6 +117,28 @@ final class TextStreamTests: XCTestCase {
         let pieces = check([T.id("I"), T.id("▁'s"), T.id("\u{0301}"), T.id("X")])
         XCTAssertEqual(pieces.joined(), "I 's\u{0301}X")
         XCTAssertEqual(pieces[1], "")
+    }
+
+    func testALongReplyStreamsTokenByTokenInABoundedWindow() {
+        // "trees" is all letters that cleanup patterns contain, and "." is a
+        // rewrite a combining mark could undo: neither is held past the next
+        // token, and the window decoded per token stays a few tokens long.
+        let tokenizer = FakeTokenizer(flushesTrailingBytes: false)
+        var longest = 0
+        let counting = { (ids: [Int]) -> String in
+            longest = max(longest, ids.count)
+            return tokenizer.decode(ids)
+        }
+        func stream(_ word: String) -> [String] {
+            longest = 0
+            return assertStreamsAsFullDecode(
+                [T.id("Hello")] + Array(repeating: T.id(word), count: 500),
+                decode: tokenizer.decode, stream: TextStream(decode: counting, isByteToken: tokenizer.isByteToken))
+        }
+        XCTAssertEqual(stream("▁trees"), ["Hello"] + Array(repeating: " trees", count: 500) + [""])
+        XCTAssertLessThanOrEqual(longest, 2)
+        XCTAssertEqual(stream("."), ["Hello", ""] + Array(repeating: ".", count: 500))
+        XCTAssertLessThanOrEqual(longest, 3)
     }
 
     func testHeldTextIsFlushedAtTheEnd() {
