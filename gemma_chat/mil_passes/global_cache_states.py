@@ -8,8 +8,8 @@ static from the start.  The 3 global caches cannot take that route: before
 materialization their length dim is symbolic, and Core ML states must have a
 concrete shape.
 
-``materialize_symbolic_shape_program`` fixes that — every ``{prefill,decode}_N``
-function it emits has fully concrete shapes.  This pass runs right after it and
+``materialize_symbolic_shape_program`` fixes that — every per-size function
+it emits has fully concrete shapes.  This pass runs right after it and
 converts the leftover cache I/O into state:
 
 * the input ``k_4`` becomes an fp16 ``state_tensor_placeholder`` of the same
@@ -18,12 +18,45 @@ converts the leftover cache I/O into state:
   used to read the input — it is the first op in the block, so it dominates
   every use;
 * the value that used to leave the function as ``k_4_out`` is written back with
-  ``coreml_update_state`` at the end of the block, and ``k_4_out`` is dropped
-  from the function outputs.
+  ``coreml_update_state`` right where it is produced, every later reader of it
+  reads the write's result instead, and ``k_4_out`` is dropped from the
+  function outputs.
 
-``sliding_pos_ring`` keeps its ordinary int32 I/O: Core ML states must be
-floating point.  That falls out of the fp16 filter below rather than being
-special-cased by name.
+Why the write is not a sink
+---------------------------
+Appending the writes at the end of the block, where nothing reads their
+result, looks simpler — and on macOS 27 makes ANECompiler throw ("Exception
+thrown: <private>") whenever such a "sink" write lands in an ANE segment, which
+fails the whole model load with the misleading "``functionName`` must be nil
+unless the model type is ML Program" error.  The sliding caches never had the
+problem: the converter already writes them where they are produced and reads
+the attention's keys and values back from the write.  This pass does the same.
+
+It is not free on the GPU: with the full model, decode steps of the 1024 and
+2048 functions are ~2% slower than with the writes at the end of the block
+(MPSGraph; measured with interleaved predict loops, macOS 27, M4 Pro), while
+the 512 one is unaffected.
+
+A written value that only reaches the output through an ``identity`` alias
+(``updated -> attention``, ``identity(updated) -> k_4_out``) is written where
+``updated`` is produced, not after the alias — after it, nothing would read the
+write.  And every write must end up with a reader: :func:`check_state_writes_are_read`
+fails the export rather than let a sink through.  It judges the program *after*
+dead-code elimination — a reader that DCE later removes (say, a cast nothing
+uses) would otherwise pass for one — so the pass runs DCE before checking, and
+``materialize`` checks the final program once more.
+
+Read-only caches
+----------------
+A layer-chunk function (see ``decode_coreml.layer_chunks``) may *read* a cache
+another chunk writes — the KV-shared layers read layer 13's and 14's.  Such a
+function takes the cache as an input with no ``_out`` partner; the pass turns
+it into a state that is only read (``read_state``, no write).  Core ML shares
+states across the functions of one package by name, so the reading chunk sees
+what the writing chunk stored.
+
+Only inputs named like a cache (``k_<slot>`` / ``v_<slot>``) are touched, so a
+chunk's ``hidden`` / ``hidden_out`` pair stays ordinary I/O.
 
 The ``fill_like`` + ``add`` wrapper
 -----------------------------------
@@ -46,6 +79,8 @@ otherwise be a compile-time constant.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import Function, Program, Var, types
@@ -54,53 +89,100 @@ from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 from coremltools.converters.mil.mil.types.symbolic import any_symbolic
 
-# An input ``X`` and an output ``X_out`` of identical fp16 type are a KV cache
-# pair — the exporter names every cache that way (see ``export._kv_export_plan``).
+# The exporter names every KV cache ``k_<slot>`` / ``v_<slot>``, and the value
+# a function writes back ``k_<slot>_out`` (see ``export._chunk_io_plan``).
+CACHE_NAME = re.compile(r"[kv]_\d+")
 OUTPUT_SUFFIX = "_out"
 
 
-def _cache_io_pairs(func: Function) -> list[tuple[str, Var]]:
-    """Return ``(input_name, output_var)`` for every fp16 ``X`` / ``X_out`` pair.
+def _cache_inputs(func: Function) -> list[tuple[str, Var | None]]:
+    """Return ``(input_name, output_var or None)`` for every fp16 cache input.
 
-    Skips inputs that are already state, non-fp16 pairs (``sliding_pos_ring``
-    is int32 and must stay I/O), and anything whose shape is still symbolic —
-    a state cannot have a flexible shape, so an unmaterialized function is left
-    alone rather than turned into a model that fails to load.
+    ``output_var`` is the ``<name>_out`` output the cache is written back
+    from, or None for a cache the function only reads.  Skips inputs that are
+    already state and anything whose shape is still symbolic — a state cannot
+    have a flexible shape, so an unmaterialized function is left alone rather
+    than turned into a model that fails to load.
     """
     outputs_by_name: dict[str, Var] = {var.name: var for var in func.outputs}
-    pairs: list[tuple[str, Var]] = []
+    caches: list[tuple[str, Var | None]] = []
     for name, var in func.inputs.items():
-        if types.is_state(var.sym_type):
+        if not CACHE_NAME.fullmatch(name) or types.is_state(var.sym_type):
+            continue
+        if var.dtype != types.fp16 or any_symbolic(var.shape):
             continue
         out_var = outputs_by_name.get(name + OUTPUT_SUFFIX)
-        if out_var is None:
-            continue
-        if var.dtype != types.fp16 or out_var.dtype != types.fp16:
-            continue
-        if any_symbolic(var.shape) or any_symbolic(out_var.shape):
-            continue
-        if out_var is var:
-            raise ValueError(
-                f"cache {name} is passed through unchanged ({out_var.name} is "
-                "the input itself); there is no updated value to write back"
-            )
-        if tuple(var.shape) != tuple(out_var.shape):
-            raise ValueError(
-                f"cache pair {name}/{out_var.name} has mismatched shapes "
-                f"{tuple(var.shape)} vs {tuple(out_var.shape)}"
-            )
-        pairs.append((name, out_var))
-    return pairs
+        if out_var is not None:
+            if any_symbolic(out_var.shape):
+                continue
+            if _unaliased(out_var) is var:
+                raise ValueError(
+                    f"cache {name} is passed through unchanged ({out_var.name} is "
+                    "the input itself); there is no updated value to write back"
+                )
+            if out_var.dtype != types.fp16 or tuple(var.shape) != tuple(out_var.shape):
+                raise ValueError(
+                    f"cache pair {name}/{out_var.name} has mismatched types "
+                    f"{var.sym_type} vs {out_var.sym_type}"
+                )
+        caches.append((name, out_var))
+    return caches
+
+
+def _unaliased(var: Var) -> Var:
+    """``var`` with any chain of ``identity`` ops in front of it stripped."""
+    while var.op is not None and var.op.op_type == "identity":
+        var = var.op.x
+    return var
+
+
+def _unread_state_writes(block) -> list[str]:
+    """Names of the ``coreml_update_state`` ops in ``block`` — and in every
+    block nested in its ops (``cond`` branches, loop bodies) — whose result
+    nothing in their own block reads and that block does not return."""
+    sinks = []
+    for op in block.operations:
+        for inner in op.blocks:
+            sinks += _unread_state_writes(inner)
+        if (op.op_type == "coreml_update_state" and not op.outputs[0].child_ops
+                and op.outputs[0] not in block.outputs):
+            sinks.append(op.name)
+    return sinks
+
+
+def check_state_writes_are_read(prog: Program) -> None:
+    """Fail if any ``coreml_update_state`` in ``prog``, at any block depth, has
+    a result nothing reads.
+
+    Such a "sink" write makes ANECompiler fail the whole model (see the module
+    docstring).  Only meaningful on a program dead-code elimination has just
+    seen: until then, a dead op (an unused cast, an orphaned output alias)
+    still counts as a reader.
+    """
+    sinks = {fname: _unread_state_writes(func) for fname, func in prog.functions.items()}
+    sinks = {fname: names for fname, names in sinks.items() if names}
+    if sinks:
+        raise ValueError(
+            f"state writes with no reader: {sinks}; a coreml_update_state "
+            "nothing consumes makes ANECompiler fail the whole model (see "
+            "mil_passes.global_cache_states)"
+        )
+
+
+def _run_dce(prog: Program) -> None:
+    from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
+
+    PASS_REGISTRY["common::dead_code_elimination"](prog)
 
 
 @block_context_manager
-def _statify_function(func: Function, pairs: list[tuple[str, Var]]) -> None:
+def _statify_function(func: Function, caches: list[tuple[str, Var | None]]) -> None:
     """Rewrite one function's cache I/O into state, in place."""
     first_op = next(iter(func.operations), None)
     if first_op is None:
         raise ValueError("cannot convert caches to state in an empty function")
 
-    converted_outputs = {out_var for _, out_var in pairs}
+    converted_outputs = {out_var for _, out_var in caches if out_var is not None}
     remaining_outputs = [var for var in func.outputs if var not in converted_outputs]
     if not remaining_outputs:
         raise ValueError(
@@ -108,7 +190,12 @@ def _statify_function(func: Function, pairs: list[tuple[str, Var]]) -> None:
             "outputs, which Core ML rejects"
         )
 
-    for in_name, out_var in pairs:
+    # Drop the cache outputs before rerouting their readers below: rerouting a
+    # block output renames the write's result to ``k_4_out``, and Core ML
+    # rejects the program ("Block redefines I/O name").
+    func.set_outputs(remaining_outputs)
+
+    for in_name, out_var in caches:
         old_var = func.inputs[in_name]
 
         # 1. The input becomes an fp16 state feature of the same concrete shape,
@@ -127,42 +214,57 @@ def _statify_function(func: Function, pairs: list[tuple[str, Var]]) -> None:
         func.replace_uses_of_var_after_op(
             anchor_op=None, old_var=old_var, new_var=read_var,
         )
+        if out_var is None:
+            continue  # read-only: no write
 
-        # 3. Write the fully-updated cache back at the end of the block.  The
-        #    zero add is load-bearing — see the module docstring.
+        # 3. Write the fully-updated cache back right after it is produced —
+        #    behind any output alias — and make every later reader consume the
+        #    write's result, so the write is never a sink (see the module
+        #    docstring).  The zero add is load-bearing — see there too.
+        updated = _unaliased(out_var)
+        ops = list(func.operations)
+        producer = ops.index(updated.op)
+        after = ops[producer + 1] if producer + 1 < len(ops) else None
         zeros = mb.fill_like(
-            ref_tensor=read_var, value=np.float16(0), name=f"{in_name}_state_zeros",
+            ref_tensor=read_var, value=np.float16(0),
+            name=f"{in_name}_state_zeros", before_op=after,
         )
-        value = mb.add(x=zeros, y=out_var, name=f"{in_name}_state_value")
-        mb.coreml_update_state(
-            state=state_var, value=value, name=f"{in_name}_update_state",
+        value = mb.add(x=zeros, y=updated, name=f"{in_name}_state_value", before_op=after)
+        written = mb.coreml_update_state(
+            state=state_var, value=value, name=f"{in_name}_update_state", before_op=after,
         )
-
-    func.set_outputs(remaining_outputs)
+        func.replace_uses_of_var_after_op(
+            anchor_op=written.op, old_var=updated, new_var=written,
+        )
 
 
 @register_pass(namespace="common")
 class global_kv_caches_to_states(AbstractGraphPass):
-    """Convert every concrete-shape fp16 ``X`` / ``X_out`` cache pair to state.
+    """Convert every concrete-shape fp16 cache input (``k_<slot>`` /
+    ``v_<slot>``) to state — written back from its ``_out`` output if it has
+    one, read-only otherwise.
 
-    Applied to a materialized program, this turns the 3 global KV caches of
-    every ``{prefill,decode}_N`` function into 6 state features (``k_4``,
-    ``v_4``, ``k_9``, ``v_9``, ``k_14``, ``v_14``) and removes the matching
-    inputs and outputs.  Functions whose caches are still symbolic-shaped are
-    left untouched.
+    Applied to a materialized program, this turns the global KV caches of
+    every per-size function into state features (``k_4``, ``v_4``, ``k_9``,
+    ``v_9``, ``k_14``, ``v_14``) and removes the matching inputs and outputs.
+    Functions whose caches are still symbolic-shaped are left untouched.
     """
 
     def apply(self, prog: Program) -> None:
         converted: dict[str, list[str]] = {}
         for fname, func in prog.functions.items():
-            pairs = _cache_io_pairs(func)
-            if not pairs:
+            caches = _cache_inputs(func)
+            if not caches:
                 continue
-            _statify_function(func, pairs)
-            converted[fname] = [name for name, _ in pairs]
+            _statify_function(func, caches)
+            converted[fname] = [name for name, _ in caches]
 
         if not converted:
             return
+        # Whether each write has a reader is only decidable once the dead
+        # readers are gone.
+        _run_dce(prog)
+        check_state_writes_are_read(prog)
         names = sorted({n for v in converted.values() for n in v})
         print(
             f"  global_kv_caches_to_states: {len(names)} caches → state "

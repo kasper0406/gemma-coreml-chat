@@ -1,35 +1,50 @@
-"""Export Gemma4-E2B chunk_prefill + decode_step as a CoreML .mlpackage.
+"""Export Gemma4-E2B as a CoreML multifunction .mlpackage of layer chunks.
 
-By default, both functions are merged into a single multifunction .mlpackage
-with shared quantized weights (per-channel int4 for matmul weights, since
-blockwise scales are not ANE-eligible; block-32 int4 for the CPU-side embedding
-tables; the logit projection left unquantized as plain fp16, because int8 is
-what MPSGraph constant-folds on first prediction and int4 cannot carry the
-logits — see ``mil_passes/quantize_const_weights``), and the global KV caches are
-materialized into one concrete-shape function per size so the model runs on
-ANE / CPU as well as GPU.  Pass --no-materialize to keep RangeDim shapes for a
-single dynamic-shape function pair.
+Every prefill / decode step runs as a sequence of **layer-chunk functions**
+(``decode_coreml.layer_chunks``) followed by one shared ``head``: the Neural
+Engine takes no function past a size limit, and one too-large function takes
+the whole package off it.  The package holds, per cache size ``N``:
 
-All 15 KV caches end up as Core ML **state** in the materialized model; the
-int32 ``sliding_pos_ring`` is the only thing besides tokens/positions that
-still crosses the model boundary (states must be floating point).
+* ``prefill_c<k>_<N>`` / ``decode_c<k>_<N>`` — layer chunk ``k``: the hidden
+  state in (``token_embed`` itself for chunk 0), the hidden state out
+  (final-normed after the last chunk);
+* ``state_<N>`` — declares every KV cache and reads a sliver of each; never
+  predicted in the hot path, it only exists so the runtime can make the one
+  ``MLState`` all chunks of that size share (Core ML shares states across a
+  package's functions by name, and a function may declare a subset of them);
 
-The two halves get there by different routes.  The 12 sliding-window caches are
-static-shaped from the start, so the StableHLO→MIL converter binds them to
-state directly (see :func:`_kv_export_plan`).  The 3 global caches keep a
-symbolic dim 1 through conversion — a state cannot have a flexible shape — and
-only become state once materialization has given every function a concrete
-cache length, in ``mil_passes.global_cache_states``.
+and, size-independent:
 
-Note: --no-materialize does not produce a loadable model any more — a
-dynamic-shape (RangeDim) program that also declares states fails to load with
-E5RT/BNNS errors, and its global caches stay ordinary I/O.  That path was
-already GPU-only/experimental; use the default materialized flow.
+* ``head`` — final-normed hidden ``[1, 1, D]`` → fp32 logits, used by decode
+  and (on the row the runtime picks) prefill.
+
+Matmul weights are quantized with per-channel scales (blockwise ones are not
+ANE-eligible): int4 in the layer chunks, int8 in ``head``, whose vocab is
+split into slices that keep the Neural Engine's weight DMA fast
+(``decode_coreml.head_slices``) — see ``mil_passes/quantize_const_weights`` —
+and deduplicated across functions.
+
+The embedding lookups are not in the graph: the functions take the embedding
+rows (``token_embed``, ``ple_rows``) and the runtime looks them up in the
+block-32 int4 tables this exporter ships in the package's ``Embeddings/``
+directory, next to ``Tokenizer/`` — see ``gemma_chat.host_embeddings``.
+
+All 15 KV caches are Core ML **state**.  The sliding ones are static-shaped, so
+the StableHLO→MIL converter binds them directly (:func:`_chunk_io_plan`); the
+global ones carry a symbolic length through conversion — a state cannot have a
+flexible shape — and become state once materialization has given every
+function a concrete cache length (``mil_passes.global_cache_states``).  The
+int32 ``sliding_pos_ring`` stays an input (states must be floating point) and
+the runtime updates it itself.
+
+``--no-materialize`` keeps the dynamic-shape functions, which do not load (a
+RangeDim program that declares states fails with E5RT/BNNS errors); it is only
+useful for inspecting the converted program.
 
 Usage:
     uv run gemma-export
     uv run gemma-export --output gemma4-e2b.mlpackage
-    uv run gemma-export --no-materialize  # dynamic-shape, does not load
+    uv run gemma-export --materialize-sizes 512,1024,2048,4096
     uv run gemma-export --skip-warmup     # save RAM on constrained machines
 """
 
@@ -37,11 +52,13 @@ from __future__ import annotations
 
 import argparse
 import gc
+import shutil
 import subprocess
 import sys
 import os as _os
 import signal as _signal
 
+import dataclasses
 from pathlib import Path
 import numpy as np
 
@@ -109,15 +126,14 @@ import coremltools as ct
 from stablehlo_coreml import StateSpec
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
-from gemma_chat.config import (
-    CHUNK_SIZE, E2B_CONFIG, HF_MODEL_ID, MAX_SEQ_LEN, VARIANTS,
-)
+from gemma_chat.config import CHUNK_SIZE, HF_MODEL_ID, MAX_SEQ_LEN, VARIANTS
 from gemma_chat.model import Gemma4Transformer, Gemma4Config, AttentionType
 from gemma_chat.weight_mapper import load_params
 from gemma_chat.decode_coreml import (
-    chunk_prefill_step, decode_step, empty_pos_ring,
+    LayerChunk, decode_chunk, layer_chunks, logits_head, prefill_chunk,
 )
-from gemma_chat.cache_spec import build_cache_specs
+from gemma_chat.cache_spec import build_cache_specs, sliding_ring_length
+from gemma_chat import host_embeddings
 
 
 # ── Truncated config / params for --num-layers ────────────────────────────
@@ -162,50 +178,119 @@ def _truncate_params(params: dict, num_layers: int, ple_dim: int) -> dict:
     return params
 
 
-# ── Shared helpers ─────────────────────────────────────────────────────────
+# ── Function I/O plans ─────────────────────────────────────────────────────
 
 
-def _kv_export_plan(
-    cache_specs, has_global: bool,
-) -> tuple[dict[int, StateSpec], list[str], list[str]]:
-    """Split the flat KV caches into Core ML state and ordinary I/O.
+@dataclasses.dataclass
+class _IOPlan:
+    """How one traced function's arguments and results map onto Core ML.
 
-    Sliding caches are static-shaped, so they become Core ML **state**: the
-    converter drops them from the model inputs and drops their updated value
-    from the outputs, exposing a state feature instead.  Global caches carry a
-    symbolic dim 1 (states must be static-shaped) and ``sliding_pos_ring`` is
-    int32 (states must be floating point), so both stay ordinary I/O here.
-    The global caches join the states after materialization concretizes their
-    length — see ``mil_passes.global_cache_states``; ``sliding_pos_ring`` stays
-    I/O for good.
-
-    Both traced functions have the argument order
-    ``[N?] + [tokens, start_position] + kv_flat + [sliding_pos_ring]`` and the
-    result order ``[logits] + kv_flat_out + [sliding_pos_ring_out]``, where
-    ``kv_flat`` is ``[k_0, v_0, k_1, v_1, ...]``.  Cache slot ``s`` is therefore
-    argument ``base + 2s`` (k) / ``base + 2s + 1`` (v) with
-    ``base = (1 if has_global else 0) + 2``, and output ``1 + 2s`` / ``2 + 2s``.
-    ``N`` is the leading dimension-variable argument JAX adds for the symbolic
-    global cache length; it is absent when no layer is global.
-
-    Returns ``(states, kv_input_names, kv_output_names)`` where the two name
-    lists cover only the caches that remain I/O, in slot order.  State features
-    keep the names the inputs used to have (``k_0``, ``v_0``, …) so the layout
-    is unchanged from the runtime's point of view.
+    ``arg_specs`` are the trace specs in argument order, **excluding** JAX's
+    leading dimension-variable argument ``N`` (present iff ``has_global``).
+    ``states`` maps traced-argument indices (counting ``N``) to
+    :class:`StateSpec`; ``input_names`` / ``output_names`` name the remaining
+    inputs and outputs, in order.  ``flexible`` are the input names whose dim 1
+    is the symbolic global cache length (their ``_out`` outputs too).
     """
-    base = (1 if has_global else 0) + 2
+    arg_specs: list
+    has_global: bool
+    states: dict[int, StateSpec]
+    input_names: list[str]
+    output_names: list[str]
+    flexible: list[str]
+
+
+def _cache_spec_for(config: Gemma4Config, slot: int, N):
+    """Trace spec of cache slot ``slot``: sliding ones are ``(1, R, nkv, hd)``
+    (``R = sliding_ring_length``), global ones ``(1, N, nkv, hd)`` with ``N``
+    symbolic."""
+    spec = build_cache_specs(config, 1)[slot]
+    length = N if spec.attn_type == AttentionType.GLOBAL else sliding_ring_length(config)
+    return jax.ShapeDtypeStruct((1, length, spec.num_kv_heads, spec.head_dim), jnp.float16)
+
+
+def _is_global_slot(config: Gemma4Config, slot: int) -> bool:
+    return build_cache_specs(config, 1)[slot].attn_type == AttentionType.GLOBAL
+
+
+def _chunk_io_plan(
+    config: Gemma4Config, chunk: LayerChunk, first: bool, tokens: int, N,
+) -> _IOPlan:
+    """The signature of one layer-chunk function.
+
+    Arguments, in order: ``[N] + leading + [k_s, v_s for s in chunk.slots] +
+    [sliding_pos_ring]``, where ``leading`` is ``[hidden]`` (all but the first
+    chunk) ``+ [token_embed, ple_rows, position]``.  Results:
+    ``[hidden_out] + [k_s_out, v_s_out for s in chunk.writes]``.
+
+    Sliding caches become state here — written back from their result if the
+    chunk owns them, read-only otherwise.  Global caches stay I/O with a
+    symbolic length (``k_s`` in, ``k_s_out`` out when written) until
+    ``mil_passes.global_cache_states`` converts them after materialization.
+    Names are ``k_<slot>`` / ``v_<slot>`` throughout; that pass relies on it.
+    """
+    d = config.per_layer_input_dim
+    D = config.embed_dim
+    leading = (["hidden"] if not first else []) + ["token_embed", "ple_rows", "position"]
+    arg_specs = (
+        ([jax.ShapeDtypeStruct((1, tokens, D), jnp.float16)] if not first else [])
+        + [
+            jax.ShapeDtypeStruct((1, tokens, D), jnp.float16),
+            jax.ShapeDtypeStruct((1, tokens, len(chunk.layers) * d), jnp.float16),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+        ]
+    )
+    has_global = any(_is_global_slot(config, s) for s in chunk.slots)
+    uses_ring = any(
+        config.attention_types[i] == AttentionType.LOCAL_SLIDING for i in chunk.layers
+    )
+    base = (1 if has_global else 0) + len(leading)
+    written = {s: 1 + 2 * j for j, s in enumerate(chunk.writes)}  # k result index
+
     states: dict[int, StateSpec] = {}
-    kv_input_names: list[str] = []
-    kv_output_names: list[str] = []
-    for slot, spec in enumerate(cache_specs):
-        k_name, v_name = f"k_{slot}", f"v_{slot}"
-        if spec.attn_type == AttentionType.GLOBAL:
-            kv_input_names += [k_name, v_name]
-            kv_output_names += [k_name + "_out", v_name + "_out"]
-        else:
-            states[base + 2 * slot] = StateSpec(output=1 + 2 * slot, name=k_name)
-            states[base + 2 * slot + 1] = StateSpec(output=2 + 2 * slot, name=v_name)
-    return states, kv_input_names, kv_output_names
+    input_names = (["N"] if has_global else []) + leading
+    output_names = ["hidden_out"]
+    flexible: list[str] = []
+    for j, slot in enumerate(chunk.slots):
+        for half, prefix in enumerate(("k", "v")):
+            name = f"{prefix}_{slot}"
+            arg_specs.append(_cache_spec_for(config, slot, N))
+            out = written[slot] + half if slot in written else None
+            if _is_global_slot(config, slot):
+                input_names.append(name)
+                flexible.append(name)
+                if out is not None:
+                    output_names.append(name + "_out")
+            else:
+                states[base + 2 * j + half] = StateSpec(output=out, name=name)
+    if uses_ring:
+        arg_specs.append(jax.ShapeDtypeStruct((1, sliding_ring_length(config)), jnp.int32))
+        input_names.append("sliding_pos_ring")
+    return _IOPlan(arg_specs, has_global, states, input_names, output_names, flexible)
+
+
+def _state_io_plan(config: Gemma4Config, N) -> _IOPlan:
+    """The ``state`` function: every cache as an argument, all read-only."""
+    slots = range(len(build_cache_specs(config, 1)))
+    has_global = any(_is_global_slot(config, s) for s in slots)
+    base = 1 if has_global else 0
+    arg_specs, states, flexible = [], {}, []
+    input_names = ["N"] if has_global else []
+    for slot in slots:
+        for half, prefix in enumerate(("k", "v")):
+            name = f"{prefix}_{slot}"
+            arg_specs.append(_cache_spec_for(config, slot, N))
+            if _is_global_slot(config, slot):
+                input_names.append(name)
+                flexible.append(name)
+            else:
+                states[base + 2 * slot + half] = StateSpec(output=None, name=name)
+    return _IOPlan(arg_specs, has_global, states, input_names, ["probe"], flexible)
+
+
+def _host_tables_dir(phase_output: Path) -> Path:
+    """Where the decode phase leaves the host embedding tables for the parent."""
+    return Path(phase_output).with_suffix(".embeddings")
 
 
 def _rename_model_io(
@@ -247,12 +332,13 @@ def _rename_model_io(
             rename_feature(spec, feat.name, new_name, rename_inputs=False)
 
 
-def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
-    """Convert StableHLO to MIL with streaming int4 weight quantization.
+def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec], weight_bits: int):
+    """Convert StableHLO to MIL, quantizing weights as they stream past.
 
     ``states`` maps traced-argument indices to :class:`StateSpec` — see
-    :func:`_kv_export_plan`.  Those arguments become Core ML state features and
-    disappear from the model's inputs/outputs.
+    :func:`_chunk_io_plan`.  Those arguments become Core ML state features and
+    disappear from the model's inputs/outputs.  Every weight is quantized
+    per-channel, ``weight_bits`` wide.
 
     Returns the MIL program.  The caller should ``del hlo_module`` after
     this returns to free the MLIR IR (~3.5 GB) before the heavier
@@ -263,10 +349,7 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     import numpy as np
     from coremltools.converters.mil import Builder as mb
 
-    from gemma_chat.mil_passes.quantize_const_weights import (
-        _is_logit_projection,
-        _quantize_weight,
-    )
+    from gemma_chat.mil_passes.quantize_const_weights import _quantize_weight
     from gemma_chat.stablehlo_streaming_patch import (
         install_stablehlo_streaming_patch,
         set_streaming_quantizer,
@@ -281,7 +364,7 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     except Exception as _e:
         print(f"  [convert] malloc_zone_pressure_relief skipped: {_e}", flush=True)
 
-    # ── Streaming int4 quantization during HLO→MIL ──
+    # ── Streaming quantization during HLO→MIL ──
     # Returning None hands the constant back to the converter untouched, which
     # emits it as a plain ``mb.const`` — that is how a weight opts out.
     _WEIGHT_THRESHOLD = 2048
@@ -292,14 +375,6 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
             return None
         if arr.dtype not in (np.float16, np.float32):
             return None
-        # The logit projection stays an unquantized fp16 const.  int4 is too
-        # lossy for it (it is read out as the logits, and per-channel scales
-        # leave it no grouping to fall back on) and int8 — the width that would
-        # carry it — is the one MPSGraph constant-folds on every function's
-        # first prediction, ~17 s and 18 GB a time.  See
-        # ``mil_passes/quantize_const_weights``.
-        if _is_logit_projection(arr):
-            return None
         # Weights reach here as fp16 (``_inplace_bf16_to_f16`` runs before the
         # trace); the downcast is just a guard.  There used to be a matching
         # ``mb.cast(..., dtype="fp32")`` on the way out for weights whose
@@ -308,23 +383,23 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
         # runtime (528 MB) got there from JAX's own dot-promotion, not from
         # here.  With the graph fp16 end to end they are consumed as fp16.
         arr = arr.astype(np.float16, copy=False)
-        q_data, scale = _quantize_weight(arr)
-        del arr
+        q_data, scale = _quantize_weight(arr, weight_bits)
         _stream_counter[0] += 1
-        _stream_counter[1] += q_data.nbytes * 2
+        _stream_counter[1] += arr.nbytes
+        del arr
         if _stream_counter[0] % 20 == 0:
             print(
-                f"    streaming-quantized {_stream_counter[0]} int4  "
+                f"    streaming-quantized {_stream_counter[0]} int{weight_bits}  "
                 f"({_stream_counter[1] / 1e9:.2f} GB)  RSS={_rss_mb():.0f} MB",
                 flush=True,
             )
         return mb.constexpr_blockwise_shift_scale(
-            data=q_data, scale=scale, name=name + "_int4",
+            data=q_data, scale=scale, name=f"{name}_int{weight_bits}",
         )
 
     install_stablehlo_streaming_patch()
     set_streaming_quantizer(_stream_quantize)
-    print("  [convert] streaming int4 quantization enabled", flush=True)
+    print(f"  [convert] streaming int{weight_bits} quantization enabled", flush=True)
 
     print(
         f"  [convert {_os.getpid()}] hlo_to_mil ({len(states)} state args) …",
@@ -340,7 +415,7 @@ def _hlo_to_mil_streaming(hlo_module, states: dict[int, StateSpec]):
     if _stream_counter[0]:
         print(
             f"  StableHLO→MIL done — streaming-quantized "
-            f"{_stream_counter[0]} tensors to int4 "
+            f"{_stream_counter[0]} tensors to int{weight_bits} "
             f"({_stream_counter[1] / 1e9:.2f} GB fp16).",
             flush=True,
         )
@@ -457,185 +532,47 @@ def _mil_to_mlpackage(
     del cml_model
 
 
-# ── Chunked-prefill export ─────────────────────────────────────────────────
+# ── Phase export ───────────────────────────────────────────────────────────
 
 
-def export_chunk_prefill(
-    output_path: str | Path,
+def _export_function(fn, plan: _IOPlan, output_path: Path, weight_bits: int = 4) -> None:
+    """Trace ``fn`` against ``plan``, convert it and save one .mlpackage, its
+    weights quantized per-channel to ``weight_bits``."""
+    print(f"  Tracing {output_path.stem} …", flush=True)
+    hlo_module = jax.jit(fn).trace(*plan.arg_specs).lower().compiler_ir("stablehlo")
+    mil_program = _hlo_to_mil_streaming(hlo_module, plan.states, weight_bits)
+    del hlo_module
+    _release_malloc()
+    _mil_to_mlpackage(
+        mil_program, output_path,
+        input_names=plan.input_names,
+        output_names=plan.output_names,
+        flexible_shapes={name: (1, MAX_SEQ_LEN) for name in plan.flexible},
+    )
+    jax.clear_caches()
+    _release_malloc()
+
+
+def export_phase(
+    phase: str,
+    output_dir: str | Path,
     model_id: str = HF_MODEL_ID,
     variant: str = "e2b",
-    max_seq_len: int = MAX_SEQ_LEN,
-    chunk_size: int = CHUNK_SIZE,
-    num_layers: int | None = None,
-) -> None:
-    """Export the chunked-prefill model (process CHUNK_SIZE tokens per call).
-
-    Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
-    so a single model works at any cache length up to ``max_seq_len``.
-    Sliding KV caches are Core ML state and never cross the model boundary;
-    materialization later turns the global ones into state as well and folds
-    ``N`` into a per-function constant, dropping both from the signature
-    described below.
-
-    Inputs:  N (1,) int32 — phantom dim for current global cache length
-             tokens (1, chunk_size) int32
-             start_position (1,) int32  — absolute position of first token in chunk
-             k_s, v_s — current **global** KV cache arrays float16 (slot order)
-             sliding_pos_ring (1, sliding_window_size) int32
-    States:  k_s, v_s — the sliding KV caches, float16, updated in place
-    Outputs: logits (chunk_size, vocab_size) float32
-             k_s_out, v_s_out — updated global KV caches
-             sliding_pos_ring_out (1, sliding_window_size) int32
-    """
-    import gc
-    import numpy as np
-    from jax import export as jax_export
-
-    output_path = Path(output_path)
-    config = VARIANTS[variant][0]
-    full_num_layers = config.num_layers
-    if num_layers is not None and num_layers < config.num_layers:
-        config = _truncated_config(config, num_layers)
-        print(f"  Truncated config to {config.num_layers} layers: "
-              f"{[a[:3] for a in config.attention_types]}")
-
-    print("=" * 60)
-    print("Chunk-prefill export — Step 1/3  Loading weights")
-    print("=" * 60)
-    params = load_params(model_id=model_id, config=config)
-    if num_layers is not None and num_layers < full_num_layers:
-        _truncate_params(params, num_layers, config.per_layer_input_dim)
-
-    print("=" * 60)
-    print(f"Chunk-prefill export — Step 2/3  Tracing (chunk_size={chunk_size})")
-    print("=" * 60)
-
-    from flax import nnx
-    from gemma_chat.weight_mapper import load_params_into_model
-    model_tmp = Gemma4Transformer(config=config, rngs=nnx.Rngs(params=0))
-    load_params_into_model(model_tmp, params, config)
-    tiny_tokens = jnp.ones((1, 8), dtype=jnp.int32)
-    _ = model_tmp(tiny_tokens)
-    del model_tmp, tiny_tokens
-    print(f"  Eager warmup OK", flush=True)
-
-    print("  Converting params to float16 …", flush=True)
-    _inplace_bf16_to_f16(params)
-
-    gc.disable()
-    try:
-        cache_specs = build_cache_specs(config, max_seq_len)
-        has_global = any(s.attn_type == AttentionType.GLOBAL for s in cache_specs)
-        if has_global:
-            (N,) = jax_export.symbolic_shape("N", constraints=[f"N >= {CHUNK_SIZE}"])
-        pos_ring_shape = (1, config.sliding_window_size)
-
-        def chunk_prefill_fn(tokens, start_pos_1d, *kv_and_ring):
-            kv_flat = list(kv_and_ring[:-1])
-            sliding_pos_ring = kv_and_ring[-1]
-            start_pos = start_pos_1d[0]
-            logits, kv_new, ring_new = chunk_prefill_step(
-                params, tokens, start_pos, kv_flat, sliding_pos_ring,
-                cfg=config, chunk_size=chunk_size,
-            )
-            return (logits,) + tuple(kv_new) + (ring_new,)
-
-        kv_flat_shapes = []
-        for s in cache_specs:
-            shape = (1, s.cache_len, s.num_kv_heads, s.head_dim)
-            if s.attn_type == AttentionType.GLOBAL:
-                shape = (1, N, s.num_kv_heads, s.head_dim)
-            kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # k
-            kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # v
-        ring_shape = jax.ShapeDtypeStruct(pos_ring_shape, jnp.int32)
-
-        print("  Tracing chunk_prefill_step with symbolic shapes …", flush=True)
-        traced = jax.jit(chunk_prefill_fn).trace(
-            jax.ShapeDtypeStruct((1, chunk_size), jnp.int32),  # tokens
-            jax.ShapeDtypeStruct((1,), jnp.int32),             # start_position
-            *kv_flat_shapes,
-            ring_shape,
-        )
-        hlo_module = traced.lower().compiler_ir('stablehlo')
-        print("  Tracing OK.", flush=True)
-
-        del traced, params
-        _release_malloc()
-
-        mlir_cache = output_path.with_suffix('.mlirbc')
-        print(f"  Saving MLIR cache → {mlir_cache} …", flush=True)
-        try:
-            with open(mlir_cache, 'wb') as _f:
-                hlo_module.operation.write_bytecode(_f)
-            sz = mlir_cache.stat().st_size
-            print(f"  MLIR cache saved ({sz/1e9:.2f} GB).", flush=True)
-        except Exception as _we:
-            print(f"  WARNING: write_bytecode failed: {_we}", flush=True)
-
-        print("=" * 60)
-        print("Chunk-prefill export — Step 3/3  ct.convert + save")
-        print("=" * 60)
-        states, kv_names, kv_out_names = _kv_export_plan(cache_specs, has_global)
-        print(
-            f"  Sliding caches as Core ML state: {len(states)}; "
-            f"global caches as I/O: {len(kv_names)}",
-            flush=True,
-        )
-
-        # Only the global caches keep a flexible dim 1.
-        flex_shapes = {name: (1, max_seq_len) for name in kv_names}
-
-        mil_program = _hlo_to_mil_streaming(hlo_module, states)
-        del hlo_module
-        _release_malloc()
-        print(f"  [memory] RSS after HLO release: {_rss_mb():.0f} MB", flush=True)
-
-        n_prefix = ["N"] if has_global else []
-        _mil_to_mlpackage(
-            mil_program, output_path,
-            input_names=n_prefix + ["tokens", "start_position"] + kv_names + ["sliding_pos_ring"],
-            output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
-            flexible_shapes=flex_shapes,
-        )
-    finally:
-        gc.enable()
-
-
-# ── Decode-step export ─────────────────────────────────────────────────────
-
-
-def export_decode_step(
-    output_path: str | Path,
-    model_id: str = HF_MODEL_ID,
-    variant: str = "e2b",
-    max_seq_len: int = MAX_SEQ_LEN,
     skip_warmup: bool = False,
     num_layers: int | None = None,
 ) -> None:
-    """Export the single-token decode-step model.
+    """Export one phase's functions as single-function packages in ``output_dir``.
 
-    Global KV caches use symbolic dim 1 (flexible shapes via RangeDim),
-    so a single model works at any cache length up to ``max_seq_len``.
-    Sliding KV caches are Core ML state and never cross the model boundary;
-    materialization later turns the global ones into state as well and folds
-    ``N`` into a per-function constant, dropping both from the signature
-    described below.
-
-    Inputs:  N (1,) int32 — phantom dim for current global cache length
-             token_id (1,) int32
-             position (1,) int32  — absolute position of this token
-             k_s, v_s — current **global** KV cache arrays float16 (slot order)
-             sliding_pos_ring (1, sliding_window_size) int32
-    States:  k_s, v_s — the sliding KV caches, float16, updated in place
-    Outputs: logits (vocab_size,) float32
-             k_s_out, v_s_out — updated global KV caches
-             sliding_pos_ring_out (1, sliding_window_size) int32
+    ``prefill``: ``prefill_c<k>.mlpackage`` per layer chunk, ``CHUNK_SIZE``
+    tokens per call.  ``decode``: ``decode_c<k>.mlpackage`` per layer chunk,
+    ``head.mlpackage`` and ``state.mlpackage``, plus the host embedding tables
+    in :func:`_host_tables_dir`.  The global caches keep a symbolic length
+    here; the parent merges everything and materializes one function per size.
     """
-    import numpy as np
-    import gc
     from jax import export as jax_export
 
-    output_path = Path(output_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     config = VARIANTS[variant][0]
     full_num_layers = config.num_layers
     if num_layers is not None and num_layers < config.num_layers:
@@ -644,103 +581,87 @@ def export_decode_step(
               f"{[a[:3] for a in config.attention_types]}")
 
     print("=" * 60)
-    print("Decode export — Step 1/3  Loading weights")
+    print(f"{phase} export — loading weights")
     print("=" * 60)
     params = load_params(model_id=model_id, config=config)
     if num_layers is not None and num_layers < full_num_layers:
         _truncate_params(params, num_layers, config.per_layer_input_dim)
-
-    print("=" * 60)
-    print("Decode export — Step 2/3  Tracing to StableHLO")
-    print("=" * 60)
 
     if not skip_warmup:
         from flax import nnx
         from gemma_chat.weight_mapper import load_params_into_model
         model_tmp = Gemma4Transformer(config=config, rngs=nnx.Rngs(params=0))
         load_params_into_model(model_tmp, params, config)
-        tiny_tokens = jnp.ones((1, 8), dtype=jnp.int32)
-        _ = model_tmp(tiny_tokens)
-        del model_tmp, tiny_tokens
-        print(f"  Eager warmup OK", flush=True)
-    else:
-        print("  Skipping eager warmup (--skip-warmup).", flush=True)
+        _ = model_tmp(jnp.ones((1, 8), dtype=jnp.int32))
+        del model_tmp
+        print("  Eager warmup OK", flush=True)
 
     print("  Converting params to float16 …", flush=True)
     _inplace_bf16_to_f16(params)
+    # The host looks both embeddings up, from tables quantized exactly as the
+    # graph used to quantize them.  The per-layer table leaves the graph
+    # entirely; the token table stays, as the (tied) logit head.
+    ple_table = params.pop("embed_tokens_per_layer")
+    if phase == "decode":
+        print("  Writing host embedding tables …", flush=True)
+        host_embeddings.write_tables(
+            {"token_embed": params["embed_tokens"], "ple_rows": ple_table},
+            config.embed_dim,
+            _host_tables_dir(output_dir),
+        )
+    del ple_table
+    _release_malloc()
+
+    (N,) = jax_export.symbolic_shape("N", constraints=[f"N >= {CHUNK_SIZE}"])
+    tokens = CHUNK_SIZE if phase == "prefill" else 1
+    step = prefill_chunk if phase == "prefill" else decode_chunk
 
     gc.disable()
     try:
-        cache_specs = build_cache_specs(config, max_seq_len)
-        has_global = any(s.attn_type == AttentionType.GLOBAL for s in cache_specs)
-        if has_global:
-            (N,) = jax_export.symbolic_shape("N", constraints=["N >= 1"])
-        pos_ring_shape = (1, config.sliding_window_size)
+        chunks = layer_chunks(config)
+        for k, chunk in enumerate(chunks):
+            print("=" * 60)
+            print(f"{phase} chunk {k}/{len(chunks)}: layers {chunk.layers.start}–"
+                  f"{chunk.layers.stop - 1}, writes {list(chunk.writes)}, "
+                  f"reads {list(chunk.reads)}")
+            print("=" * 60)
+            plan = _chunk_io_plan(config, chunk, first=k == 0, tokens=tokens, N=N)
 
-        def decode_fn(token_id_1d, position_1d, *kv_and_ring):
-            kv_flat = list(kv_and_ring[:-1])
-            sliding_pos_ring = kv_and_ring[-1]
-            token_id = token_id_1d[0]
-            position = position_1d[0]
-            logits, kv_new, ring_new = decode_step(
-                params, token_id, position, kv_flat, sliding_pos_ring,
-                cfg=config,
+            # JAX adds the dimension variable ``N`` itself; the Python
+            # function only sees the arguments in ``plan.arg_specs``.
+            def chunk_fn(*args, chunk=chunk, first=k == 0):
+                if first:
+                    token_embed, ple_rows, position, *rest = args
+                    hidden = token_embed
+                else:
+                    hidden, token_embed, ple_rows, position, *rest = args
+                caches = {s: (rest[2 * j], rest[2 * j + 1]) for j, s in enumerate(chunk.slots)}
+                ring = rest[2 * len(chunk.slots)] if len(rest) > 2 * len(chunk.slots) else None
+                hidden, written = step(
+                    params, chunk, hidden, token_embed, ple_rows, position[0],
+                    caches, ring, cfg=config,
+                )
+                return (hidden,) + tuple(c for s in chunk.writes for c in written[s])
+
+            _export_function(chunk_fn, plan, output_dir / f"{phase}_c{k}.mlpackage")
+
+        if phase == "decode":
+            head_plan = _IOPlan(
+                [jax.ShapeDtypeStruct((1, 1, config.embed_dim), jnp.float16)],
+                False, {}, ["hidden"], ["logits"], [],
             )
-            return (logits,) + tuple(kv_new) + (ring_new,)
+            # int8: int4 is too lossy for the logits (see ``logits_head``).
+            _export_function(
+                lambda hidden: logits_head(params, hidden, config),
+                head_plan, output_dir / "head.mlpackage", weight_bits=8,
+            )
 
-        kv_flat_shapes = []
-        for s in cache_specs:
-            shape = (1, s.cache_len, s.num_kv_heads, s.head_dim)
-            if s.attn_type == AttentionType.GLOBAL:
-                shape = (1, N, s.num_kv_heads, s.head_dim)
-            kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # k
-            kv_flat_shapes.append(jax.ShapeDtypeStruct(shape, jnp.float16))  # v
-        ring_shape = jax.ShapeDtypeStruct(pos_ring_shape, jnp.int32)
+            state_plan = _state_io_plan(config, N)
 
-        print("  Tracing decode_step with symbolic shapes …", flush=True)
-        traced = jax.jit(decode_fn).trace(
-            jax.ShapeDtypeStruct((1,), jnp.int32),  # token_id
-            jax.ShapeDtypeStruct((1,), jnp.int32),  # position
-            *kv_flat_shapes,
-            ring_shape,
-        )
-        hlo_module = traced.lower().compiler_ir('stablehlo')
-        print("  Tracing OK.", flush=True)
+            def state_fn(*caches):
+                return jnp.stack([c[0, 0, 0, 0] for c in caches])
 
-        del traced, params
-        jax.clear_caches()
-        _release_malloc()
-        print(f"  [memory] RSS after trace cleanup: {_rss_mb():.0f} MB", flush=True)
-
-        # Skip MLIR cache save for decode — it's 3.5 GB and we need the
-        # memory headroom for ct.convert + save.  Prefill cache is sufficient
-        # for debugging.
-
-        print("=" * 60)
-        print("Decode export — Step 3/3  ct.convert + save")
-        print("=" * 60)
-        states, kv_names, kv_out_names = _kv_export_plan(cache_specs, has_global)
-        print(
-            f"  Sliding caches as Core ML state: {len(states)}; "
-            f"global caches as I/O: {len(kv_names)}",
-            flush=True,
-        )
-
-        # Only the global caches keep a flexible dim 1.
-        flex_shapes = {name: (1, max_seq_len) for name in kv_names}
-
-        mil_program = _hlo_to_mil_streaming(hlo_module, states)
-        del hlo_module
-        _release_malloc()
-        print(f"  [memory] RSS after HLO release: {_rss_mb():.0f} MB", flush=True)
-
-        n_prefix = ["N"] if has_global else []
-        _mil_to_mlpackage(
-            mil_program, output_path,
-            input_names=n_prefix + ["token_id", "position"] + kv_names + ["sliding_pos_ring"],
-            output_names=["logits"] + kv_out_names + ["sliding_pos_ring_out"],
-            flexible_shapes=flex_shapes,
-        )
+            _export_function(state_fn, state_plan, output_dir / "state.mlpackage")
     finally:
         gc.enable()
 
@@ -769,31 +690,16 @@ def _embed_tokenizer(model_id: str, mlpackage_path: Path) -> None:
     print(f"  Tokenizer stored in {tok_dir}/")
 
 
+def _embed_host_tables(tables_dir: Path, mlpackage_path: Path) -> None:
+    """Move the decode phase's host embedding tables into the .mlpackage."""
+    dst = mlpackage_path / host_embeddings.DIR_NAME
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.move(str(tables_dir), str(dst))
+    print(f"  Host embedding tables stored in {dst}/")
+
+
 # ── Entry point ─────────────────────────────────────────────────────────────
-
-
-def _run_phase(phase: str, args: argparse.Namespace, output_path: Path) -> None:
-    """Run a single export phase (prefill or decode) in this process."""
-    if phase == "prefill":
-        export_chunk_prefill(
-            output_path=output_path,
-            model_id=args.model_id,
-            variant=args.variant,
-            max_seq_len=args.max_seq_len,
-            chunk_size=CHUNK_SIZE,
-            num_layers=args.num_layers,
-        )
-    elif phase == "decode":
-        export_decode_step(
-            output_path=output_path,
-            model_id=args.model_id,
-            variant=args.variant,
-            max_seq_len=args.max_seq_len,
-            skip_warmup=args.skip_warmup,
-            num_layers=args.num_layers,
-        )
-    else:
-        raise ValueError(f"Unknown phase: {phase}")
 
 
 def _parse_materialize_sizes(s: str | None) -> list[int]:
@@ -810,15 +716,12 @@ def _parse_materialize_sizes(s: str | None) -> list[int]:
 
 
 def main() -> None:
-    import shutil
     import tempfile
 
     parser = argparse.ArgumentParser(
         description=(
-            "Export Gemma4-E2B prefill + decode as a CoreML .mlpackage.  "
-            "By default the global KV caches are materialized to concrete "
-            "per-size functions for ANE/CPU compatibility; pass "
-            "--no-materialize for a GPU-only dynamic-shape (RangeDim) export."
+            "Export Gemma4-E2B as a CoreML .mlpackage of layer-chunk functions "
+            "(prefill + decode, one set per cache size) plus a shared logit head."
         )
     )
     parser.add_argument(
@@ -841,7 +744,7 @@ def main() -> None:
         "--max-seq-len",
         type=int,
         default=MAX_SEQ_LEN,
-        help=f"Max sequence length (default: {MAX_SEQ_LEN})",
+        help=f"Largest default materialized size (default: {MAX_SEQ_LEN})",
     )
     parser.add_argument(
         "--skip-warmup",
@@ -857,41 +760,24 @@ def main() -> None:
     parser.add_argument(
         "--decode-only",
         action="store_true",
-        help="Export only the decode model (skip prefill)",
-    )
-    parser.add_argument(
-        "--separate",
-        action="store_true",
-        help=(
-            "Export prefill and decode as separate .mlpackage files "
-            "instead of a single multifunction model."
-        ),
+        help="Export only the decode functions (skip prefill)",
     )
     parser.add_argument(
         "--materialize",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Replace the dynamic-shape (RangeDim) global KV caches with one "
-            "concrete-shape function per size.  Produces an ANE-compatible "
-            "multifunction .mlpackage with `{prefill,decode}_{size}` functions "
-            "that share deduplicated weights, and turns the global KV caches "
-            "into Core ML state (the sliding ones already are).  Defaults to "
-            "powers of 2 from 512 to --max-seq-len; override with "
-            "--materialize-sizes.  "
-            "Enabled by default because the ANE and CPU backends hit runtime "
-            "issues with RangeDim shapes.  --no-materialize keeps the "
-            "dynamic-shape export, but since the sliding KV caches became "
-            "Core ML state such a model no longer loads at all (E5RT/BNNS "
-            "errors on a RangeDim program that declares states) — it is only "
-            "useful for inspecting the converted program."
+            "Specialize every function to concrete cache sizes (default).  "
+            "--no-materialize keeps the dynamic-shape functions, which do not "
+            "load (E5RT/BNNS errors on a RangeDim program that declares "
+            "states); only useful for inspecting the converted program."
         ),
     )
     parser.add_argument(
         "--materialize-sizes",
         default=None,
         help=(
-            "Comma-separated concrete cache sizes when --materialize is set "
+            "Comma-separated concrete cache sizes "
             f"(default: powers of 2 from 512 up to --max-seq-len; every size "
             f"must be >= CHUNK_SIZE = {CHUNK_SIZE})"
         ),
@@ -910,16 +796,16 @@ def main() -> None:
 
     # If invoked as a subprocess for a single phase, run it and exit.
     if args._phase:
-        _run_phase(args._phase, args, Path(args._phase_output))
+        export_phase(
+            args._phase, args._phase_output, model_id=args.model_id,
+            variant=args.variant, skip_warmup=args.skip_warmup,
+            num_layers=args.num_layers,
+        )
         return
-
-    if args.materialize and args.separate:
-        parser.error("--materialize cannot be combined with --separate")
 
     materialize_sizes: list[int] = []
     if args.materialize:
         materialize_sizes = _parse_materialize_sizes(args.materialize_sizes)
-        # Cap sizes to --max-seq-len.
         over = [s for s in materialize_sizes if s > args.max_seq_len]
         if over:
             print(
@@ -928,9 +814,7 @@ def main() -> None:
             )
             materialize_sizes = [s for s in materialize_sizes if s <= args.max_seq_len]
         if not materialize_sizes:
-            parser.error(
-                "--materialize: no valid sizes after clamping to --max-seq-len"
-            )
+            parser.error("--materialize: no valid sizes after clamping to --max-seq-len")
         # A prefill chunk is written into the cache in one go, so a cache
         # shorter than a chunk cannot be filled.
         too_small = [s for s in materialize_sizes if s < CHUNK_SIZE]
@@ -939,28 +823,20 @@ def main() -> None:
                 f"--materialize-sizes: {too_small} are smaller than "
                 f"CHUNK_SIZE ({CHUNK_SIZE}); a prefill chunk must fit in the cache"
             )
-        print(
-            f"\nMaterialize plan: one function per size in {materialize_sizes}",
-            flush=True,
-        )
+        print(f"\nMaterialize plan: one function set per size in {materialize_sizes}",
+              flush=True)
 
     output = Path(args.output)
 
     def _subprocess_phase(phase: str, phase_output: Path) -> None:
         """Re-invoke ourselves in a subprocess for memory isolation."""
         cmd = [sys.executable, "-m", "gemma_chat.export"]
-        # Forward user args.
-        cmd += ["--output", str(args.output)]
-        cmd += ["--model-id", args.model_id]
-        cmd += ["--variant", args.variant]
-        cmd += ["--max-seq-len", str(args.max_seq_len)]
+        cmd += ["--model-id", args.model_id, "--variant", args.variant]
         if args.skip_warmup:
             cmd += ["--skip-warmup"]
         if args.num_layers is not None:
             cmd += ["--num-layers", str(args.num_layers)]
-        # Phase-specific args.
         cmd += ["--_phase", phase, "--_phase-output", str(phase_output)]
-
         result = subprocess.run(cmd, env={**_os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
         if result.returncode != 0:
             print(f"\n!!! {phase} export failed (exit {result.returncode})", file=sys.stderr)
@@ -971,137 +847,62 @@ def main() -> None:
 
         Target is ``gemma_chat.materialize`` (not ``gemma_chat.export``) so the
         child doesn't import JAX/flax at startup — the pymil load + materialize
-        pass + final save need every spare GB, especially with a combined
-        (prefill + decode) multifunction source.
+        pass + final save need every spare GB.
         """
         cmd = [sys.executable, "-m", "gemma_chat.materialize"]
-        cmd += ["--input", str(src)]
-        cmd += ["--output", str(dst)]
+        cmd += ["--input", str(src), "--output", str(dst)]
         cmd += ["--sizes", ",".join(str(s) for s in sizes)]
-        print(
-            f"\n  [materialize] {src.name} → {len(sizes)} sizes per source function …",
-            flush=True,
-        )
+        print(f"\n  [materialize] {src.name} → {len(sizes)} sizes …", flush=True)
         result = subprocess.run(cmd, env={**_os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
         if result.returncode != 0:
             print(f"\n!!! materialize failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(result.returncode)
 
-    if args.separate:
-        # ── Separate models: each gets its own .mlpackage with RangeDim ──
-        output.mkdir(parents=True, exist_ok=True)
-        out_decode = output / "decode.mlpackage"
+    tmp_dir = Path(tempfile.mkdtemp(prefix="gemma-export-"))
+    phases = ["decode"] if args.decode_only else ["prefill", "decode"]
+    print(f"\nExport plan: {' + '.join(phases)} -> {output}\n  Temp dir: {tmp_dir}\n",
+          flush=True)
 
-        phases = ["decode"] if args.decode_only else ["prefill", "decode"]
-        print(
-            f"\nExport plan (separate models): {' + '.join(phases)} -> {output}/\n",
-            flush=True,
-        )
+    try:
+        for phase in phases:
+            _subprocess_phase(phase, tmp_dir / phase)
+            print(f"\n  {phase} functions exported to {tmp_dir / phase}\n", flush=True)
 
-        try:
-            if not args.decode_only:
-                out_prefill = output / "prefill.mlpackage"
-                if out_prefill.exists():
-                    shutil.rmtree(out_prefill)
-                _subprocess_phase("prefill", out_prefill)
-                print(f"\n  Chunk-prefill exported to {out_prefill}\n")
+        from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
 
-                print("=" * 60, "\nDecode-step export.\n", "=" * 60, "\n",
-                      sep="", flush=True)
+        # ── Merge every function into one package (weight deduplication) ──
+        # Runs in the parent: the sources hold one weight set between them,
+        # so the merge's peak memory is bounded by it.
+        print("=" * 60)
+        print("Merging into multifunction .mlpackage (weight deduplication) ...")
+        print("=" * 60)
+        desc = MultiFunctionDescriptor()
+        for phase in phases:
+            for pkg in sorted((tmp_dir / phase).glob("*.mlpackage")):
+                desc.add_function(str(pkg), src_function_name="main",
+                                  target_function_name=pkg.stem)
+        desc.default_function_name = "decode_c0"
 
-            if out_decode.exists():
-                shutil.rmtree(out_decode)
-            _subprocess_phase("decode", out_decode)
-            print(f"\n  Decode exported to {out_decode}\n")
+        combined = tmp_dir / "combined.mlpackage" if materialize_sizes else output
+        if combined.exists():
+            shutil.rmtree(combined)
+        save_multifunction(desc, str(combined))
+        _embed_tokenizer(args.model_id, combined)
+        _embed_host_tables(_host_tables_dir(tmp_dir / "decode"), combined)
 
-            sizes = []
-            for p in sorted(output.glob("*.mlpackage")):
-                sz = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-                sizes.append(f"    {p.name}  ({sz / 1e9:.2f} GB)")
-            print("\n  Export complete:\n" + "\n".join(sizes) + "\n")
-
-            # Embed tokenizer into decode model (the one the CLI loads)
-            _embed_tokenizer(args.model_id, out_decode)
-
-        except KeyboardInterrupt:
-            print("\nInterrupted.", file=sys.stderr)
-            sys.exit(1)
-    else:
-        # ── Multifunction export (default): merge prefill + decode ──
-        tmp_dir = Path(tempfile.mkdtemp(prefix="gemma-export-"))
-        tmp_prefill = tmp_dir / "prefill.mlpackage"
-        tmp_decode = tmp_dir / "decode.mlpackage"
-
-        phases = ["decode"] if args.decode_only else ["prefill", "decode"]
-        print(
-            f"\nExport plan (multifunction): {' + '.join(phases)} -> {output}\n"
-            f"  Temp dir: {tmp_dir}\n",
-            flush=True,
-        )
-
-        try:
-            if not args.decode_only:
-                _subprocess_phase("prefill", tmp_prefill)
-                print(f"\n  Chunk-prefill exported to {tmp_prefill}\n")
-                print("=" * 60, "\nDecode-step export.\n", "=" * 60, "\n",
-                      sep="", flush=True)
-
-            _subprocess_phase("decode", tmp_decode)
-            print(f"\n  Decode exported to {tmp_decode}\n")
-
-            from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
-
-            # ── Combine prefill + decode into a dynamic-shape multifunction ──
-            # Runs in the parent: each source is a single-function package
-            # with ~2.6 GB of weights, so the merge's peak memory is bounded.
-            # This intermediate feeds either the final output (non-materialize)
-            # or the materialize subprocess.
+        if materialize_sizes:
             print("=" * 60)
-            print("Merging into multifunction .mlpackage (weight deduplication) ...")
+            print("Materializing dynamic shapes to per-size concrete functions …")
             print("=" * 60)
-            desc = MultiFunctionDescriptor()
-            if not args.decode_only:
-                desc.add_function(str(tmp_prefill), src_function_name="main",
-                                  target_function_name="prefill")
-            desc.add_function(str(tmp_decode), src_function_name="main",
-                              target_function_name="decode")
-            desc.default_function_name = "decode"
+            _subprocess_materialize(combined, output, materialize_sizes)
 
-            if materialize_sizes:
-                tmp_combined = tmp_dir / "combined.mlpackage"
-                save_multifunction(desc, str(tmp_combined))
-
-                # Materialize the combined multifunction. Loading it once into
-                # pymil and running materialize_symbolic_shape_program per
-                # source function keeps peak RAM at the weight-set size, vs
-                # the old per-phase-then-merge flow which multiplied weights
-                # by ``phases × sizes_per_phase`` and blew past 40 GB commit.
-                print("=" * 60)
-                print("Materializing dynamic shapes to per-size concrete functions …")
-                print("=" * 60)
-                _subprocess_materialize(tmp_combined, output, materialize_sizes)
-
-                n_phases = 1 if args.decode_only else 2
-                final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
-                print(
-                    f"\n  Final model: {output} ({final_size / 1e9:.2f} GB, "
-                    f"{len(materialize_sizes) * n_phases} functions)\n"
-                )
-            else:
-                if output.exists():
-                    shutil.rmtree(output)
-                save_multifunction(desc, str(output))
-
-                final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
-                print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
-
-            _embed_tokenizer(args.model_id, output)
-
-        except KeyboardInterrupt:
-            print("\nInterrupted.", file=sys.stderr)
-            sys.exit(1)
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        final_size = sum(f.stat().st_size for f in output.rglob("*") if f.is_file())
+        print(f"\n  Final model: {output} ({final_size / 1e9:.2f} GB)\n")
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

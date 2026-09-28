@@ -12,11 +12,15 @@ import Foundation
 /// Errors raised during inference.
 public enum InferenceError: Error, LocalizedError {
     case emptyPrompt
+    /// The prompt is longer than ``InferenceEngine/maxPromptTokens``.
+    case promptTooLong(tokens: Int, limit: Int)
 
     public var errorDescription: String? {
         switch self {
         case .emptyPrompt:
             "Cannot run inference on an empty prompt"
+        case .promptTooLong(let tokens, let limit):
+            "The prompt is \(tokens) tokens, more than the \(limit) that fit in the context — shorten the message or raise the context size"
         }
     }
 }
@@ -92,38 +96,27 @@ public struct InferenceEngine: Sendable {
             Task.detached { [self] in
                 do {
                     let genStart = CFAbsoluteTimeGetCurrent()
-                    let ids = truncatePromptIDs(
-                        promptIDs,
-                        maxSeqLen: model.effectiveMaxSeqLen,
-                        reserveForGeneration: maxNewTokens
-                    )
-
-                    // Invalidate KV reuse if truncation changed the prompt —
-                    // the cached prefix no longer matches the truncated suffix.
-                    // Clearing the state here routes us through `fullPrefill`,
-                    // which allocates a fresh cache.
-                    var effectiveKVState = existingKVState
-                    var effectivePrefillOffset = prefillOffset
-                    if ids.count < promptIDs.count && prefillOffset > 0 {
-                        Log.info("[KV] Prompt was truncated (\(promptIDs.count)→\(ids.count)) — invalidating KV reuse")
-                        effectiveKVState = nil
-                        effectivePrefillOffset = 0
+                    // Never cut the prompt here: a suffix loses the chat
+                    // template's framing. Callers fit the conversation with
+                    // `GemmaTokenizer.encodeChatPrompt(history:systemPrompt:budget:)`.
+                    let ids = promptIDs
+                    guard ids.count <= maxPromptTokens else {
+                        throw InferenceError.promptTooLong(tokens: ids.count, limit: maxPromptTokens)
                     }
-
                     let nReal = ids.count
                     let chunkSize = model.chunkSize
                     let nChunks = (nReal + chunkSize - 1) / chunkSize
-                    Log.info("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks of \(chunkSize), prefillOffset=\(effectivePrefillOffset)")
+                    Log.info("[Perf] Prompt: \(nReal) tokens, \(nChunks) chunks of \(chunkSize), prefillOffset=\(prefillOffset)")
 
                     // --- Chunked Prefill ---
                     let prefillStart = CFAbsoluteTimeGetCurrent()
                     var currentKV: KVCacheState
                     var currentLogits: MLMultiArray
 
-                    if let existing = effectiveKVState, effectivePrefillOffset > 0 {
+                    if let existing = existingKVState, prefillOffset > 0 {
                         let (prefillLogits, prefillKV) = try await self.continuePrefill(
                             ids: ids,
-                            fromOffset: effectivePrefillOffset,
+                            fromOffset: prefillOffset,
                             kvState: existing
                         )
                         currentKV = prefillKV
@@ -327,24 +320,19 @@ public struct InferenceEngine: Sendable {
         )
     }
 
-    // MARK: - Helpers
+    /// Most prompt tokens the model takes: the padded prompt has to fit its
+    /// largest loaded cache, with a position left to decode the reply's
+    /// first token into.
+    public var maxPromptTokens: Int {
+        min(model.effectiveMaxSeqLen / model.chunkSize * model.chunkSize, model.effectiveMaxSeqLen - 1)
+    }
 
-    /// Keep the last tokens so the prompt fits within maxSeqLen.
-    ///
-    /// The cap is rounded down to a chunk boundary: prefill pads the prompt up
-    /// to a multiple of the model's chunk size, so an unrounded cap can pad
-    /// past the largest cache the model loaded.
-    private func truncatePromptIDs(
-        _ ids: [Int32],
-        maxSeqLen: Int,
-        reserveForGeneration: Int
-    ) -> [Int32] {
-        let raw = max(maxSeqLen - reserveForGeneration, 1)
-        let chunk = model.chunkSize
-        let cap = max((raw / chunk) * chunk, min(chunk, maxSeqLen))
-        if ids.count > cap {
-            return Array(ids.suffix(cap))
-        }
-        return ids
+    /// Prompt tokens a conversation may fill before its oldest turns are
+    /// dropped (``GemmaTokenizer/encodeChatPrompt(history:systemPrompt:budget:)``):
+    /// ``maxPromptTokens`` less room for a `reply`-token answer, but never
+    /// less than half of it — a reply budget as long as the context would
+    /// otherwise leave no history at all.
+    public func promptBudget(reservingForReply reply: Int) -> Int {
+        maxPromptTokens - min(reply, maxPromptTokens / 2)
     }
 }

@@ -28,18 +28,26 @@ import pytest
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 
-from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
+from gemma_chat.mil_passes.global_cache_states import (
+    check_state_writes_are_read,
+    global_kv_caches_to_states,
+)
 
 LEN = 8       # cache length ("materialized" global cache size)
 HEAD_DIM = 2
 
 
-def _build_program():
+def _build_program(alias: bool = False, reader: str = "live"):
     """A one-cache step: read the cache, write ``pos + 1`` into row ``pos``.
 
-    Mirrors the materialized export in miniature: ``cache`` in, ``cache_out``
-    out, plus a second reader of the input (the sum) so the pass has to rewire
-    more than the write itself.
+    Mirrors the materialized export in miniature: ``k_0`` in, ``k_0_out`` out,
+    a reader of the input (``entry``, the sum on entry) so the pass has to
+    rewire more than the write itself, and — as the attention reads the cache
+    it has just written — a reader of the updated cache (``after``).
+
+    ``alias`` routes the output through an ``identity``, the way a converter
+    may name an output; ``reader="none"`` leaves the write a sink, and
+    ``reader="dead"`` gives it only a reader dead-code elimination removes.
     """
 
     @mb.program(
@@ -49,10 +57,10 @@ def _build_program():
         ],
         opset_version=ct.target.iOS18,
     )
-    def prog(pos, cache):
+    def prog(pos, k_0):
         # What the cache held on entry — the observable proof of persistence.
         entry = mb.reduce_sum(
-            x=mb.cast(x=cache, dtype="fp32"), axes=[0, 1, 2, 3], keep_dims=True,
+            x=mb.cast(x=k_0, dtype="fp32"), axes=[0, 1, 2, 3], keep_dims=True,
         )
         entry = mb.reshape(x=entry, shape=[1], name="entry")
 
@@ -64,10 +72,21 @@ def _build_program():
             values=[np.int32([0]), pos, np.int32([0]), np.int32([0])], axis=0,
         )
         end = mb.add(x=begin, y=np.int32([1, 1, 1, HEAD_DIM]))
-        cache_out = mb.slice_update(
-            x=cache, update=value, begin=begin, end=end, name="cache_out",
+        updated = mb.slice_update(
+            x=k_0, update=value, begin=begin, end=end,
+            name="updated" if alias else "k_0_out",
         )
-        return entry, cache_out
+        out = mb.identity(x=updated, name="k_0_out") if alias else updated
+        if reader == "none":
+            return entry, out
+        if reader == "dead":
+            mb.cast(x=updated, dtype="fp32", name="unused")
+            return entry, out
+        after = mb.reduce_sum(
+            x=mb.cast(x=updated, dtype="fp32"), axes=[0, 1, 2, 3], keep_dims=True,
+        )
+        after = mb.reshape(x=after, shape=[1], name="after")
+        return entry, after, out
 
     return prog
 
@@ -82,15 +101,15 @@ def statified_program():
 def test_input_becomes_a_state_and_output_disappears(statified_program):
     func = statified_program.functions["main"]
 
-    cache_var = func.inputs["cache"]
+    cache_var = func.inputs["k_0"]
     assert types.is_state(cache_var.sym_type)
     assert cache_var.dtype == types.fp16
     assert tuple(cache_var.shape) == (1, LEN, 1, HEAD_DIM)
     # Ordinary inputs are untouched, and the input order is preserved.
-    assert list(func.inputs) == ["pos", "cache"]
+    assert list(func.inputs) == ["pos", "k_0"]
     assert not types.is_state(func.inputs["pos"].sym_type)
 
-    assert [var.name for var in func.outputs] == ["entry"]
+    assert [var.name for var in func.outputs] == ["entry", "after"]
 
 
 def test_read_state_is_first_and_feeds_every_use(statified_program):
@@ -99,11 +118,11 @@ def test_read_state_is_first_and_feeds_every_use(statified_program):
 
     read = ops[0]
     assert read.op_type == "read_state"
-    assert read.input is func.inputs["cache"]
+    assert read.input is func.inputs["k_0"]
 
     # No op reads the state var except read_state / coreml_update_state, i.e.
     # every consumer of the old input now consumes the (dominating) read.
-    consumers = {op.op_type for op in func.inputs["cache"].child_ops}
+    consumers = {op.op_type for op in func.inputs["k_0"].child_ops}
     assert consumers == {"read_state", "coreml_update_state"}
     # Both the summation and the slice_update took the read var.
     readers = {op.op_type for op in read.outputs[0].child_ops}
@@ -115,7 +134,7 @@ def test_update_state_writes_the_fully_updated_cache(statified_program):
     updates = [op for op in func.operations if op.op_type == "coreml_update_state"]
     assert len(updates) == 1
     update = updates[0]
-    assert update.state is func.inputs["cache"]
+    assert update.state is func.inputs["k_0"]
 
     # The written value is the updated cache, kept out of the runtime's
     # in-place slice path by a zero add (see the pass docstring).
@@ -124,7 +143,7 @@ def test_update_state_writes_the_fully_updated_cache(statified_program):
     operands = {add.x.op.op_type, add.y.op.op_type}
     assert operands == {"fill_like", "slice_update"}
     slice_update = add.x.op if add.x.op.op_type == "slice_update" else add.y.op
-    assert slice_update.name == "cache_out"
+    assert slice_update.name == "k_0_out"
 
 
 @pytest.fixture(scope="module")
@@ -141,8 +160,8 @@ def statified_model(statified_program):
 def test_state_feature_replaces_the_cache_io(statified_model):
     spec = statified_model._spec
     assert [feat.name for feat in spec.description.input] == ["pos"]
-    assert [feat.name for feat in spec.description.output] == ["entry"]
-    assert [feat.name for feat in spec.description.state] == ["cache"]
+    assert [feat.name for feat in spec.description.output] == ["entry", "after"]
+    assert [feat.name for feat in spec.description.state] == ["k_0"]
     array = spec.description.state[0].type.stateType.arrayType
     assert list(array.shape) == [1, LEN, 1, HEAD_DIM]
 
@@ -173,3 +192,125 @@ def test_cache_contents_persist_across_predictions(statified_model):
         {"pos": np.array([4], dtype=np.int32)}, state=state,
     )
     assert result["entry"][0] == pytest.approx(running)
+
+
+# ── The write is consumed, never a sink ─────────────────────────────────────
+
+
+def test_the_write_follows_its_value_and_feeds_the_later_readers(statified_program):
+    """A ``coreml_update_state`` nothing reads makes ANECompiler throw once it
+    lands in an ANE segment; the pass must write where the value is produced
+    and hand the write's result to everything after it."""
+    func = statified_program.functions["main"]
+    ops = [op for op in func.operations if op.op_type != "const"]
+    update = next(op for op in ops if op.op_type == "coreml_update_state")
+    value_op = next(op for op in ops if op.name == "k_0_out")
+
+    i = ops.index(value_op)
+    assert [op.op_type for op in ops[i + 1:i + 4]] == ["fill_like", "add", "coreml_update_state"]
+    assert ops[i + 3] is update
+
+    written = update.outputs[0]
+    assert written.child_ops, "the write is a sink"
+    # Nothing after the write reads the unwritten value any more.
+    assert [op for op in value_op.outputs[0].child_ops if op is not update.value.op] == []
+
+
+def test_the_later_readers_see_the_written_cache(statified_model):
+    state = statified_model.make_state()
+    running = 0.0
+    for pos in range(4):
+        running += HEAD_DIM * (pos + 1)
+        result = statified_model.predict({"pos": np.array([pos], dtype=np.int32)}, state=state)
+        assert result["after"][0] == pytest.approx(running), f"at pos {pos}"
+
+
+@pytest.mark.parametrize("reader", ["none", "dead"])
+def test_a_write_nothing_reads_fails_the_pass(reader):
+    """Including a write whose only reader is dead code: dead-code elimination
+    would remove the unused cast and leave the write a sink."""
+    with pytest.raises(ValueError, match="no reader"):
+        global_kv_caches_to_states().apply(_build_program(reader=reader))
+
+
+@pytest.mark.parametrize("read", [False, True])
+def test_a_write_inside_a_nested_block_is_checked_too(read):
+    """A write in a ``cond`` branch is judged in its own block: read there, or
+    returned from it, it is consumed; otherwise it is a sink."""
+
+    @mb.program(
+        input_specs=[
+            mb.TensorSpec((1,), dtype=types.bool),
+            mb.StateTensorSpec((1, LEN, 1, HEAD_DIM), dtype=types.fp16),
+        ],
+        opset_version=ct.target.iOS18,
+    )
+    def prog(flag, k_0):
+        cache = mb.read_state(input=k_0)
+
+        def write():
+            written = mb.coreml_update_state(
+                state=k_0, value=mb.add(x=cache, y=np.float16(1)),
+            )
+            return mb.reduce_sum(x=written, keep_dims=False) if read \
+                else mb.reduce_sum(x=cache, keep_dims=False)
+
+        def keep():
+            return mb.reduce_sum(x=cache, keep_dims=False)
+
+        return mb.cond(pred=mb.squeeze(x=flag), _true_fn=write, _false_fn=keep, name="out")
+
+    nested = [op for op in prog.functions["main"].operations if op.blocks]
+    assert nested and any(
+        o.op_type == "coreml_update_state" for b in nested[0].blocks for o in b.operations
+    )
+    if read:
+        check_state_writes_are_read(prog)
+    else:
+        with pytest.raises(ValueError, match="no reader"):
+            check_state_writes_are_read(prog)
+
+
+def test_an_output_alias_is_written_where_the_value_is_produced():
+    """``updated -> after`` and ``identity(updated) -> k_0_out``: writing after
+    the identity would leave ``after`` reading the unwritten value and the
+    write with no reader."""
+    prog = _build_program(alias=True)
+    global_kv_caches_to_states().apply(prog)
+    func = prog.functions["main"]
+    update = next(op for op in func.operations if op.op_type == "coreml_update_state")
+    assert update.value.op.y.op.name == "updated"
+    readers = {op.op_type for op in update.outputs[0].child_ops}
+    assert "cast" in readers  # the `after` reduction reads the write
+    assert [var.name for var in func.outputs] == ["entry", "after"]
+
+
+def test_a_cache_without_an_output_becomes_a_read_only_state():
+    """A chunk that only reads another chunk's cache (the KV-shared layers)."""
+
+    @mb.program(
+        input_specs=[mb.TensorSpec((1, LEN, 1, HEAD_DIM), dtype=types.fp16)],
+        opset_version=ct.target.iOS18,
+    )
+    def prog(v_3):
+        return mb.reduce_sum(x=v_3, axes=[1], keep_dims=False, name="total")
+
+    global_kv_caches_to_states().apply(prog)
+    func = prog.functions["main"]
+    assert types.is_state(func.inputs["v_3"].sym_type)
+    assert [op.op_type for op in func.inputs["v_3"].child_ops] == ["read_state"]
+    assert not any(op.op_type == "coreml_update_state" for op in func.operations)
+
+
+def test_non_cache_io_pairs_are_left_alone():
+    """A chunk's ``hidden`` / ``hidden_out`` is fp16 in and out, like a cache."""
+
+    @mb.program(
+        input_specs=[mb.TensorSpec((1, 1, 4), dtype=types.fp16)],
+        opset_version=ct.target.iOS18,
+    )
+    def prog(hidden):
+        return mb.add(x=hidden, y=np.float16(1), name="hidden_out")
+
+    global_kv_caches_to_states().apply(prog)
+    assert not types.is_state(prog.functions["main"].inputs["hidden"].sym_type)

@@ -44,13 +44,44 @@ public final class GemmaTokenizer: @unchecked Sendable {
         tokenizer.decode(tokens: ids, skipSpecialTokens: true)
     }
 
-    /// Tokenize conversation history using Gemma4's chat template.
+    /// Whether `id` is a byte-fallback token (`<0xNN>`): one UTF-8 byte of a
+    /// character the vocabulary has no token for. Same test as the
+    /// tokenizer's `ByteFallback` decoder.
+    func isByteToken(_ id: Int) -> Bool {
+        guard let piece = tokenizer.convertIdToToken(id) else { return false }
+        return piece.count == 6 && piece.hasPrefix("<0x") && piece.hasSuffix(">")
+    }
+
+    /// Tokenize a conversation with Gemma4's chat template, dropping its
+    /// oldest turns while the prompt is longer than `budget` tokens.
     ///
-    /// Returns token IDs directly (no intermediate string).
-    /// Uses the tokenizer's built-in chat template with `<|turn>` / `<turn|>` markers.
+    /// Turns go whole, from the front, and the kept history always starts at
+    /// a user message; the system prompt and the newest user message are
+    /// always kept, so the result can still exceed `budget` — the engine
+    /// refuses a prompt that does not fit the context at all
+    /// (``InferenceError/promptTooLong(tokens:limit:)``). Cutting tokens off
+    /// the front instead would drop the template's framing (`<bos>`, the
+    /// first `<|turn>user`) and the model would answer nonsense.
     public func encodeChatPrompt(
         history: [ChatMessage],
-        systemPrompt: String? = nil
+        systemPrompt: String? = nil,
+        budget: Int
+    ) -> [Int] {
+        var start = history.startIndex
+        var ids = encodeChatPrompt(history: history[start...], systemPrompt: systemPrompt)
+        while ids.count > budget,
+              let next = history[start...].dropFirst().firstIndex(where: { $0.role == .user }) {
+            start = next
+            ids = encodeChatPrompt(history: history[start...], systemPrompt: systemPrompt)
+        }
+        return ids
+    }
+
+    /// Token IDs of `history` in Gemma4's chat template (`<|turn>` /
+    /// `<turn|>` markers), no intermediate string.
+    private func encodeChatPrompt(
+        history: ArraySlice<ChatMessage>,
+        systemPrompt: String?
     ) -> [Int] {
         var messages: [Message] = []
         if let sys = systemPrompt {

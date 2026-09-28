@@ -11,6 +11,7 @@ placement, and the graph shapes this project actually produces.
 """
 
 import numpy as np
+import pytest
 import jax
 import jax.numpy as jnp
 import jax.scipy.special
@@ -18,12 +19,12 @@ import coremltools as ct
 from coremltools.converters.mil.mil import types as mil_types
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
+from gemma_chat.decode_coreml import _rmsnorm as rmsnorm
 from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
-from gemma_chat.model import _embed_lookup
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
-def _convert(fn, *example_args, load: bool = False):
+def _convert(fn, *example_args, load: bool = False, compute_units=ct.ComputeUnit.ALL):
     """Trace ``fn``, run the project pipeline, return ``(mlmodel, mil_program)``."""
     hlo = jax.jit(fn).lower(*example_args).compiler_ir("stablehlo")
     prog = hlo_to_mil(hlo, minimum_deployment_target=ct.target.iOS18)
@@ -34,6 +35,7 @@ def _convert(fn, *example_args, load: bool = False):
         pass_pipeline=pipeline,
         compute_precision=ct.precision.FLOAT32,
         minimum_deployment_target=ct.target.iOS18,
+        compute_units=compute_units,
         skip_model_load=not load,
     )
     return model, model._mil_program
@@ -117,13 +119,6 @@ def sliding_cache_write(cache, value, slot):
     return jnp.where(mask, value, cache)
 
 
-def rmsnorm(x, scale):
-    """``decode_coreml._rmsnorm``."""
-    x32 = x.astype(jnp.float32)
-    var = jnp.mean(jnp.square(x32), axis=-1, keepdims=True)
-    return (x32 * jax.lax.rsqrt(var + 1e-6) * scale.astype(jnp.float32)).astype(jnp.float16)
-
-
 def exact_gelu(x):
     """The FFN activation from ``decode_coreml._gelu_exact`` — fp16, erf spelling."""
     return x * 0.5 * (1.0 + jax.scipy.special.erf(x * float(1.0 / np.sqrt(2.0))))
@@ -135,9 +130,11 @@ def logit_softcap(x):
     return jnp.tanh(x / cap) * cap
 
 
-def double_rmsnorm(x, scale_a, scale_b):
-    """Adjacent norms — the fp16→fp32 round-trip ``collapse_cast_chains`` targets."""
-    return rmsnorm(rmsnorm(x, scale_a), scale_b)
+def double_rmsnorm(x):
+    """Adjacent norms, as every sub-layer boundary of the real graph has them
+    (the scales are weight constants there too)."""
+    scale = jnp.asarray(np.full((x.shape[-1],), 0.5, np.float16))
+    return rmsnorm(rmsnorm(x, scale), scale)
 
 
 def _attn_args(C, hd, kv_rep=2, H=8, S=128):
@@ -151,53 +148,39 @@ def _attn_args(C, hd, kv_rep=2, H=8, S=128):
 
 # ── attention fusion ─────────────────────────────────────────────────────
 
-def test_chunk_attention_fuses_to_sdpa():
+def _assert_attention_decomposed(prog):
+    """``matmul -> select(mask) -> softmax -> matmul``, never SDPA.
+
+    The Neural Engine ignores ``scaled_dot_product_attention``'s ``attn_mask``,
+    so the pipeline drops ``fuse_attention_to_sdpa`` — see
+    ``ct_convert_pipeline``.  The decomposed softmax still collapses to one op.
+    """
+    assert _count(prog, "scaled_dot_product_attention") == 0
+    assert _count(prog, "softmax") == 1
+    assert _count(prog, "matmul") == 2
+    assert _count(prog, "select") == 1
+    _assert_softmax_not_decomposed(prog)
+
+
+def test_chunk_attention_stays_decomposed():
     q, k, v = _attn_args(C=16, hd=256)
     mask = jnp.ones((16, 128), jnp.bool_)
     _, prog = _convert(chunk_attention, q, k, v, mask)
-
-    assert _count(prog, "scaled_dot_product_attention") == 1
-    assert _count(prog, "softmax") == 0
-    assert _count(prog, "matmul") == 0
-    assert _count(prog, "select") == 0
-    _assert_softmax_not_decomposed(prog)
+    _assert_attention_decomposed(prog)
 
 
-def test_global_attention_fuses_to_sdpa():
-    """Global layers use head_dim=512; SDPA pre-scales the query by sqrt(512)."""
+def test_global_chunk_attention_stays_decomposed():
     q, k, v = _attn_args(C=16, hd=512)
     mask = jnp.ones((16, 128), jnp.bool_)
     _, prog = _convert(chunk_attention, q, k, v, mask)
-
-    assert _count(prog, "scaled_dot_product_attention") == 1
-    assert _count(prog, "softmax") == 0
-    scales = [float(op.inputs["y"].val) for op in _ops(prog)
-              if op.op_type == "mul" and op.inputs["y"].val is not None
-              and np.asarray(op.inputs["y"].val).size == 1]
-    assert any(abs(s - np.sqrt(512.0)) < 0.1 for s in scales), scales
+    _assert_attention_decomposed(prog)
 
 
-def test_decode_attention_fuses_to_sdpa():
-    """Decode is the hot path: query length 1 must fuse as completely as prefill.
-
-    stablehlo-coreml 0.1.5 taught ``fuse_attention_to_sdpa`` to handle a unit
-    query axis, so the whole block collapses and the mask rides along as SDPA's
-    ``attn_mask`` rather than surviving as a ``select``.
-    """
+def test_decode_attention_stays_decomposed():
     q, k, v = _attn_args(C=1, hd=256)
     valid = jnp.ones((128,), jnp.bool_)
     _, prog = _convert(decode_attention, q, k, v, valid)
-
-    assert _count(prog, "scaled_dot_product_attention") == 1
-    assert _count(prog, "softmax") == 0
-    assert _count(prog, "matmul") == 0
-    assert _count(prog, "select") == 0
-    # Only the two GQA repeat tiles (k and v) are left; the mask tile is gone.
-    assert _count(prog, "tile") == 2
-    _assert_softmax_not_decomposed(prog)
-
-    sdpa = next(op for op in _ops(prog) if op.op_type == "scaled_dot_product_attention")
-    assert sdpa.inputs.get("attn_mask") is not None, "the mask was dropped, not absorbed"
+    _assert_attention_decomposed(prog)
 
 
 def test_standalone_softmax_stays_a_softmax():
@@ -251,33 +234,48 @@ def _rmsnorm_const_scale(x):
     return rmsnorm(x, jnp.asarray(np.full((x.shape[-1],), 0.5, np.float16)))
 
 
-def test_rmsnorm_fuses_to_l2_norm():
-    """``fuse_rmsnorm`` — the eight-op chain becomes ``l2_norm`` + one ``mul``.
+def test_rmsnorm_fuses_to_one_fp16_l2_norm():
+    """The fp32-statistics norm becomes ``l2_norm`` + one ``mul``, in fp16.
 
-    ``(1, 1, D)`` needs no reshape: ``l2_norm`` normalizes over the last three
-    dims, which for that shape is exactly the last one.
+    ``fuse_rmsnorm`` collapses the chain onto ``l2_norm`` and ``fp16_l2_norm``
+    drops the casts around it. ``(1, 1, D)`` needs no reshape: ``l2_norm``
+    normalizes over the last three dims, which for that shape is exactly the
+    last one.
     """
     x = jnp.ones((1, 1, 256), jnp.float16)
     _, prog = _convert(_rmsnorm_const_scale, x)
 
     assert _count(prog, "l2_norm") == 1
-    for op_type in ("reduce_mean", "reduce_sum", "rsqrt", "reshape"):
+    for op_type in ("reduce_mean", "reduce_sum", "rsqrt", "reshape", "cast"):
         assert _count(prog, op_type) == 0, f"unfused RMSNorm leftover: {op_type}"
-    # eps' = d * eps, so that l2_norm's sum-of-squares matches mean + 1e-6.
+    # eps' = d * eps, so that l2_norm's sum of squares matches mean + 1e-6.
     l2 = next(op for op in _ops(prog) if op.op_type == "l2_norm")
-    assert abs(float(l2.inputs["epsilon"].val) - 256 * 1e-6) < 1e-9
-    # cast(fp32) -> l2_norm -> mul(sqrt(d)*scale) -> cast(fp16), nothing else.
-    assert sum(1 for op in _ops(prog) if op.op_type != "const") == 4
+    assert l2.inputs["epsilon"].val == np.float16(256 * 1e-6)
+    assert l2.outputs[0].dtype == mil_types.fp16
+    # l2_norm -> mul(sqrt(d) * scale).
+    assert sum(1 for op in _ops(prog) if op.op_type != "const") == 2
 
 
-def test_rmsnorm_off_canonical_shape_is_left_alone():
-    """``l2_norm`` reduces the last three dims, so a ``(1, L, H, hd)`` q-norm
-    would need reshaping around it — measurably a loss, so the pass skips it."""
-    for shape in ((1, 4, 8, 256), (1, 128, 256)):
+def test_rmsnorm_off_canonical_shape_is_viewed_as_rows():
+    """Prefill ``(1, L, D)`` and per-head ``(1, L, H, hd)`` norms are viewed as
+    ``(rows, 1, 1, d)`` so they fuse too: an unfused fp16 sum of squares
+    would overflow, and the fp32 one would pin the norm to the CPU on the ANE."""
+    for shape in ((1, 4, 8, 256), (1, 128, 256), (1, 1, 8, 256)):
         _, prog = _convert(_rmsnorm_const_scale, jnp.ones(shape, jnp.float16))
-        assert _count(prog, "l2_norm") == 0, shape
-        assert _count(prog, "reduce_mean") == 1, shape
-        assert _count(prog, "rsqrt") == 1, shape
+        assert _count(prog, "l2_norm") == 1, shape
+        for op_type in ("reduce_mean", "reduce_sum", "rsqrt", "cast"):
+            assert _count(prog, op_type) == 0, (shape, op_type)
+        assert _count(prog, "reshape") <= 2, shape
+
+
+def test_a_norm_scale_fp16_cannot_hold_fails_the_conversion():
+    """``sqrt(d) * scale`` is narrowed to fp16; one that overflows must not
+    silently become ``inf``. At d = 1536 that takes a scale above ~1671."""
+    def big_scale_norm(x):
+        return rmsnorm(x, jnp.asarray(np.full((x.shape[-1],), 2000.0, np.float16)))
+
+    with pytest.raises(ValueError, match="fp16 cannot represent"):
+        _convert(big_scale_norm, jnp.ones((1, 1, 1536), jnp.float16))
 
 
 def test_exact_gelu_fuses_to_one_fp16_op():
@@ -295,14 +293,64 @@ def test_exact_gelu_fuses_to_one_fp16_op():
     assert gelu.outputs[0].dtype == mil_types.fp16
 
 
-def test_adjacent_rmsnorms_have_no_cast_roundtrip():
-    """``collapse_cast_chains`` — coremltools keeps lossy downcast→upcast pairs."""
-    x = jnp.ones((1, 1, 256), jnp.float16)
-    scale = jnp.ones((256,), jnp.float16)
-    _, prog = _convert(double_rmsnorm, x, scale, scale)
+def test_rmsnorm_is_fp16_end_to_end():
+    """The ANE has no fp32: a norm that upcasts anywhere pins its ops to the CPU.
 
-    assert _count(prog, "l2_norm") == 2
-    assert _cast_roundtrips(prog) == 0
+    Covers every norm shape the model has — the ``(1, 1, D)`` decode norms,
+    the chunk and per-head ones — and two norms back to back.
+    """
+    progs = [_convert(_rmsnorm_const_scale, jnp.ones(shape, jnp.float16))[1]
+             for shape in ((1, 1, 1536), (1, 128, 256), (1, 4, 8, 256))]
+    progs.append(_convert(double_rmsnorm, jnp.ones((1, 1, 256), jnp.float16))[1])
+    for prog in progs:
+        assert _count(prog, "cast") == 0
+        for op in _ops(prog):
+            for out in op.outputs:
+                if not mil_types.is_float(out.dtype):
+                    continue  # int32 axes constants
+                assert out.dtype == mil_types.fp16, (
+                    f"{op.op_type} produces {mil_types.builtin_to_string(out.dtype)}"
+                )
+
+
+def _norm_rows():
+    """fp16 rows across the range RMSNorm meets, eps-dominated ones included."""
+    rng = np.random.RandomState(11)
+    rows = {
+        "zeros": np.zeros(1536),
+        "all 1e-6": np.full(1536, 1e-6),
+        "all 1e-4": np.full(1536, 1e-4),
+        "all 1e-3": np.full(1536, 1e-3),
+        "rms 1": rng.randn(1536),
+        "rms 80": rng.randn(1536) * 80.0,
+        "rms 2000": rng.randn(1536) * 2000.0,
+    }
+    outlier = rng.randn(1536) * 300.0
+    outlier[7] = 6.0e4  # one huge outlier, as residual streams have
+    rows["rms 300 + 6e4 outlier"] = outlier
+    return {k: v.astype(np.float16) for k, v in rows.items()}
+
+
+def _reference_rmsnorm(x16, scale16):
+    x = x16.astype(np.float64)
+    return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + 1e-6) * scale16.astype(np.float64)
+
+
+def test_rmsnorm_matches_an_fp64_reference_across_the_range():
+    """The JAX function, fp16 in and out, against fp64 — tiny rows included,
+    where ``eps`` dominates and the output must stay small, and rows whose
+    fp16 sum of squares would overflow."""
+    scale = (1.0 + np.random.RandomState(5).randn(1536) * 0.1).astype(np.float16)
+    for name, row in _norm_rows().items():
+        # decode (1, 1, D), prefill (1, L, D) and per-head (1, 1, H, hd) rows
+        for x in (row.reshape(1, 1, 1536), np.stack([row, row])[None], row.reshape(1, 1, 6, 256)):
+            s = scale[:x.shape[-1]]
+            out = np.asarray(rmsnorm(jnp.asarray(x), jnp.asarray(s)), np.float64)
+            ref = _reference_rmsnorm(x, s)
+            shape = x.shape
+            assert np.all(np.isfinite(out)), (name, shape)
+            np.testing.assert_allclose(out, ref, rtol=2e-3, atol=2e-3 * np.abs(ref).max() + 1e-12,
+                                       err_msg=f"{name} {shape}")
 
 
 # ── numerical parity ─────────────────────────────────────────────────────
@@ -321,7 +369,7 @@ def test_numerical_chunk_attention():
         jnp.ones_like(q), jnp.ones_like(k), jnp.ones_like(v), jnp.ones((C, S), jnp.bool_),
         load=True,
     )
-    assert _count(prog, "scaled_dot_product_attention") == 1
+    _assert_attention_decomposed(prog)
     out = _predict(model, q, k, v, mask.astype(np.float32))
 
     assert np.max(np.abs(ref - out)) < 1e-3
@@ -341,7 +389,7 @@ def test_numerical_decode_attention():
         jnp.ones_like(q), jnp.ones_like(k), jnp.ones_like(v), jnp.ones((S,), jnp.bool_),
         load=True,
     )
-    assert _count(prog, "scaled_dot_product_attention") == 1
+    _assert_attention_decomposed(prog)
     out = _predict(model, q, k, v, valid.astype(np.float32))
 
     assert np.max(np.abs(ref - out)) < 1e-3
@@ -357,6 +405,27 @@ def test_numerical_logit_softcap():
     np.testing.assert_allclose(out, ref, atol=1e-2, rtol=1e-2)
 
 
+def test_exported_rmsnorm_matches_an_fp64_reference_on_cpu():
+    """The converted norm — an fp16 ``l2_norm`` — on the CPU across the range.
+
+    Its sum of squares must not overflow like a plain fp16 one would. (Measured
+    on the GPU and the ANE as well; see ``mil_passes/fp16_l2_norm`` for those
+    numbers and the ANE's one deviation, on eps-dominated rows.)
+    """
+    rows = _norm_rows()
+    x = np.stack(list(rows.values()))[:, None, None, :]   # (rows, 1, 1, 1536)
+    scale = (1.0 + np.random.RandomState(5).randn(1536) * 0.1).astype(np.float16)
+    model, prog = _convert(
+        _rmsnorm_const_scale, jnp.asarray(x), load=True, compute_units=ct.ComputeUnit.CPU_ONLY,
+    )
+    assert _count(prog, "l2_norm") == 1 and _count(prog, "cast") == 0
+    out = _predict(model, x).astype(np.float64)
+    ref = _reference_rmsnorm(x, np.full(1536, 0.5, np.float16))
+    for i, name in enumerate(rows):
+        np.testing.assert_allclose(out[i], ref[i], rtol=5e-3, atol=5e-3 * np.abs(ref[i]).max() + 1e-12,
+                                   err_msg=name)
+
+
 def test_numerical_rmsnorm_and_gelu():
     rng = np.random.RandomState(3)
     x = rng.randn(1, 8, 256).astype(np.float16)
@@ -369,82 +438,3 @@ def test_numerical_rmsnorm_and_gelu():
     ref_gelu = np.array(exact_gelu(jnp.array(x)))
     model, _ = _convert(exact_gelu, jnp.array(x), load=True)
     np.testing.assert_allclose(_predict(model, x), ref_gelu, atol=1e-2, rtol=1e-2)
-
-
-# ── weight quantization: what gets a constexpr and what does not ─────────
-
-def test_logit_projection_int8_for_decode_fp16_for_prefill():
-    """The [dim, vocab] logit projection is quantized to int8 with block-32 scales.
-
-    Both historical reasons for leaving it fp16 are tied to the old
-    [K, N] / ``transpose_y=False`` layout and no longer hold:
-
-    * MPSGraph's ``LowerDequantizeND`` constant-fold (~16 s on the first
-      prediction of every process) only happens in that orientation.  Measured
-      fresh-process first predict at N=262144: 16.3 s for [K,N]/ty=False vs
-      0.06 s for [N,K]/ty=True, the same as fp16.
-    * int4 is still too lossy for logits, and buys no speed over int8 here
-      (2.02 vs 2.11 ms at M=1; 43.2 vs 43.1 ms at M=128).
-
-    Block-32 rather than per-channel is a **correctness** requirement, not a
-    tuning choice: Core ML's int8 per-channel matmul in the
-    [N,K]/``transpose_y=True`` orientation returns uncorrelated garbage for
-    N >= 65536 once M >= 5 (relRMS 1.0 vs fp16), and prefill runs this head at
-    M = CHUNK_SIZE = 128.  This test pins the grouping.
-
-    Decode only: in situ the int8 head is worth ~+4% decode but costs ~22% of
-    prefill, which runs it at M = CHUNK_SIZE rather than M = 1.  The two phases
-    convert separately, so they simply get different weights.
-
-    The gather table in the same graph is the control: it stays int4 block-32.
-    """
-    rng = np.random.RandomState(5)
-    vocab = 262144
-    # Distinct embedding/logit dims, so neither tensor can be mistaken for the
-    # other's transpose when the converter picks a matmul orientation.
-    table = (rng.randn(vocab, 32) * 0.05).astype(np.float16)
-    hidden = (rng.randn(32, 64) * 0.1).astype(np.float16)
-    logit_w = (rng.randn(64, vocab) * 0.02).astype(np.float16)
-
-    def decode_fn(token_id):
-        embedded = _embed_lookup(jnp.asarray(table), token_id)
-        return jnp.matmul(jnp.matmul(embedded, jnp.asarray(hidden)),
-                          jnp.asarray(logit_w))
-
-    def prefill_fn(tokens):
-        embedded = _embed_lookup(jnp.asarray(table), tokens)
-        return jnp.matmul(jnp.matmul(embedded, jnp.asarray(hidden)),
-                          jnp.asarray(logit_w))
-
-    _, prog = _convert(decode_fn, jnp.zeros((1, 1), jnp.int32))
-
-    constexprs = [op for op in _ops(prog)
-                  if op.op_type == "constexpr_blockwise_shift_scale"]
-    by_shape = {tuple(op.outputs[0].shape): op for op in constexprs}
-
-    head = by_shape.get(logit_w.shape) or by_shape.get(logit_w.T.shape)
-    assert head is not None, (
-        f"the logit projection was not quantized (constexprs: {list(by_shape)})"
-    )
-
-    # int8, not int4: the data must NOT carry the sub-byte tag.
-    data = head.inputs["data"].val
-    assert data.dtype.metadata is None, "logit head was quantized to int4, not int8"
-
-    # Grouped (block-32) along the contraction axis, i.e. >1 scale per row.
-    scale = head.inputs["scale"].val
-    assert scale.ndim == 2 and min(scale.shape) > 1, (
-        f"logit head scale {scale.shape} is not grouped; per-channel scales "
-        "silently corrupt this matmul at M >= 5 for vocab >= 65536"
-    )
-
-    assert table.shape in by_shape, "the embedding table stopped being quantized"
-
-    # ...and prefill keeps the plain fp16 const, because int8 costs it ~22%.
-    _, prefill_prog = _convert(prefill_fn, jnp.zeros((1, 4), jnp.int32))
-    prefill_shapes = {tuple(op.outputs[0].shape) for op in _ops(prefill_prog)
-                      if op.op_type == "constexpr_blockwise_shift_scale"}
-    assert not ({logit_w.shape, logit_w.T.shape} & prefill_shapes), (
-        "the prefill logit head was quantized; int8 costs ~22% of prefill"
-    )
-    assert table.shape in prefill_shapes, "prefill embedding table not quantized"

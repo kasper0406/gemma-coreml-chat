@@ -21,8 +21,8 @@ model has:
 - The global KV caches as Core ML **state** instead of I/O: concrete shapes are
   exactly what state features were missing, so `global_kv_caches_to_states`
   runs here, right after materialization.  Note this makes the state layout
-  size-dependent — a state made from `prefill_512` fits only the `*_512`
-  pair, and growing the cache means migrating contents into a new state.
+  size-dependent — a state made from `state_512` fits only the `*_512`
+  functions, and growing the cache means migrating contents into a new state.
 - The cache *length* folded in as a constant: JAX's dimension-variable argument
   `N` is a value, not a shape, so materialization leaves it a runtime input and
   the global attention mask symbolic.  `concretize_cache_length` replaces it,
@@ -43,7 +43,8 @@ uv run gemma-materialize --input gemma4-e2b.mlpackage --output gemma4-e2b-mat.ml
 ```
 
 Defaults to sizes [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
-matching the runtime doubling growth strategy.
+matching the runtime doubling growth strategy.  The input's ``Tokenizer/`` and
+``Embeddings/`` directories are copied into the output.
 """
 
 from __future__ import annotations
@@ -57,8 +58,12 @@ from typing import Sequence
 import coremltools as ct
 
 import gemma_chat.weight_shards  # noqa: F401  — caps blob files below 2 GiB
+from gemma_chat import host_embeddings
 from gemma_chat.mil_passes.concretize_cache_length import concretize_cache_length
-from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
+from gemma_chat.mil_passes.global_cache_states import (
+    check_state_writes_are_read,
+    global_kv_caches_to_states,
+)
 from gemma_chat.mil_passes.transpose_matmul_weights import transpose_matmul_weights
 
 
@@ -84,9 +89,10 @@ def _concretize_cache_lengths(prog, function_name_to_length: dict[str, int]) -> 
     **Why the attention fusion is deliberately NOT re-run here.**  Concrete
     shapes would let ``common::fuse_attention_to_sdpa`` finally collect the
     *global* attention sites it had to skip during export (it bails on symbolic
-    dimensions; the *sliding* sites were always concrete, are fused at convert
-    time, and stay fused — they are not affected by either defect below).
-    Fusing the global sites trips two Apple bugs, both on macOS 26.5:
+    dimensions).  It is no longer in the export pipeline at all — the ANE
+    ignores SDPA's ``attn_mask``, see ``mil_passes.ct_convert_pipeline`` — but
+    even before that, fusing the global sites tripped two Apple bugs, both on
+    macOS 26.5:
 
     1. **ANE partitioner.** Once a function holds two or more global SDPAs,
        ANECCompile() fails on the segment containing the *deepest* one with
@@ -105,9 +111,7 @@ def _concretize_cache_lengths(prog, function_name_to_length: dict[str, int]) -> 
        on the query is part of the trigger.
 
     Leaving the global sites as the ``matmul → add(mask) → softmax → matmul``
-    they already are avoids both.  When Apple fixes either defect, re-running
-    ``common::fuse_attention_to_sdpa`` here (plus DCE) is all it takes to get
-    the fused form back — benchmark it against the decomposed form first.
+    they already are avoids both, and the ANE mask defect as well.
     """
     from coremltools.converters.mil.mil.passes.pass_pipeline import (
         PassPipelineManager as _PassPipelineManager,
@@ -256,6 +260,7 @@ def _materialize_single_function(
     # runs ~2.2x slower.  See the pass docstring.
     transpose_matmul_weights().apply(prog)
     _run_dce(prog)
+    check_state_writes_are_read(prog)
 
     # After materialization, point the default at one of the new functions.
     # (The upstream helper hard-codes "main", which breaks for non-"main"
@@ -360,11 +365,12 @@ def _materialize_multifunction_source(
     """Materialize every function of a (multi)function source into concrete
     per-size clones, loading the source pymil program **once**.
 
-    For each ``src_fn`` in ``source_function_names``, produces
-    ``{src_fn}_{size}`` target functions by running the
+    For each ``src_fn`` in ``source_function_names`` with a flexible-dim
+    input, produces ``{src_fn}_{size}`` target functions by running the
     ``materialize_symbolic_shape_program`` pass in-place on the same program.
     The original dynamic-shape source functions are dropped before save (the
-    whole point of materializing is to shed RangeDim ops for ANE).
+    whole point of materializing is to shed RangeDim ops for ANE); functions
+    without one are size-independent and kept as they are.
 
     Avoids the memory blow-up of the old "materialize each phase → then
     ``save_multifunction`` merge" flow: that merge loads each per-phase
@@ -399,20 +405,20 @@ def _materialize_multifunction_source(
     # dedup pass NOW — before materialize clones those ops — assigns matching
     # weight_ids by content hash, and the materialize pass propagates them to
     # every concrete-shape clone. The final save then blob-shares across all
-    # {prefill,decode}_{size} functions, keeping the on-device artifact the
+    # per-size functions, keeping the on-device artifact the
     # size of one weight set instead of two.
     _clear_weight_ids(prog)
     const_deduplication()._deduplicate_const_across_functions(prog)
 
+    # A function with no flexible-dim input does not depend on the cache size
+    # (the logit ``head``): it is carried over as it is, once.
     src_specs: list[tuple[str, list]] = []
     for src_fn in source_function_names:
         flexibles = _flexible_dim_inputs(spec, src_fn)
-        if not flexibles:
-            raise RuntimeError(
-                f"Source function {src_fn!r} has no flexible-dim inputs; "
-                "nothing to materialize."
-            )
-        src_specs.append((src_fn, flexibles))
+        if flexibles:
+            src_specs.append((src_fn, flexibles))
+    if not src_specs:
+        raise RuntimeError(f"{source_path} has no flexible-dim inputs; nothing to materialize.")
 
     kept_weight_ids = _weight_ids(prog)
     for src_fn, flexibles in src_specs:
@@ -458,14 +464,16 @@ def _materialize_multifunction_source(
     # rewrite, but nothing else runs dce this late (``skip_all_passes`` is set
     # below), so without this every rewritten weight is serialized twice.
     _run_dce(prog)
+    # The final program: no state write may have lost its reader on the way.
+    check_state_writes_are_read(prog)
 
-    # Smallest decode (if present) as default — least work on load; matches
-    # gemma-export's convention.
-    if f"decode_{min(sizes)}" in prog.functions:
-        prog.default_function_name = f"decode_{min(sizes)}"
-    else:
-        first_src = source_function_names[0]
-        prog.default_function_name = f"{first_src}_{min(sizes)}"
+    # The source's default at the smallest size — least work on load.
+    default = spec.description.defaultFunctionName or src_specs[0][0]
+    if default not in prog.functions:
+        default = f"{default}_{min(sizes)}"
+    if default not in prog.functions:
+        default = f"{src_specs[0][0]}_{min(sizes)}"
+    prog.default_function_name = default
     prog.export_as_multifunction = True
     prog.skip_all_passes = True
 
@@ -484,6 +492,25 @@ def _materialize_multifunction_source(
     out.save(str(dest_path))
 
 
+# What the runtime reads from inside the package besides the Core ML model:
+# the tokenizer and the host embedding tables (``gemma_chat.host_embeddings``).
+# A Core ML save writes neither, so materialization carries them over.
+SIDECAR_DIRS = ("Tokenizer", host_embeddings.DIR_NAME)
+
+
+def _copy_sidecars(source_path: Path, dest_path: Path) -> None:
+    for name in SIDECAR_DIRS:
+        src = Path(source_path) / name
+        if not src.is_dir():
+            print(
+                f"  warning: {Path(source_path).name} has no {name}/, so neither "
+                "will the output; the runtime needs it",
+                flush=True,
+            )
+            continue
+        shutil.copytree(src, Path(dest_path) / name)
+
+
 def materialize_mlpackage(
     source_path: Path,
     dest_path: Path,
@@ -495,7 +522,16 @@ def materialize_mlpackage(
     ``main_{N}`` functions. For a named-function or multifunction source
     (e.g. prefill + decode), the output contains ``{fname}_{N}`` functions
     for each source function ``fname`` and each ``N`` in ``sizes``.
+
+    The source's :data:`SIDECAR_DIRS` are copied into the output, so a
+    runnable source gives a runnable output.  That is also why the output must
+    be a different path: the save replaces the destination before the
+    sidecars are copied out of the source.
     """
+    if Path(source_path).resolve() == Path(dest_path).resolve():
+        raise ValueError(
+            f"cannot materialize {source_path} in place: write to a different path"
+        )
     peek = ct.models.MLModel(str(source_path), skip_model_load=True)
     has_named_functions = len(peek._spec.description.functions) > 0
     fn_names = _source_function_names(peek._spec)
@@ -512,6 +548,7 @@ def materialize_mlpackage(
         _materialize_multifunction_source(
             source_path, dest_path, sizes, fn_names,
         )
+    _copy_sidecars(source_path, dest_path)
 
 
 def _parse_sizes(s: str) -> list[int]:

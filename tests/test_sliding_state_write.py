@@ -22,16 +22,16 @@ import numpy as np
 import pytest
 
 from gemma_chat import decode_coreml
-from gemma_chat.cache_spec import build_cache_specs
-from gemma_chat.config import E2B_CONFIG, MAX_SEQ_LEN
+from gemma_chat.cache_spec import build_cache_specs, sliding_ring_length
+from gemma_chat.config import E2B_CONFIG
 from gemma_chat.decode_coreml import _sliding_ring_write, decode_step, empty_pos_ring
-from gemma_chat.model import AttentionType, Gemma4Config
+from gemma_chat.model import AttentionType, Gemma4Config, _embed_lookup
 
 
-def _dus_ring_write(cache, value, position, window: int):
+def _dus_ring_write(cache, value, position):
     """The write this replaced: an in-place slice update at the ring slot."""
     return jax.lax.dynamic_update_slice(
-        cache, value, (0, position % window, 0, 0)
+        cache, value, (0, position % cache.shape[1], 0, 0)
     )
 
 
@@ -53,8 +53,8 @@ def test_ring_write_matches_dynamic_update_slice(window):
             rng.standard_normal((1, 1, nkv, hd)).astype(np.float16)
         )
         pos = jnp.int32(position)
-        got = _sliding_ring_write(cache, value, pos, window)
-        want = _dus_ring_write(cache, value, pos, window)
+        got = _sliding_ring_write(cache, value, pos)
+        want = _dus_ring_write(cache, value, pos)
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
         assert got.dtype == cache.dtype
         assert got.shape == cache.shape
@@ -69,7 +69,7 @@ def test_ring_write_only_touches_its_own_slot():
     )
     value = jnp.full((1, 1, nkv, hd), -1.0, dtype=jnp.float16)
 
-    got = np.asarray(_sliding_ring_write(cache, value, jnp.int32(7), window))
+    got = np.asarray(_sliding_ring_write(cache, value, jnp.int32(7)))
     expected = np.asarray(cache).copy()
     expected[0, 7 % window] = -1.0
     np.testing.assert_array_equal(got, expected)
@@ -134,35 +134,58 @@ def _tiny_params(cfg: Gemma4Config, seed: int = 0) -> dict:
     return params
 
 
+def _empty_caches(cfg, max_seq_len):
+    """Zeroed ``{slot: (k, v)}`` in the exported layout: sliding caches are
+    ``sliding_ring_length`` rows, global ones ``max_seq_len``."""
+    caches = {}
+    for slot, s in enumerate(build_cache_specs(cfg, max_seq_len)):
+        rows = sliding_ring_length(cfg) if s.attn_type == AttentionType.LOCAL_SLIDING else s.cache_len
+        shape = (1, rows, s.num_kv_heads, s.head_dim)
+        caches[slot] = (jnp.zeros(shape, jnp.float16), jnp.zeros(shape, jnp.float16))
+    return caches
+
+
+def _host_rows(params, tokens, cfg):
+    """The rows the host looks up (see ``gemma_chat.host_embeddings``)."""
+    token_embed = _embed_lookup(params["embed_tokens"], tokens) \
+        * jnp.sqrt(float(cfg.embed_dim)).astype(jnp.float16)
+    return token_embed, _embed_lookup(params["embed_tokens_per_layer"], tokens)
+
+
 def _run_decode(params, cfg, max_seq_len, steps):
     """Run `steps` decode steps, returning (logits list, caches, pos ring)."""
-    specs = build_cache_specs(cfg, max_seq_len)
-    kv = []
-    for s in specs:
-        shape = (1, s.cache_len, s.num_kv_heads, s.head_dim)
-        kv.append(jnp.zeros(shape, dtype=jnp.float16))
-        kv.append(jnp.zeros(shape, dtype=jnp.float16))
+    kv = [c for pair in _empty_caches(cfg, max_seq_len).values() for c in pair]
     ring = empty_pos_ring(cfg)
 
     all_logits = []
     for position in range(steps):
-        token = jnp.int32((position * 7 + 3) % cfg.num_embed)
+        token = jnp.full((1, 1), (position * 7 + 3) % cfg.num_embed, jnp.int32)
+        token_embed, ple_rows = _host_rows(params, token, cfg)
         logits, kv, ring = decode_step(
-            params, token, jnp.int32(position), kv, ring, cfg=cfg,
+            params, token_embed, ple_rows, jnp.int32(position), kv, ring, cfg=cfg,
         )
         all_logits.append(np.asarray(logits))
     return all_logits, [np.asarray(c) for c in kv], np.asarray(ring)
 
 
-def test_decode_step_unchanged_by_the_reformulation(monkeypatch):
+@pytest.fixture
+def small_ring(monkeypatch):
+    """A 4-token prefill chunk, so the tiny models' rings are 8 + 4 rows and
+    wrap within a few dozen steps."""
+    from gemma_chat import cache_spec
+    monkeypatch.setattr(cache_spec, "CHUNK_SIZE", 4)
+    return 4
+
+
+def test_decode_step_unchanged_by_the_reformulation(monkeypatch, small_ring):
     """Same logits and same caches as the dynamic_update_slice version.
 
-    Runs past the sliding window so the ring wraps twice; the global cache
-    (which still uses dynamic_update_slice) is exercised at the same time.
+    Runs long enough for the 12-row ring to wrap twice; the global cache
+    is exercised at the same time.
     """
     cfg = _tiny_config()
-    max_seq_len = 24
-    steps = 20  # 2.5 wraps of the 8-slot ring
+    max_seq_len = 32
+    steps = 30
     params = _tiny_params(cfg)
 
     new_logits, new_kv, new_ring = _run_decode(params, cfg, max_seq_len, steps)
@@ -180,62 +203,254 @@ def test_decode_step_unchanged_by_the_reformulation(monkeypatch):
     assert any(np.any(c != 0) for c in new_kv)
 
 
-# ── 3. The export-side state mapping ───────────────────────────────────────
+# ── 3. Layer chunks compose to the whole model ────────────────────────────
 
 
-def test_kv_export_plan_indices_and_names():
-    from gemma_chat.export import _kv_export_plan
-
-    specs = build_cache_specs(E2B_CONFIG, MAX_SEQ_LEN)
-    sliding = [i for i, s in enumerate(specs)
-               if s.attn_type == AttentionType.LOCAL_SLIDING]
-    globals_ = [i for i, s in enumerate(specs)
-                if s.attn_type == AttentionType.GLOBAL]
-    assert (len(sliding), len(globals_)) == (12, 3)
-
-    states, kv_in, kv_out = _kv_export_plan(specs, has_global=True)
-
-    # Traced args: [N, token, position] + kv_flat + [sliding_pos_ring]
-    # Traced outs: [logits] + kv_flat_out + [sliding_pos_ring_out]
-    base = 3
-    n_args = base + 2 * len(specs) + 1
-    n_outs = 1 + 2 * len(specs) + 1
-
-    assert set(states) == {
-        base + 2 * slot + half for slot in sliding for half in (0, 1)
-    }
-    for slot in sliding:
-        k_spec = states[base + 2 * slot]
-        v_spec = states[base + 2 * slot + 1]
-        assert (k_spec.name, k_spec.output) == (f"k_{slot}", 1 + 2 * slot)
-        assert (v_spec.name, v_spec.output) == (f"v_{slot}", 2 + 2 * slot)
-
-    assert kv_in == [f"{p}_{slot}" for slot in globals_ for p in ("k", "v")]
-    assert kv_out == [f"{n}_out" for n in kv_in]
-
-    # Every argument is either state or a remaining input, exactly once.
-    remaining_inputs = ["N", "token_id", "position"] + kv_in + ["sliding_pos_ring"]
-    assert len(remaining_inputs) + len(states) == n_args
-    # Same for outputs.
-    remaining_outputs = ["logits"] + kv_out + ["sliding_pos_ring_out"]
-    consumed = {spec.output for spec in states.values()}
-    assert len(consumed) == len(states)
-    assert len(remaining_outputs) + len(consumed) == n_outs
-    assert 0 not in consumed and (n_outs - 1) not in consumed
-
-
-def test_kv_export_plan_without_global_layers():
-    """A truncated all-sliding export has no `N` argument, shifting the base."""
-    from gemma_chat.export import _kv_export_plan
-
-    cfg = dataclasses.replace(
-        Gemma4Config(),
-        attention_types=(AttentionType.LOCAL_SLIDING,) * 2,
+def _kv_shared_config() -> Gemma4Config:
+    """7 layers, the last two KV-shared (reading layers 3 and 4), window 8."""
+    S, G = AttentionType.LOCAL_SLIDING, AttentionType.GLOBAL
+    return dataclasses.replace(
+        Gemma4Config(), attention_types=(S, S, G, S, G, S, G),
+        num_kv_shared_layers=2, sliding_window_size=8,
     )
-    specs = build_cache_specs(cfg, 32)
-    states, kv_in, kv_out = _kv_export_plan(specs, has_global=False)
 
-    assert kv_in == [] and kv_out == []
-    assert set(states) == {2, 3, 4, 5}
-    assert states[2].name == "k_0" and states[2].output == 1
-    assert states[5].name == "v_1" and states[5].output == 4
+
+def test_layer_chunks_cover_the_model_and_share_the_right_caches(monkeypatch):
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 3, 5))
+    chunks = decode_coreml.layer_chunks(_kv_shared_config())
+    assert [(c.layers.start, c.layers.stop) for c in chunks] == [(0, 3), (3, 5), (5, 7)]
+    assert [c.writes for c in chunks] == [(0, 1, 2), (3, 4), ()]
+    assert [c.reads for c in chunks] == [(), (), (3, 4)]
+
+
+def test_a_chunk_without_a_global_layer_joins_the_one_before(monkeypatch):
+    """Every exported function but the head is one per cache size."""
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 3, 4))
+    chunks = decode_coreml.layer_chunks(_kv_shared_config())
+    # Layer 3 alone is sliding-only.
+    assert [(c.layers.start, c.layers.stop) for c in chunks] == [(0, 4), (4, 7)]
+
+
+def test_a_leading_chunk_without_a_global_layer_joins_the_one_after(monkeypatch):
+    """A leading sliding-only chunk has no cache-size-dependent input, so it
+    used to be exported as a size-less ``decode_c0`` next to ``decode_c1_<N>``
+    — a layout the runtime cannot load.  Every chunk must hold a global layer."""
+    from gemma_chat.export import _chunk_io_plan
+
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 2, 3))
+    cfg = _kv_shared_config()  # S S G S G S G
+    chunks = decode_coreml.layer_chunks(cfg)
+    assert [(c.layers.start, c.layers.stop) for c in chunks] == [(0, 3), (3, 7)]
+    for k, chunk in enumerate(chunks):
+        assert _chunk_io_plan(cfg, chunk, first=k == 0, tokens=1, N=24).has_global
+
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 4))
+    assert [(c.layers.start, c.layers.stop) for c in decode_coreml.layer_chunks(E2B_CONFIG)] \
+        == [(0, E2B_CONFIG.num_layers)]
+
+
+def test_a_model_without_a_global_layer_is_rejected():
+    cfg = dataclasses.replace(
+        Gemma4Config(), attention_types=(AttentionType.LOCAL_SLIDING,) * 3,
+    )
+    with pytest.raises(ValueError, match="no global-attention layer"):
+        decode_coreml.layer_chunks(cfg)
+
+
+def test_the_shipped_chunks_all_hold_a_global_layer():
+    chunks = decode_coreml.layer_chunks(E2B_CONFIG)
+    assert [i for c in chunks for i in c.layers] == list(range(E2B_CONFIG.num_layers))
+    for c in chunks:
+        assert any(E2B_CONFIG.attention_types[i] == AttentionType.GLOBAL for i in c.layers)
+
+
+def test_chunked_decode_matches_a_single_chunk(monkeypatch, small_ring):
+    """Splitting the layers — with the KV-shared ones in a chunk of their own,
+    reading caches an earlier chunk wrote — changes nothing."""
+    cfg = _kv_shared_config()
+    params = _tiny_params(cfg)
+    one_logits, one_kv, one_ring = _run_decode(params, cfg, 24, 12)
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", (0, 3, 5))
+    three_logits, three_kv, three_ring = _run_decode(params, cfg, 24, 12)
+    for a, b in zip(one_logits, three_logits):
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-5)
+    for a, b in zip(one_kv, three_kv):
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-3)
+    np.testing.assert_array_equal(one_ring, three_ring)
+
+
+# ── 4. The export-side signatures ──────────────────────────────────────────
+
+
+def test_chunk_io_plan_maps_every_argument_and_result():
+    from gemma_chat.export import _chunk_io_plan
+
+    cfg = _kv_shared_config()
+    specs = build_cache_specs(cfg, 24)
+    is_global = {s: spec.attn_type == AttentionType.GLOBAL for s, spec in enumerate(specs)}
+    for k, chunk in enumerate(decode_coreml.layer_chunks(cfg)):
+        plan = _chunk_io_plan(cfg, chunk, first=k == 0, tokens=1, N=24)
+        leading = (["hidden"] if k else []) + ["token_embed", "ple_rows", "position"]
+        base = 1 + len(leading)  # N first: every chunk holds a global layer
+        assert plan.has_global
+        assert plan.input_names[:base] == ["N"] + leading
+
+        # Traced results: [hidden_out] + k/v of every written slot.
+        results = ["hidden_out"] + [f"{p}_{s}_out" for s in chunk.writes for p in "kv"]
+        for j, slot in enumerate(chunk.slots):
+            for half, prefix in enumerate("kv"):
+                name, arg = f"{prefix}_{slot}", base + 2 * j + half
+                written = results.index(f"{name}_out") if slot in chunk.writes else None
+                if is_global[slot]:
+                    assert arg not in plan.states and name in plan.input_names
+                    assert name in plan.flexible
+                else:
+                    assert plan.states[arg].name == name
+                    assert plan.states[arg].output == written
+        state_outputs = {spec.output for spec in plan.states.values()} - {None}
+        assert plan.output_names == [r for i, r in enumerate(results) if i not in state_outputs]
+        assert plan.input_names[-1] == "sliding_pos_ring"
+        # Every traced argument is either state or a named input (``N`` is
+        # JAX's own, not in ``arg_specs``).
+        assert len(plan.arg_specs) + 1 == len(plan.input_names) + len(plan.states)
+
+
+def test_state_io_plan_declares_every_cache_read_only():
+    from gemma_chat.export import _state_io_plan
+
+    cfg = _kv_shared_config()
+    plan = _state_io_plan(cfg, N=24)
+    specs = build_cache_specs(cfg, 24)
+    sliding = [s for s, spec in enumerate(specs) if spec.attn_type == AttentionType.LOCAL_SLIDING]
+    assert sorted(spec.name for spec in plan.states.values()) == sorted(
+        f"{p}_{s}" for s in sliding for p in "kv"
+    )
+    assert all(spec.output is None for spec in plan.states.values())
+    assert plan.input_names == ["N"] + [
+        f"{p}_{s}" for s in range(len(specs)) if s not in sliding for p in "kv"
+    ]
+
+
+# ── 5. The sliding window is exact, prefill and decode alike ──────────────
+
+
+class _Runtime:
+    """The GemmaCore runtime's cache handling (``InferenceEngine`` /
+    ``KVCacheState`` / ``CoreMLModel.grownToFit``) over the JAX chunk
+    functions, for one conversation.
+
+    * Prefill runs whole chunks from a chunk boundary: the final one is
+      right-padded with token 0, and the padding is written into the caches
+      and marked in the ring like any token.  Only the last real row's logits
+      are kept.
+    * Decode writes one position at a time — over the padding, first.
+    * The global caches have one of ``sizes`` rows; outgrowing it copies them
+      into zeroed caches of the next size (the first rows, as
+      ``PredictionBuffer.copyPrefix`` does) and keeps the sliding caches and
+      the ring unchanged.
+    """
+
+    def __init__(self, params, cfg, chunk_size, sizes):
+        self.params, self.cfg, self.chunk_size, self.sizes = params, cfg, chunk_size, sizes
+        self.size = sizes[0]
+        self.caches = _empty_caches(cfg, self.size)
+        self.ring = empty_pos_ring(cfg)
+        self.grown = []
+
+    def grow_to_fit(self, needed):
+        size = next(s for s in self.sizes if s >= needed)
+        if size == self.size:
+            return
+        fresh = _empty_caches(self.cfg, size)
+        for slot, pair in self.caches.items():
+            rows = pair[0].shape[1]
+            fresh[slot] = tuple(new.at[:, :rows].set(old) for old, new in zip(pair, fresh[slot]))
+        self.caches, self.size = fresh, size
+        self.grown.append(size)
+
+    def _run(self, step, tokens, start, extra):
+        cfg, d = self.cfg, self.cfg.per_layer_input_dim
+        count = tokens.shape[1]
+        self.ring = decode_coreml.ring_with_positions(self.ring, start + jnp.arange(count))
+        token_embed, ple_rows = _host_rows(self.params, tokens, cfg)
+        hidden = token_embed
+        for chunk in decode_coreml.layer_chunks(cfg):
+            cols = ple_rows[:, :, chunk.layers.start * d:chunk.layers.stop * d]
+            hidden, written = step(
+                self.params, chunk, hidden, token_embed, cols, jnp.int32(start),
+                {s: self.caches[s] for s in chunk.slots}, self.ring, cfg, **extra,
+            )
+            self.caches.update(written)
+        return hidden
+
+    def prefill(self, ids, offset):
+        """``continuePrefill``: ``ids[:, offset:]`` from the chunk holding
+        ``offset``; returns the last real token's logits."""
+        C, n = self.chunk_size, ids.shape[1]
+        padded_len = -(-n // C) * C
+        padded = jnp.concatenate([ids, jnp.zeros((1, padded_len - n), jnp.int32)], axis=1)
+        self.grow_to_fit(padded_len)
+        for start in range(offset // C * C, padded_len, C):
+            hidden = self._run(decode_coreml.prefill_chunk, padded[:, start:start + C],
+                               start, {"chunk_size": C})
+        real = n - (padded_len - C)
+        return decode_coreml.logits_head(self.params, hidden[:, real - 1:real], self.cfg)
+
+    def decode(self, token, position):
+        self.grow_to_fit(position + 1)
+        hidden = self._run(decode_coreml.decode_chunk, token, position, {})
+        return decode_coreml.logits_head(self.params, hidden, self.cfg)
+
+
+@pytest.mark.parametrize("starts", [(0,), (0, 3, 5)])
+@pytest.mark.parametrize("prompt", [13, 15, 16])
+def test_every_row_attends_exactly_its_window(monkeypatch, small_ring, starts, prompt):
+    """A two-turn conversation through the runtime's cache handling against
+    the reference model's full-sequence attention, far past the window.
+
+    Turn one prefills ``prompt`` tokens (the final chunk holding 1, 3 or 4
+    real rows), decodes over the padding and grows the global caches from 16
+    to 32 rows mid-reply; turn two prefills from the chunk its new tokens
+    start in and decodes on.  Every position the runtime produces logits for
+    is compared.
+
+    A prefill chunk is written into the sliding ring before its rows attend.
+    With a ring of exactly ``window`` rows the chunk overwrote positions its
+    own first rows still needed, so every row past the window attended to
+    fewer than ``window`` positions (logits off by ~1 here).  With
+    ``(0, 3, 5)`` the KV-shared layers sit in a later layer chunk and read the
+    ring from state after the owning chunk has written it.
+    """
+    from flax import nnx
+    from gemma_chat.model import Gemma4Transformer
+    from gemma_chat.weight_mapper import load_params_into_model
+
+    monkeypatch.setattr(decode_coreml, "LAYER_CHUNK_STARTS", starts)
+    cfg = _kv_shared_config()  # window 8
+    params = _tiny_params(cfg)
+    reply, turn_two, reply_two = 9, 6, 5
+    total = prompt + reply + turn_two + reply_two
+    ids = jnp.asarray(
+        np.random.default_rng(1).integers(1, cfg.num_embed, (1, total)), jnp.int32,
+    )
+
+    model = Gemma4Transformer(config=cfg, rngs=nnx.Rngs(params=0))
+    load_params_into_model(model, params, cfg)
+    want = np.asarray(model(ids)[0], np.float32)
+
+    rt = _Runtime(params, cfg, small_ring, sizes=(16, 32, 64))
+    got = {}
+
+    def converse(prompt_end, offset, reply_len):
+        got[prompt_end - 1] = rt.prefill(ids[:, :prompt_end], offset)
+        for p in range(prompt_end, prompt_end + reply_len):
+            got[p] = rt.decode(ids[:, p:p + 1], p)
+
+    converse(prompt, 0, reply)
+    assert rt.grown == [32], "turn one has to grow the cache mid-reply"
+    converse(prompt + reply + turn_two, prompt + reply, reply_two)
+
+    positions = sorted(got)
+    err = np.abs(np.stack([np.asarray(got[p], np.float32) for p in positions])
+                 - want[positions]).max(axis=-1)
+    assert err.max() < 0.1, f"max |logit error| at {positions}: {np.round(err, 3)}"

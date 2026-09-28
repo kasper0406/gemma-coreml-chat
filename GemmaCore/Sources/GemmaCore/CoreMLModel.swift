@@ -1,58 +1,115 @@
-/// CoreML model wrapper for the materialized multifunction Gemma4-E2B package.
+/// CoreML model wrapper for the chunked, materialized multifunction Gemma4-E2B
+/// package.
 ///
-/// The artifact exports concrete-shape function pairs `prefill_<N>` /
-/// `decode_<N>`, one per size in the export's `--materialize-sizes` (powers of
-/// two by default, but any ascending set is legal, and a `--decode-only` export
-/// has no `prefill_<N>` at all). Each function is specialized to one global KV
-/// cache length, with no dynamic shape ops, so it runs on every backend
-/// including ANE and iPhone. The runtime selects the pair matching the current
-/// cache size — see ``KVCacheSizePolicy``, the only place bucketing lives.
+/// Every step runs as a sequence of **layer-chunk functions** and then one
+/// shared logit head, because the Neural Engine takes no function past a size
+/// limit (and one too-large function takes the whole package off it). For
+/// each size N in the export's `--materialize-sizes` the package declares
 ///
-/// **Every** KV cache is a CoreML state: the sliding-window caches and the
-/// global-attention ones alike. A prediction therefore takes the token,
-/// the position, and the int32 `sliding_pos_ring` (states must be floating
-/// point, so the ring cannot be one), and returns logits plus the updated ring.
-/// An artifact that still declares `k_<slot>` / `v_<slot>` as inputs predates
-/// that change and is rejected at load — re-run `gemma-export`.
+/// - `decode_c<k>_<N>` / `prefill_c<k>_<N>`, k = 0 ..< ``layerChunkCount``:
+///   the hidden state in (`token_embed` itself for chunk 0) and out, the
+///   final one normed;
+/// - `state_<N>`: declares every KV cache; only used to make the `MLState`;
 ///
-/// State buffer shapes are baked into each function, so an `MLState` belongs to
-/// exactly one size: ``makeEmptyKVState(size:)`` creates it from that pair's
-/// model handle, and ``grownToFit(_:needed:)`` migrates the contents when the
-/// conversation outgrows it.
+/// plus the size-independent `head` (final hidden `[1, 1, D]` → logits).
+/// A `--decode-only` export has no `prefill_*` functions.
+///
+/// **Every** KV cache is CoreML state, and Core ML shares states across the
+/// functions of one package by name: one `MLState`, made from `state_<N>`,
+/// serves every chunk of size N (each chunk declares only the caches its
+/// layers touch). The inputs besides the state are the embedding rows
+/// (`token_embed`, and each chunk's columns of `ple_rows` — looked up on the
+/// host, see ``HostEmbeddings``), the position and the int32
+/// `sliding_pos_ring`, which the host keeps up to date itself (see
+/// ``KVCacheState``). The runtime selects the size through
+/// ``KVCacheSizePolicy``, the only place bucketing lives.
+///
+/// State buffer shapes are baked into each size's functions, so an `MLState`
+/// belongs to exactly one size: ``makeEmptyKVState(size:)`` creates it and
+/// ``grownToFit(_:needed:)`` migrates the contents when the conversation
+/// outgrows it. Artifacts from before the layer chunks, the cache states or
+/// the host lookups are rejected at load — re-run `gemma-export`.
+///
+/// Every loaded function is shared: all conversations of a size run the same
+/// chunk functions, and every size runs the same `head`. Core ML's synchronous
+/// prediction is not safe to call concurrently on one `MLModel`, so each
+/// function is a ``SerialFunction`` that lets one prediction at a time through
+/// — two conversations (or a specialization warming a new size while another
+/// generates) interleave step by step rather than race.
 
 import CoreML
 import CryptoKit
 import Foundation
 
 public final class CoreMLModel: @unchecked Sendable {
-    /// I/O names, shapes, and dtypes of one function, read from its description
-    /// once so predictions never re-derive them.
-    struct FunctionIO {
-        let logitsOutputName: String
-        let logitsShape: [NSNumber]
-        let logitsDataType: MLMultiArrayDataType
-        /// Token input, `[1, chunk]` for prefill and `[1]` for decode.
-        let tokenInputName: String
-        let tokenLength: Int
-        let positionInputName: String
-        let ringInputName: String
-        let ringOutputName: String
-        let ringShape: [NSNumber]
-        let ringDataType: MLMultiArrayDataType
-        /// Every KV cache, sliding and global, sorted for deterministic
-        /// migration order.
-        let stateNames: [String]
+    /// The two kinds of step: a `chunkSize`-token prompt chunk, or one token.
+    enum Phase: String, CaseIterable, Sendable {
+        case prefill, decode
     }
 
-    let decodeIO: FunctionIO
-    let prefillIO: FunctionIO
+    /// Feature names the exporter gives every function (`gemma_chat/export.py`).
+    enum Feature {
+        static let hidden = "hidden"
+        static let hiddenOut = "hidden_out"
+        static let tokenEmbed = HostEmbeddings.tokenInputName
+        static let pleRows = HostEmbeddings.perLayerInputName
+        static let position = "position"
+        static let ring = "sliding_pos_ring"
+        static let logits = "logits"
+    }
 
-    /// Tokens per prefill call, read from the prefill function's token input.
+    /// Signature of one layer-chunk function — the same at every size.
+    struct ChunkIO {
+        /// False for chunk 0, whose hidden state is `token_embed` itself.
+        let takesHidden: Bool
+        /// Whether the chunk has a sliding-window layer to mask.
+        let takesRing: Bool
+        /// `[1, L, columns]`: this chunk's slice of the per-layer rows.
+        let pleRowsShape: [NSNumber]
+    }
+
+    /// Signature of one phase's chunk sequence.
+    struct PhaseIO {
+        let chunks: [ChunkIO]
+        /// `[1, L, D]`, the shape of `token_embed` and of every chunk's
+        /// hidden state in and out.
+        let hiddenShape: [NSNumber]
+        /// Tokens per call (L).
+        var tokenLength: Int { hiddenShape[1].intValue }
+    }
+
+    /// Signature of `head`.
+    struct HeadIO {
+        let inputShape: [NSNumber]
+        let logitsShape: [NSNumber]
+        let logitsDataType: MLMultiArrayDataType
+    }
+
+    let decodeIO: PhaseIO
+    /// The decode signature again in decode-only mode, which prefills by
+    /// looping decode.
+    let prefillIO: PhaseIO
+    let headIO: HeadIO
+    /// `sliding_pos_ring`'s shape, `[1, sliding_window]`.
+    let ringShape: [NSNumber]
+    /// Every KV cache state, as `state_<N>` declares them, sorted for a
+    /// deterministic migration order.
+    let stateNames: [String]
+
+    /// The tables the embedding-row inputs are looked up in.
+    private let embeddings: HostEmbeddings
+    /// The logit head, shared by every size and both phases.
+    private let head: SerialFunction
+
+    /// Tokens per prefill call, read from the prefill chunks' `token_embed`.
     ///
-    /// A decode-only artifact has no prefill function and prefills by looping
+    /// A decode-only load has no prefill functions and prefills by looping
     /// `decode`, so its chunk is 1: any larger value would only pad the prompt
     /// out to a chunk boundary and spend real decode steps on the padding.
     public let chunkSize: Int
+
+    /// Layer-chunk functions per step (per phase and size).
+    public let layerChunkCount: Int
 
     /// Available materialized sizes, ascending. If the caller passed
     /// `maxContextSize`, this is the filtered list.
@@ -67,8 +124,8 @@ public final class CoreMLModel: @unchecked Sendable {
 
     /// True when only decode functions are loaded. `prefill()` falls back to
     /// running `decode()` per token — slower (no chunked prefill kernel), but
-    /// halves resident-MLModel count, which is the difference between fitting
-    /// and OOM on tight devices like iPhone 12 Pro.
+    /// halves the resident function count, which is the difference between
+    /// fitting and OOM on tight devices like iPhone 12 Pro.
     public let isDecodeOnly: Bool
 
     /// URL of the compiled .mlmodelc (for lazy function loading).
@@ -84,13 +141,6 @@ public final class CoreMLModel: @unchecked Sendable {
     /// Compute units used for all function loads.
     private let computeUnits: MLComputeUnits
 
-    /// `MLModel` isn't `Sendable`, so we can't use `Task<MLModel, Error>`
-    /// directly. Wrap it in an @unchecked-Sendable box: CoreML's own loading
-    /// is already thread-safe, and we never mutate the model instance.
-    private struct SendableMLModel: @unchecked Sendable {
-        let model: MLModel
-    }
-
     /// Per-function state: either fully loaded, or a pending load Task that
     /// concurrent callers can join rather than re-issuing the load.
     ///
@@ -99,38 +149,47 @@ public final class CoreMLModel: @unchecked Sendable {
     /// evicts, C starts T2, then B's eviction removes T2's entry and D starts
     /// T3 — two concurrent multi-GB loads of the same function.
     private enum LoadState {
-        case loaded(MLModel)
-        case loading(id: UInt64, task: Task<SendableMLModel, Error>)
+        case loaded(SerialFunction)
+        case loading(id: UInt64, task: Task<SerialFunction, Error>)
     }
 
-    /// Function state keyed by function name (e.g. "decode_512").
+    /// Function state keyed by function name (e.g. "decode_c0_512").
     private var functions: [String: LoadState]
-    /// Functions that have already run their throwaway specialization
-    /// prediction — see ``specialize(name:size:)``. Tracked separately from
-    /// `functions` because a bulk preload deliberately loads without
-    /// specializing.
-    private var specializedFunctions: Set<String> = []
+    /// Sizes that have already run their throwaway specialization step — see
+    /// ``specialize(size:)``. Tracked separately from `functions` because a
+    /// bulk preload deliberately loads without specializing.
+    private var specializedSizes: Set<Int> = []
     private var nextLoadID: UInt64 = 0
     private let cacheLock = NSLock()
 
     private init(
-        prefillIO: FunctionIO,
-        decodeIO: FunctionIO,
+        prefillIO: PhaseIO,
+        decodeIO: PhaseIO,
+        headIO: HeadIO,
+        ringShape: [NSNumber],
+        stateNames: [String],
+        embeddings: HostEmbeddings,
+        head: SerialFunction,
         chunkSize: Int,
         materializedSizes: [Int],
-        effectiveMaxSeqLen: Int,
         isDecodeOnly: Bool,
         modelURL: URL,
         sourceURL: URL,
         sourceFingerprint: String?,
         computeUnits: MLComputeUnits,
-        initialFunctions: [String: MLModel]
+        initialFunctions: [String: SerialFunction]
     ) {
         self.prefillIO = prefillIO
         self.decodeIO = decodeIO
+        self.headIO = headIO
+        self.ringShape = ringShape
+        self.stateNames = stateNames
+        self.embeddings = embeddings
+        self.head = head
         self.chunkSize = chunkSize
+        self.layerChunkCount = decodeIO.chunks.count
         self.materializedSizes = materializedSizes
-        self.effectiveMaxSeqLen = effectiveMaxSeqLen
+        self.effectiveMaxSeqLen = materializedSizes[materializedSizes.count - 1]
         self.isDecodeOnly = isDecodeOnly
         self.modelURL = modelURL
         self.sourceURL = sourceURL
@@ -139,38 +198,53 @@ public final class CoreMLModel: @unchecked Sendable {
         self.functions = initialFunctions.mapValues { .loaded($0) }
     }
 
+    // MARK: - Function names
+
+    static let headFunctionName = "head"
+
+    static func chunkFunctionName(_ phase: Phase, chunk: Int, size: Int) -> String {
+        "\(phase.rawValue)_c\(chunk)_\(size)"
+    }
+
+    static func stateFunctionName(size: Int) -> String {
+        "state_\(size)"
+    }
+
+    /// Every per-size function this load uses at `size`: the state function
+    /// first, then decode's chunks, then prefill's.
+    private func functionNames(size: Int) -> [String] {
+        let phases: [Phase] = isDecodeOnly ? [.decode] : [.decode, .prefill]
+        return [Self.stateFunctionName(size: size)] + phases.flatMap { phase in
+            (0..<layerChunkCount).map { Self.chunkFunctionName(phase, chunk: $0, size: size) }
+        }
+    }
+
     // MARK: - KV cache lifecycle
 
     /// A zeroed cache for `size` (rounded up through ``cacheSizePolicy``),
-    /// defaulting to the smallest materialized pair.
+    /// defaulting to the smallest materialized size.
     ///
-    /// The `MLState` is made from that pair's own model handle: state buffer
-    /// shapes are baked into each materialized function, so a state made at one
-    /// size is meaningless at another. The pair must already be loaded —
-    /// `ensureLoaded(forGlobalCacheSize:)` first for anything but the bootstrap
-    /// size, which `load` brings up.
+    /// The `MLState` is made from that size's `state_<N>` function, the one
+    /// that declares every cache: state buffer shapes are baked into each
+    /// size's functions, so a state made at one size is meaningless at
+    /// another. The size must already be loaded — `ensureLoaded(forGlobalCacheSize:)`
+    /// first for anything but the bootstrap size, which `load` brings up.
     ///
     /// Make a new one per conversation. Reusing one across a reset would leave
     /// stale K/V that a re-populated `sliding_pos_ring` marks valid again.
     public func makeEmptyKVState(size requested: Int? = nil) throws -> KVCacheState {
         let target = cacheSizePolicy.size(forNeeded: requested ?? materializedSizes[0])
-        guard let model = loadedFunction(named: functionName(prefix: "decode", size: target)) else {
+        guard let function = loadedFunction(named: Self.stateFunctionName(size: target)) else {
             throw KVCacheError.functionNotLoaded(size: target)
         }
-        return try KVCacheState(
-            size: target,
-            caches: model.makeState(),
-            ringShape: decodeIO.ringShape,
-            ringDataType: decodeIO.ringDataType,
-            chunkSize: chunkSize
-        )
+        return try KVCacheState(size: target, caches: function.makeState(), ringShape: ringShape)
     }
 
     /// Return a cache big enough for `needed` tokens, migrating `kv` into a
-    /// larger pair's state when it no longer fits.
+    /// larger size's state when it no longer fits.
     ///
     /// Returns `kv` untouched in the common case. When growth is required the
-    /// next pair is loaded first (state buffers can only be made from a loaded
+    /// next size is loaded first (state buffers can only be made from a loaded
     /// handle) and every cache is copied across — see
     /// ``KVCacheState/adoptContents(of:stateNames:)``.
     public func grownToFit(_ kv: KVCacheState, needed: Int) async throws -> KVCacheState {
@@ -178,7 +252,7 @@ public final class CoreMLModel: @unchecked Sendable {
         guard target > kv.size else { return kv }
         try await ensureLoaded(forGlobalCacheSize: target)
         let grown = try makeEmptyKVState(size: target)
-        try grown.adoptContents(of: kv, stateNames: decodeIO.stateNames)
+        try grown.adoptContents(of: kv, stateNames: stateNames)
         Log.info("[KV] Grew caches \(kv.size) → \(target) (needed \(needed))")
         return grown
     }
@@ -198,7 +272,7 @@ public final class CoreMLModel: @unchecked Sendable {
     /// next to the source for fast subsequent loads (E5RT cache reuse).
     /// For .mlmodelc files, loads directly without recompilation.
     ///
-    /// - Parameter maxContextSize: Only retain function pairs ≤ this size.
+    /// - Parameter maxContextSize: Only retain sizes ≤ this one.
     ///   Loading fewer functions is critical on memory-constrained devices like
     ///   iPhone, where loading all 16 pairs OOMs.
     /// - Parameter decodeOnly: Skip loading prefill functions entirely.
@@ -207,7 +281,7 @@ public final class CoreMLModel: @unchecked Sendable {
     ///   iPhone 12 Pro / 6 GB devices. Forced on for `--decode-only` artifacts,
     ///   which export no prefill functions to load.
     /// - Parameter backgroundPreload: Kick off a detached load of every
-    ///   retained function pair once the bootstrap pair is up. Right for
+    ///   retained size's functions once the bootstrap size is up. Right for
     ///   interactive apps (later size transitions become instant), wrong for
     ///   benchmarks — multi-GB loads running under a measured window contend
     ///   for CPU/ANE/disk and race the engine's own `ensureLoaded`, so
@@ -419,17 +493,16 @@ public final class CoreMLModel: @unchecked Sendable {
         digest.map { String(format: "%02x", $0) }.joined()
     }
 
+
     /// Load a pre-compiled multifunction .mlmodelc.
     ///
     /// The function set comes from `model.mil` — a text parse, no
-    /// `MLModel.load` — rather than from trial loads, so the bootstrap is never
-    /// the multi-MLModel memory spike that OOMs an iPhone. Only when the
-    /// manifest is unreadable does this fall back to probing.
+    /// `MLModel.load` — so the bootstrap never loads more than it keeps.
     ///
     /// Strategy, tuned for memory-constrained devices:
     ///   1. Take the declared function set from `model.mil`.
-    ///   2. Load `decode_{smallest}` and `prefill_{smallest}` SERIALLY. Peak
-    ///      live MLModel count is 1 during bootstrap.
+    ///   2. Load `head`, then the smallest size's state and chunk functions,
+    ///      one at a time.
     ///   3. Optionally background-preload the remaining retained sizes.
     private static func loadCompiled(
         from url: URL,
@@ -442,30 +515,28 @@ public final class CoreMLModel: @unchecked Sendable {
     ) async throws -> CoreMLModel {
         Log.info("[CoreML] Loading decode\(decodeOnly ? "" : " + prefill") functions from \(url.lastPathComponent)...")
 
-        var effectiveDecodeOnly = decodeOnly
-        let sizes: [Int]
-
-        if let declared = enumerateMaterializedFunctions(compiledURL: url) {
-            // A `gemma-export --decode-only` artifact has decode_<N> and no
-            // prefill_<N>. Insisting on the decode∩prefill intersection there
-            // yields no sizes at all.
-            if declared.prefillSizes.isEmpty && !effectiveDecodeOnly {
-                Log.info("[CoreML] Artifact exports no prefill functions — switching to decode-only mode")
-                effectiveDecodeOnly = true
-            }
-            sizes = declared.usableSizes(decodeOnly: effectiveDecodeOnly)
-            guard !sizes.isEmpty else {
-                throw CoreMLModelError.noUsableMaterializedFunctions(
-                    decodeSizes: declared.decodeSizes,
-                    prefillSizes: declared.prefillSizes
-                )
-            }
-            Log.info("[CoreML] Materialized sizes (from manifest): \(sizes)")
-        } else {
-            Log.info("[CoreML] Manifest enumeration unavailable; falling back to parallel probe")
-            sizes = await probeMaterializedSizes(url: url, computeUnits: computeUnits)
-            guard !sizes.isEmpty else { throw CoreMLModelError.notMaterialized(url.lastPathComponent) }
+        guard let declared = enumerateMaterializedFunctions(compiledURL: url) else {
+            throw CoreMLModelError.notMaterialized(url.lastPathComponent)
         }
+        guard declared.hasHead, let layerChunkCount = declared.layerChunkCount else {
+            throw declared.predatesLayerChunks
+                ? CoreMLModelError.modelPredatesLayerChunks(url.lastPathComponent)
+                : CoreMLModelError.notMaterialized(url.lastPathComponent)
+        }
+        // A `gemma-export --decode-only` artifact has no prefill chunks.
+        // Insisting on them there yields no sizes at all.
+        var effectiveDecodeOnly = decodeOnly
+        if declared.prefillSizes.isEmpty && !effectiveDecodeOnly {
+            Log.info("[CoreML] Artifact exports no prefill functions — switching to decode-only mode")
+            effectiveDecodeOnly = true
+        }
+        let sizes = declared.usableSizes(decodeOnly: effectiveDecodeOnly)
+        guard !sizes.isEmpty else {
+            throw CoreMLModelError.noUsableMaterializedFunctions(
+                decodeSizes: declared.decodeSizes, prefillSizes: declared.prefillSizes
+            )
+        }
+        Log.info("[CoreML] Materialized sizes (from manifest): \(sizes), \(layerChunkCount) layer chunks")
 
         // Restrict retained sizes to `maxContextSize` before any heavy load,
         // so the bootstrap only pulls functions we'll actually keep.
@@ -479,67 +550,78 @@ public final class CoreMLModel: @unchecked Sendable {
         } else {
             retainedSizes = sizes
         }
-
         let bootSize = retainedSizes[0]
-        let decodeName = "decode_\(bootSize)"
-        let prefillName = "prefill_\(bootSize)"
 
-        // Serial loads keep peak live-MLModel count at 1 during bootstrap.
-        let decodeModel = try await loadFunction(
-            url: url, computeUnits: computeUnits, function: decodeName
-        )
-        let prefillModel: MLModel?
-        if effectiveDecodeOnly {
-            prefillModel = nil
-            Log.info("[CoreML] Loaded \(decodeName) (decode-only; prefill skipped)")
-        } else {
-            prefillModel = try await loadFunction(
-                url: url, computeUnits: computeUnits, function: prefillName
-            )
-            Log.info("[CoreML] Loaded \(decodeName) + \(prefillName) (serial)")
+        // Serial loads keep the bootstrap's peak to one function load at a time.
+        func load(_ name: String) async throws -> SerialFunction {
+            try await loadFunction(url: url, computeUnits: computeUnits, function: name)
         }
-
-        let decodeIO = try classifyIO(model: decodeModel, function: decodeName)
-        // In decode-only mode, prefill metadata is borrowed from decode: the
-        // per-token loop in `decodeOnlyPrefill` runs the decode function, so
-        // those are the names and shapes it needs.
-        let prefillIO = try prefillModel.map { try classifyIO(model: $0, function: prefillName) }
-            ?? decodeIO
-        // Decode-only prefills one token at a time, so a chunk larger than 1
-        // would only pad the prompt and spend real decode steps on padding.
-        let chunkSize = prefillModel == nil ? 1 : prefillIO.tokenLength
-        if prefillModel != nil {
-            // The engine reads the row of the last *real* token out of the
-            // chunk, so a prefill that emits fewer rows than it consumes tokens
-            // cannot serve a padded final chunk. Fail here rather than at the
-            // first prompt that isn't a chunk multiple.
-            let rows = prefillIO.logitsShape.dropLast().map { $0.intValue }.reduce(1, *)
-            guard rows == chunkSize else {
-                throw CoreMLModelError.unexpectedSignature(
-                    function: prefillName,
-                    detail: "takes \(chunkSize) tokens but emits \(rows) logits row(s); the runtime needs one row per chunk position"
-                )
+        let head = try await load(headFunctionName)
+        let stateName = stateFunctionName(size: bootSize)
+        var loaded: [String: SerialFunction] = [stateName: try await load(stateName)]
+        var chunkModels: [Phase: [SerialFunction]] = [:]
+        for phase in effectiveDecodeOnly ? [Phase.decode] : [.decode, .prefill] {
+            for k in 0..<layerChunkCount {
+                let name = chunkFunctionName(phase, chunk: k, size: bootSize)
+                let model = try await load(name)
+                loaded[name] = model
+                chunkModels[phase, default: []].append(model)
             }
         }
-        logIOSummary(decodeIO: decodeIO, prefillIO: prefillIO, chunkSize: chunkSize)
+        Log.info("[CoreML] Loaded head + \(loaded.count) functions of size \(bootSize) (serial)")
 
-        var initialFunctions: [String: MLModel] = [decodeName: decodeModel]
-        if let p = prefillModel {
-            initialFunctions[prefillName] = p
+        let stateNames = loaded[stateName]!.model.modelDescription.stateDescriptionsByName.keys.sorted()
+        let headIO = try classifyHead(model: head.model)
+        var ringShape: [NSNumber]?
+        func classify(_ phase: Phase) throws -> PhaseIO {
+            let names = (0..<layerChunkCount).map { chunkFunctionName(phase, chunk: $0, size: bootSize) }
+            let io = try classifyPhase(
+                models: chunkModels[phase]!.map(\.model), names: names, stateNames: Set(stateNames),
+                ringShape: &ringShape
+            )
+            guard io.hiddenShape[2] == headIO.inputShape[2] else {
+                throw CoreMLModelError.unexpectedSignature(
+                    function: headFunctionName,
+                    detail: "takes a hidden state of \(headIO.inputShape) but \(names.last!) emits \(io.hiddenShape)"
+                )
+            }
+            return io
         }
+        let decodeIO = try classify(.decode)
+        // In decode-only mode, prefill metadata is borrowed from decode: the
+        // per-token loop in `decodeOnlyPrefill` runs the decode chunks.
+        let prefillIO = effectiveDecodeOnly ? decodeIO : try classify(.prefill)
+        guard let ringShape else {
+            throw CoreMLModelError.unexpectedSignature(
+                function: chunkFunctionName(.decode, chunk: 0, size: bootSize),
+                detail: "no layer chunk takes `\(Feature.ring)`"
+            )
+        }
+        // After the signatures, so an artifact that still takes token ids
+        // gets that error rather than a missing-directory one.
+        let embeddings = try HostEmbeddings(packageURL: sourceURL)
+        for io in [decodeIO, prefillIO] {
+            try checkEmbeddingShapes(io, against: embeddings)
+        }
+        let chunkSize = effectiveDecodeOnly ? 1 : prefillIO.tokenLength
+        Log.info("[CoreML] \(layerChunkCount) layer chunks; decode hidden=\(decodeIO.hiddenShape.map(\.intValue)), prefill chunk=\(chunkSize), head logits=\(headIO.logitsShape.map(\.intValue)) dtype=\(headIO.logitsDataType.rawValue), ring=\(ringShape.map(\.intValue)), \(stateNames.count) cache states")
 
         let instance = CoreMLModel(
             prefillIO: prefillIO,
             decodeIO: decodeIO,
+            headIO: headIO,
+            ringShape: ringShape,
+            stateNames: stateNames,
+            embeddings: embeddings,
+            head: head,
             chunkSize: chunkSize,
             materializedSizes: retainedSizes,
-            effectiveMaxSeqLen: retainedSizes[retainedSizes.count - 1],
             isDecodeOnly: effectiveDecodeOnly,
             modelURL: url,
             sourceURL: sourceURL,
             sourceFingerprint: sourceFingerprint,
             computeUnits: computeUnits,
-            initialFunctions: initialFunctions
+            initialFunctions: loaded
         )
         if backgroundPreload {
             instance.preloadAllSizes()
@@ -547,204 +629,172 @@ public final class CoreMLModel: @unchecked Sendable {
         return instance
     }
 
-    /// Last-resort size discovery when `model.mil` can't be parsed: try loading
-    /// `decode_<N>` for every plausible N and keep the ones that succeed. The
-    /// probed models are dropped — this only answers "which sizes exist"; the
-    /// bootstrap reloads what it needs.
-    private static func probeMaterializedSizes(
-        url: URL, computeUnits: MLComputeUnits
-    ) async -> [Int] {
-        let candidateSizes = (6...16).map { 1 << $0 }  // 64..65536
-        return await withTaskGroup(of: Int?.self) { group in
-            for size in candidateSizes {
-                group.addTask {
-                    let config = MLModelConfiguration()
-                    config.computeUnits = computeUnits
-                    config.functionName = "decode_\(size)"
-                    let model = try? await MLModel.load(contentsOf: url, configuration: config)
-                    return model == nil ? nil : size
-                }
-            }
-            var found: [Int] = []
-            for await size in group {
-                if let size { found.append(size) }
-            }
-            return found.sorted()
-        }
-    }
-
-    /// Load a single function by name (used at bootstrap).
+    /// Load a single function by name.
     private static func loadFunction(
         url: URL, computeUnits: MLComputeUnits, function: String
-    ) async throws -> MLModel {
+    ) async throws -> SerialFunction {
         let config = MLModelConfiguration()
         config.computeUnits = computeUnits
         config.functionName = function
-        return try await MLModel.load(contentsOf: url, configuration: config)
-    }
-
-    /// The `{decode,prefill}_<N>` function sets a compiled artifact declares.
-    struct MaterializedFunctions {
-        /// Sizes with a `decode_<N>` function, ascending.
-        let decodeSizes: [Int]
-        /// Sizes with a `prefill_<N>` function, ascending. Empty for artifacts
-        /// exported with `gemma-export --decode-only`.
-        let prefillSizes: [Int]
-
-        /// Sizes runnable in the requested mode: decode-only needs just a
-        /// decode function, otherwise both halves of the pair must exist.
-        func usableSizes(decodeOnly: Bool) -> [Int] {
-            guard !decodeOnly else { return decodeSizes }
-            let prefill = Set(prefillSizes)
-            return decodeSizes.filter { prefill.contains($0) }
+        do {
+            return SerialFunction(try await MLModel.load(contentsOf: url, configuration: config))
+        } catch {
+            throw CoreMLModelError.functionLoadFailed(
+                function: function, computeUnits: computeUnitsTag(computeUnits), underlying: error
+            )
         }
     }
 
-    /// Scan the compiled `model.mil` manifest for `func decode_N<…>` /
-    /// `func prefill_N<…>` declarations.
+    /// The per-size function sets a compiled artifact declares.
+    struct MaterializedFunctions {
+        /// Chunk indices declared per size, per phase.
+        let chunks: [Phase: [Int: Set<Int>]]
+        /// Sizes with a `state_<N>` function.
+        let stateSizes: Set<Int>
+        let hasHead: Bool
+        /// The artifact declares pre-chunk `decode_<N>` functions.
+        let predatesLayerChunks: Bool
+
+        /// Chunks per step: the decode chunk count at the smallest size, or nil
+        /// when there are none.
+        var layerChunkCount: Int? {
+            guard let smallest = chunks[.decode]?.keys.min() else { return nil }
+            return chunks[.decode]?[smallest]?.count
+        }
+
+        /// Sizes whose chunks are complete in `phase`, ascending.
+        func sizes(_ phase: Phase) -> [Int] {
+            guard let count = layerChunkCount else { return [] }
+            let full = Set(0..<count)
+            return (chunks[phase] ?? [:]).filter { $0.value == full }.keys.sorted()
+        }
+
+        var decodeSizes: [Int] { sizes(.decode) }
+        var prefillSizes: [Int] { sizes(.prefill) }
+
+        /// Sizes runnable in the requested mode: a state function, the decode
+        /// chunks and, unless decode-only, the prefill chunks.
+        func usableSizes(decodeOnly: Bool) -> [Int] {
+            let prefill = Set(prefillSizes)
+            return decodeSizes.filter {
+                stateSizes.contains($0) && (decodeOnly || prefill.contains($0))
+            }
+        }
+    }
+
+    /// Scan the compiled `model.mil` manifest for `func decode_c<k>_<N>`,
+    /// `func prefill_c<k>_<N>`, `func state_<N>` and `func head` declarations.
     ///
-    /// Returns nil ONLY when the manifest is missing or unparseable. An empty
-    /// `decodeSizes` means "parsed fine, this isn't a materialized artifact" —
-    /// callers must not conflate the two, because nil is what licenses the
-    /// expensive parallel probe.
+    /// Returns nil only when the manifest is missing or unparseable.
     static func enumerateMaterializedFunctions(compiledURL: URL) -> MaterializedFunctions? {
         let milURL = compiledURL.appendingPathComponent("model.mil")
-        guard let text = try? String(contentsOf: milURL, encoding: .utf8) else {
-            return nil
-        }
-        guard let re = try? NSRegularExpression(
-            pattern: #"\bfunc\s+(decode|prefill)_(\d+)\s*[<(]"#
-        ) else { return nil }
+        guard let text = try? String(contentsOf: milURL, encoding: .utf8),
+              let re = try? NSRegularExpression(
+                pattern: #"\bfunc\s+(?:(decode|prefill)_c(\d+)_(\d+)|state_(\d+)|(head)|(decode|prefill)_(\d+))\s*[<(]"#
+              )
+        else { return nil }
 
-        var decodeSizes = Set<Int>()
-        var prefillSizes = Set<Int>()
+        var chunks: [Phase: [Int: Set<Int>]] = [:]
+        var stateSizes = Set<Int>()
+        var hasHead = false
+        var predates = false
         let full = NSRange(text.startIndex..<text.endIndex, in: text)
         re.enumerateMatches(in: text, range: full) { match, _, _ in
-            guard let m = match, m.numberOfRanges >= 3,
-                  let kr = Range(m.range(at: 1), in: text),
-                  let sr = Range(m.range(at: 2), in: text),
-                  let size = Int(text[sr]) else { return }
-            if text[kr] == "decode" { decodeSizes.insert(size) }
-            else { prefillSizes.insert(size) }
+            guard let m = match else { return }
+            func group(_ i: Int) -> String? {
+                Range(m.range(at: i), in: text).map { String(text[$0]) }
+            }
+            if let phase = group(1).flatMap(Phase.init(rawValue:)),
+               let k = group(2).flatMap({ Int($0) }), let size = group(3).flatMap({ Int($0) }) {
+                chunks[phase, default: [:]][size, default: []].insert(k)
+            } else if let size = group(4).flatMap({ Int($0) }) {
+                stateSizes.insert(size)
+            } else if group(5) != nil {
+                hasHead = true
+            } else if group(6) != nil {
+                predates = true
+            }
         }
         return MaterializedFunctions(
-            decodeSizes: decodeSizes.sorted(),
-            prefillSizes: prefillSizes.sorted()
+            chunks: chunks, stateSizes: stateSizes, hasHead: hasHead, predatesLayerChunks: predates
         )
-    }
-
-    /// Log I/O classification summary.
-    private static func logIOSummary(
-        decodeIO: FunctionIO, prefillIO: FunctionIO, chunkSize: Int
-    ) {
-        Log.info("[CoreML] Decode: logits=\(decodeIO.logitsOutputName)\(decodeIO.logitsShape.map { $0.intValue }) dtype=\(decodeIO.logitsDataType.rawValue), token=\(decodeIO.tokenInputName), pos=\(decodeIO.positionInputName), ring=\(decodeIO.ringInputName)→\(decodeIO.ringOutputName), caches=\(decodeIO.stateNames.count) states")
-        Log.info("[CoreML] Prefill: logits=\(prefillIO.logitsOutputName)\(prefillIO.logitsShape.map { $0.intValue }) dtype=\(prefillIO.logitsDataType.rawValue), chunk=\(chunkSize)")
     }
 
     // MARK: - Function Resolution
 
-    /// Name of the function serving `size`, which callers get from a
-    /// ``KVCacheState`` and is therefore always one of `materializedSizes`.
-    private func functionName(prefix: String, size: Int) -> String {
-        "\(prefix)_\(size)"
-    }
-
-    /// The loaded model for `name`, or nil if it hasn't been loaded yet.
-    private func loadedFunction(named name: String) -> MLModel? {
+    /// The loaded function `name`, or nil if it hasn't been loaded yet.
+    private func loadedFunction(named name: String) -> SerialFunction? {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         if case .loaded(let model) = functions[name] { return model }
         return nil
     }
 
-    /// The loaded model for a prediction, or a clear error naming the call the
-    /// caller skipped.
-    private func function(prefix: String, size: Int) throws -> MLModel {
-        let name = functionName(prefix: prefix, size: size)
-        guard let model = loadedFunction(named: name) else {
-            throw KVCacheError.functionNotLoaded(size: size)
+    /// The loaded chunk functions of `phase` at `size`, in order, or a clear
+    /// error naming the call the caller skipped.
+    private func chunkModels(_ phase: Phase, size: Int) throws -> [SerialFunction] {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return try (0..<layerChunkCount).map { k in
+            guard case .loaded(let model) = functions[Self.chunkFunctionName(phase, chunk: k, size: size)] else {
+                throw KVCacheError.functionNotLoaded(size: size)
+            }
+            return model
         }
-        return model
     }
 
-    /// Pre-load *and specialize* the decode and prefill functions for a given
-    /// cache size. Call from an async context before sync `prefill()`/`decode()`
-    /// calls; every path that is about to predict at a new size goes through
-    /// here, which is what keeps ``specialize(name:size:)`` off the token loop.
+    /// Pre-load *and specialize* every function for a given cache size. Call
+    /// from an async context before sync `prefill()`/`decode()` calls; every
+    /// path that is about to predict at a new size goes through here, which is
+    /// what keeps ``specialize(size:)`` off the token loop.
     public func ensureLoaded(forGlobalCacheSize cacheSize: Int) async throws {
         let size = cacheSizePolicy.size(forNeeded: cacheSize)
-        let decodeName = functionName(prefix: "decode", size: size)
-        let prefillName = functionName(prefix: "prefill", size: size)
-
         try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { _ = try await self.loadIfNeeded(name: decodeName) }
-            if !self.isDecodeOnly {
-                group.addTask { _ = try await self.loadIfNeeded(name: prefillName) }
+            for name in functionNames(size: size) {
+                group.addTask { _ = try await self.loadIfNeeded(name: name) }
             }
             try await group.waitForAll()
         }
-
-        // Serial, deliberately: a specialization transiently allocates tens of
-        // GB (MPSGraph materializes the dequantized embedding tables), so two
-        // at once exhausts memory on machines that comfortably run one.
-        try specialize(name: decodeName, size: size)
-        if !isDecodeOnly {
-            try specialize(name: prefillName, size: size)
-        }
+        try specialize(size: size)
     }
 
-    /// Run one throwaway prediction on a freshly loaded function, into a
-    /// scratch `MLState` that no conversation owns.
+    /// Run one throwaway step of each phase through a freshly loaded size,
+    /// into a scratch `MLState` that no conversation owns.
     ///
     /// A GPU-backed CoreML function does not finish compiling when it loads:
     /// `MLModel.load` only builds the E5RT plan, and MPSGraph specializes the
-    /// executable lazily inside the *first* `predictionFromFeatures:`. For this
-    /// model that first call costs ~17 s of single-threaded MLIR work, almost
-    /// all of it constant-folding the block-32 int4 embedding tables that feed
-    /// `gather` (`LowerDequantizeND` → `foldCastAttribute`, one LLVM `APFloat`
-    /// per weight element), with a ~27 GB transient peak. Nothing caches it:
-    /// it is redone in every process, for every materialized function.
-    ///
-    /// So pay it here — at load, or at the moment a conversation grows into a
-    /// new size — instead of inside the first token the user is waiting on.
-    /// The scratch state matters: predictions mutate KV caches in place, so
-    /// warming through the live cache would write a phantom token 0 into it.
-    private func specialize(name: String, size: Int) throws {
+    /// executable lazily inside the *first* prediction — seconds per function,
+    /// redone in every process. So pay it here — at load, or at the moment a
+    /// conversation grows into a new size — instead of inside the first token
+    /// the user is waiting on. The scratch state matters: predictions mutate
+    /// KV caches in place, so warming through the live cache would write a
+    /// phantom token 0 into it.
+    private func specialize(size: Int) throws {
         cacheLock.lock()
-        let alreadyDone = !specializedFunctions.insert(name).inserted
+        let alreadyDone = !specializedSizes.insert(size).inserted
         cacheLock.unlock()
         guard !alreadyDone else { return }
 
-        guard let model = loadedFunction(named: name) else {
-            throw KVCacheError.functionNotLoaded(size: size)
-        }
         let start = CFAbsoluteTimeGetCurrent()
         try autoreleasepool {
-            let scratch = try KVCacheState(
-                size: size,
-                caches: model.makeState(),
-                ringShape: decodeIO.ringShape,
-                ringDataType: decodeIO.ringDataType,
-                chunkSize: chunkSize
-            )
-            if name.hasPrefix("decode") {
-                _ = try decode(token: 0, position: 0, kvState: scratch)
-            } else {
+            let scratch = try makeEmptyKVState(size: size)
+            _ = try decode(token: 0, position: 0, kvState: scratch)
+            if !isDecodeOnly {
                 _ = try prefill(
                     tokens: [Int32](repeating: 0, count: chunkSize),
                     startPosition: 0, logitsRow: 0, kvState: scratch
                 )
             }
         }
-        Log.info("[CoreML] Specialized '\(name)' in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start))s")
+        Log.info("[CoreML] Specialized size \(size) in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start))s")
     }
 
     /// Result of checking the cache for `name`: an already-loaded model, or a
     /// load Task (either newly started by us or one a concurrent caller had
     /// already kicked off).
     private enum CacheLookup {
-        case existing(MLModel)
-        case pending(id: UInt64, task: Task<SendableMLModel, Error>)
+        case existing(SerialFunction)
+        case pending(id: UInt64, task: Task<SerialFunction, Error>)
     }
 
     /// Atomically look up `name`; if absent, start a new load Task and record
@@ -761,12 +811,8 @@ public final class CoreMLModel: @unchecked Sendable {
         }
         let url = modelURL
         let units = computeUnits
-        let task: Task<SendableMLModel, Error> = Task {
-            let config = MLModelConfiguration()
-            config.computeUnits = units
-            config.functionName = name
-            let model = try await MLModel.load(contentsOf: url, configuration: config)
-            return SendableMLModel(model: model)
+        let task: Task<SerialFunction, Error> = Task {
+            try await Self.loadFunction(url: url, computeUnits: units, function: name)
         }
         nextLoadID += 1
         let id = nextLoadID
@@ -774,7 +820,7 @@ public final class CoreMLModel: @unchecked Sendable {
         return .pending(id: id, task: task)
     }
 
-    private func markLoaded(name: String, model: MLModel) {
+    private func markLoaded(name: String, model: SerialFunction) {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         functions[name] = .loaded(model)
@@ -795,13 +841,13 @@ public final class CoreMLModel: @unchecked Sendable {
     /// Load a single function by name. Concurrent callers for the same name
     /// share one in-flight Task instead of issuing duplicate loads.
     @discardableResult
-    private func loadIfNeeded(name: String) async throws -> MLModel {
+    private func loadIfNeeded(name: String) async throws -> SerialFunction {
         switch lookupOrStart(name: name) {
         case .existing(let model):
             return model
         case .pending(let id, let task):
             do {
-                let model = try await task.value.model
+                let model = try await task.value
                 markLoaded(name: name, model: model)
                 Log.info("[CoreML] Function '\(name)' loaded.")
                 return model
@@ -812,7 +858,7 @@ public final class CoreMLModel: @unchecked Sendable {
         }
     }
 
-    /// Kick off background loads for every materialized function pair in
+    /// Kick off background loads for every retained size's functions in
     /// ascending size order. Non-blocking: later calls to `ensureLoaded` join
     /// in-flight tasks rather than issuing duplicate loads.
     public func preloadAllSizes(concurrency: Int = 2) {
@@ -827,11 +873,11 @@ public final class CoreMLModel: @unchecked Sendable {
         }
     }
 
-    /// Block until every materialized function pair is loaded, reporting
-    /// progress as each completes. On first-run installs this is what warms
-    /// the ANE / E5RT cache before the first chat turn — otherwise the user
-    /// hits multi-minute stalls mid-session. Safe to call even when the bg
-    /// preload is running: both join the same in-flight tasks.
+    /// Block until every retained function is loaded, reporting progress as
+    /// each completes. On first-run installs this is what warms the ANE / E5RT
+    /// cache before the first chat turn — otherwise the user hits multi-minute
+    /// stalls mid-session. Safe to call even when the bg preload is running:
+    /// both join the same in-flight tasks.
     public func warmSynchronously(
         concurrency: Int = 4,
         progress: @Sendable @escaping (_ completed: Int, _ total: Int) -> Void
@@ -842,11 +888,10 @@ public final class CoreMLModel: @unchecked Sendable {
         if allOK { markWarmed() }
     }
 
-    /// Every function this load retains, in ascending size order.
+    /// Every per-size function this load retains, in ascending size order.
+    /// (`head` is loaded by `load` itself.)
     private var allFunctionNames: [String] {
-        materializedSizes.flatMap {
-            isDecodeOnly ? ["decode_\($0)"] : ["decode_\($0)", "prefill_\($0)"]
-        }
+        materializedSizes.flatMap { functionNames(size: $0) }
     }
 
     /// Core worker used by both `preloadAllSizes` and `warmSynchronously`:
@@ -972,12 +1017,13 @@ public final class CoreMLModel: @unchecked Sendable {
 
     // MARK: - Prediction
 
-    /// Run one prefill chunk and return the logits row for `logitsRow`.
+    /// Run one prefill chunk and return the logits of token `logitsRow`.
     ///
     /// `tokens.count` must equal ``chunkSize``; the engine pads the prompt to a
-    /// chunk boundary. Only one row of the `[chunk, vocab]` output is ever
-    /// wanted (the last *real* token of the chunk), so the row is copied out
-    /// and the big output buffer is reused for the next chunk.
+    /// chunk boundary. Only one row of the chunk is ever wanted (the last
+    /// *real* token), so only that row of the final hidden state goes through
+    /// `head`. The returned logits live in the cache's rotating logits
+    /// backings, like ``decode(token:position:kvState:)``'s.
     public func prefill(
         tokens: [Int32],
         startPosition: Int32,
@@ -985,8 +1031,13 @@ public final class CoreMLModel: @unchecked Sendable {
         kvState: KVCacheState
     ) throws -> MLMultiArray {
         // This chunk writes cache rows startPosition ..< +count, so every one
-        // of them has to fit. The real prefill kernel would fault; the
-        // per-token loop would silently scribble past the end.
+        // of them has to fit — checked before anything, the ring included, is
+        // touched (a negative position would index the ring below slot 0).
+        guard startPosition >= 0 else {
+            throw CoreMLModelError.positionOutOfRange(
+                position: Int(startPosition), cacheSize: kvState.size
+            )
+        }
         guard Int(startPosition) + tokens.count <= kvState.size else {
             throw CoreMLModelError.positionOutOfRange(
                 position: Int(startPosition) + tokens.count - 1, cacheSize: kvState.size
@@ -1004,30 +1055,20 @@ public final class CoreMLModel: @unchecked Sendable {
             )
         }
 
-        let model = try function(prefix: "prefill", size: kvState.size)
-        try kvState.loadChunk(tokens)
-        kvState.setScalar(startPosition, in: kvState.positionScalar)
-
-        let inputs: [String: MLMultiArray] = [
-            prefillIO.tokenInputName: kvState.chunkTokens,
-            prefillIO.positionInputName: kvState.positionScalar,
-            prefillIO.ringInputName: kvState.ring,
-        ]
-
-        let logitsBacking = try kvState.prefillLogits(
-            shape: prefillIO.logitsShape, dataType: prefillIO.logitsDataType
+        let step = try kvState.step(.prefill, io: prefillIO, headIO: headIO)
+        // Padded positions get the pad token's rows, like any other token.
+        let hidden = try runChunks(
+            step, tokens: tokens, position: startPosition,
+            models: chunkModels(.prefill, size: kvState.size), kvState: kvState
         )
-        let logits = try predict(
-            model: model, io: prefillIO, inputs: inputs,
-            logitsBacking: logitsBacking, kvState: kvState
-        )
-        return try PredictionBuffer.extractRow(logitsRow, from: logits, what: "prefill logits")
+        try PredictionBuffer.copyRow(logitsRow, of: hidden, into: step.headInput)
+        return try runHead(step, kvState: kvState)
     }
 
     /// Per-token prefill via repeated `decode()` calls — the fallback used when
     /// only decode functions are loaded. Slower than a real prefill function
-    /// (no fused chunk kernel), but keeps the resident MLModel count at 1
-    /// instead of 2, the only way to fit on iPhone 12 Pro / 6 GB.
+    /// (no fused chunk kernel), but keeps the resident function count at half,
+    /// the only way to fit on iPhone 12 Pro / 6 GB.
     ///
     /// The chunk is 1 token in this mode, so in practice this runs one decode
     /// and copies its logits — the loop is here for symmetry with a chunked
@@ -1049,7 +1090,7 @@ public final class CoreMLModel: @unchecked Sendable {
                     token: token, position: startPosition + Int32(i), kvState: kvState
                 )
                 if i == logitsRow {
-                    // Copy: the decode logits live in a backing that the next
+                    // Copy: the decode logits live in a backing that a later
                     // step overwrites.
                     row = try PredictionBuffer.extractRow(0, from: logits, what: "decode logits")
                 }
@@ -1062,154 +1103,190 @@ public final class CoreMLModel: @unchecked Sendable {
     }
 
     /// Run one decode step. The returned logits live in a double-buffered
-    /// backing: they stay valid across the *next* decode and are overwritten by
+    /// backing: they stay valid across the *next* step and are overwritten by
     /// the one after, which is exactly the lifetime the sampling loop needs.
     public func decode(
         token: Int32,
         position: Int32,
         kvState: KVCacheState
     ) throws -> MLMultiArray {
-        guard Int(position) < kvState.size else {
+        guard position >= 0, Int(position) < kvState.size else {
             throw CoreMLModelError.positionOutOfRange(
                 position: Int(position), cacheSize: kvState.size
             )
         }
-        let model = try function(prefix: "decode", size: kvState.size)
-        kvState.setScalar(token, in: kvState.tokenScalar)
-        kvState.setScalar(position, in: kvState.positionScalar)
-
-        let inputs: [String: MLMultiArray] = [
-            decodeIO.tokenInputName: kvState.tokenScalar,
-            decodeIO.positionInputName: kvState.positionScalar,
-            decodeIO.ringInputName: kvState.ring,
-        ]
-
-        let logitsBacking = try kvState.nextDecodeLogitsBacking(
-            shape: decodeIO.logitsShape, dataType: decodeIO.logitsDataType
+        let step = try kvState.step(.decode, io: decodeIO, headIO: headIO)
+        // The decode head reads the last chunk's output buffer directly.
+        _ = try runChunks(
+            step, tokens: CollectionOfOne(token), position: position,
+            models: chunkModels(.decode, size: kvState.size), kvState: kvState
         )
-        return try predict(
-            model: model, io: decodeIO, inputs: inputs,
-            logitsBacking: logitsBacking, kvState: kvState
-        )
+        return try runHead(step, kvState: kvState)
     }
 
-    /// Shared prediction body: hand CoreML our preallocated output buffers, run
-    /// the stateful prediction, take the new ring, and return the logits.
+    /// Look the tokens' rows up, record their positions in the ring, and run
+    /// every layer chunk of one step in order. Returns the final (normed)
+    /// hidden state.
     ///
     /// The KV caches never appear here — they are state, mutated in place
-    /// inside `kvState.caches`.
-    private func predict(
-        model: MLModel,
-        io: FunctionIO,
-        inputs: [String: MLMultiArray],
-        logitsBacking: MLMultiArray,
+    /// inside `kvState.caches` by whichever chunks own them.
+    private func runChunks(
+        _ step: StepScratch,
+        tokens: some Collection<Int32>,
+        position: Int32,
+        models: [SerialFunction],
         kvState: KVCacheState
     ) throws -> MLMultiArray {
-        let options = MLPredictionOptions()
-        options.outputBackings = [
-            io.logitsOutputName: logitsBacking,
-            io.ringOutputName: kvState.ringSpare,
-        ]
-        let result = try model.prediction(
-            from: CoreMLInputProvider(values: inputs),
-            using: kvState.caches,
-            options: options
-        )
-        guard let ring = result.featureValue(for: io.ringOutputName)?.multiArrayValue else {
-            throw CoreMLModelError.missingOutput(io.ringOutputName)
+        try embeddings.fill(tokens: tokens, tokenEmbed: step.tokenEmbed, pleRows: step.pleRows)
+        kvState.setPosition(position)
+        kvState.markRing(start: position, count: tokens.count)
+        for (k, model) in models.enumerated() {
+            let result = try model.prediction(
+                from: step.chunkInputs[k], using: kvState.caches, options: step.chunkOptions[k]
+            )
+            guard let produced = result.featureValue(for: Feature.hiddenOut)?.multiArrayValue else {
+                throw CoreMLModelError.missingOutput(Feature.hiddenOut)
+            }
+            // The next chunk's input provider holds the backing, so a
+            // framework-allocated result has to land there.
+            if produced !== step.hidden[k] {
+                kvState.noteIgnoredBacking(Feature.hiddenOut)
+                try PredictionBuffer.copyPrefix(from: produced, to: step.hidden[k], what: Feature.hiddenOut)
+            }
         }
-        guard let logits = result.featureValue(for: io.logitsOutputName)?.multiArrayValue else {
-            throw CoreMLModelError.missingOutput(io.logitsOutputName)
+        return step.hidden[models.count - 1]
+    }
+
+    /// `head` on `step.headInput`, into the cache's next logits backing.
+    private func runHead(_ step: StepScratch, kvState: KVCacheState) throws -> MLMultiArray {
+        let (backing, options) = try kvState.nextLogits(headIO)
+        let result = try head.prediction(from: step.headInputs, options: options)
+        guard let logits = result.featureValue(for: Feature.logits)?.multiArrayValue else {
+            throw CoreMLModelError.missingOutput(Feature.logits)
         }
-        try kvState.adoptRing(ring)
-        if logits !== logitsBacking {
-            kvState.noteIgnoredBacking(io.logitsOutputName)
+        if logits !== backing {
+            kvState.noteIgnoredBacking(Feature.logits)
         }
         return logits
     }
 
     // MARK: - I/O Classification
 
-    /// Read one function's I/O names, shapes, and dtypes, rejecting artifacts
-    /// that predate stateful KV caches.
+    /// Read one phase's chunk signatures, rejecting artifacts that predate
+    /// stateful KV caches or host-side embedding lookups.
     ///
-    /// With every cache declared as state, the signature is small and rigid:
-    /// inputs are the token, the position, the int32 `sliding_pos_ring`, and
-    /// (on exports that keep it) the cache-length `N`; outputs are the
-    /// float logits and the updated ring. Anything named `k_<n>` / `v_<n>` on
-    /// the signature means the caches still cross the boundary.
-    static func classifyIO(model: MLModel, function: String) throws -> FunctionIO {
+    /// Each chunk takes `token_embed` and its `ple_rows` columns (fp16
+    /// `[1, L, …]`), the int32 `position`, the int32 `sliding_pos_ring` if it
+    /// has a sliding layer, and — every chunk but the first — the previous
+    /// chunk's `hidden`; it returns `hidden_out`. Anything named
+    /// `k_<n>` / `v_<n>` on the signature means the caches still cross the
+    /// boundary. Every state a chunk declares must be one `state_<N>` declares,
+    /// since the chunks run on the `MLState` made from it.
+    static func classifyPhase(
+        models: [MLModel], names: [String], stateNames: Set<String>,
+        ringShape: inout [NSNumber]?
+    ) throws -> PhaseIO {
+        var chunks: [ChunkIO] = []
+        var hiddenShape: [NSNumber]?
+        for (k, (model, function)) in zip(models, names).enumerated() {
+            let description = model.modelDescription
+            let inputs = description.inputDescriptionsByName
+            let outputs = description.outputDescriptionsByName
+
+            let cacheIO = (Array(inputs.keys) + Array(outputs.keys)).filter(isCacheName).sorted()
+            let states = Set(description.stateDescriptionsByName.keys)
+            guard cacheIO.isEmpty, !states.isEmpty else {
+                throw CoreMLModelError.modelPredatesCacheStates(function: function, cacheFeatures: cacheIO)
+            }
+            guard states.isSubset(of: stateNames) else {
+                throw CoreMLModelError.unexpectedSignature(
+                    function: function,
+                    detail: "declares states \(states.subtracting(stateNames).sorted()) that the state function does not"
+                )
+            }
+            func fp16(_ name: String, in features: [String: MLFeatureDescription]) -> [NSNumber]? {
+                guard let c = features[name]?.multiArrayConstraint, c.dataType == .float16,
+                      c.shape.count == 3 else { return nil }
+                return c.shape
+            }
+            guard let tokenEmbed = fp16(Feature.tokenEmbed, in: inputs),
+                  let pleRows = fp16(Feature.pleRows, in: inputs) else {
+                throw CoreMLModelError.modelPredatesHostEmbeddings(
+                    function: function, inputs: inputs.keys.sorted()
+                )
+            }
+            guard let out = fp16(Feature.hiddenOut, in: outputs), outputs.count == 1 else {
+                throw CoreMLModelError.unexpectedSignature(
+                    function: function,
+                    detail: "expected the one output `\(Feature.hiddenOut)` (fp16, rank 3), got \(outputs.keys.sorted())"
+                )
+            }
+            let takesHidden = k > 0
+            let hidden = takesHidden ? fp16(Feature.hidden, in: inputs) : tokenEmbed
+            let expected = hiddenShape ?? tokenEmbed
+            guard let hidden, hidden == expected, tokenEmbed == expected, out == expected,
+                  pleRows[1] == expected[1] else {
+                throw CoreMLModelError.unexpectedSignature(
+                    function: function,
+                    detail: "hidden / token_embed / hidden_out / ple_rows shapes disagree (expected \(expected.map(\.intValue)))"
+                )
+            }
+            hiddenShape = expected
+
+            let takesRing = inputs[Feature.ring] != nil
+            if let ring = inputs[Feature.ring]?.multiArrayConstraint {
+                guard ring.dataType == .int32, ringShape == nil || ringShape == ring.shape else {
+                    throw CoreMLModelError.unexpectedSignature(
+                        function: function, detail: "`\(Feature.ring)` is not the int32 ring the other chunks take"
+                    )
+                }
+                ringShape = ring.shape
+            }
+            let known = [Feature.tokenEmbed, Feature.pleRows, Feature.position]
+                + (takesHidden ? [Feature.hidden] : []) + (takesRing ? [Feature.ring] : [])
+            guard Set(inputs.keys) == Set(known),
+                  inputs[Feature.position]?.multiArrayConstraint?.dataType == .int32 else {
+                throw CoreMLModelError.unexpectedSignature(
+                    function: function,
+                    detail: "expected inputs \(known.sorted()) with an int32 `\(Feature.position)`, got \(inputs.keys.sorted())"
+                )
+            }
+            chunks.append(ChunkIO(takesHidden: takesHidden, takesRing: takesRing, pleRowsShape: pleRows))
+        }
+        guard let hiddenShape, !chunks.isEmpty else {
+            throw CoreMLModelError.unexpectedSignature(function: names.first ?? "?", detail: "no layer chunks")
+        }
+        return PhaseIO(chunks: chunks, hiddenShape: hiddenShape)
+    }
+
+    /// `head`: fp16 `hidden` `[1, 1, D]` in, float `logits` out.
+    static func classifyHead(model: MLModel) throws -> HeadIO {
         let description = model.modelDescription
-        let stateNames = description.stateDescriptionsByName.keys.sorted()
-        let inputs = description.inputDescriptionsByName
-        let outputs = description.outputDescriptionsByName
-
-        let cacheIO = (Array(inputs.keys) + Array(outputs.keys)).filter(isCacheName).sorted()
-        guard cacheIO.isEmpty, !stateNames.isEmpty else {
-            throw CoreMLModelError.modelPredatesCacheStates(
-                function: function, cacheFeatures: cacheIO
-            )
-        }
-
-        // Outputs: one float tensor (logits) and one int32 tensor (the ring).
-        var logitsName: String?
-        var ringOutputName: String?
-        for (name, desc) in outputs {
-            guard let c = desc.multiArrayConstraint else { continue }
-            if c.dataType == .int32 { ringOutputName = name } else { logitsName = name }
-        }
-        guard let logitsName, let logitsConstraint = outputs[logitsName]?.multiArrayConstraint else {
+        guard let input = description.inputDescriptionsByName[Feature.hidden]?.multiArrayConstraint,
+              input.dataType == .float16, input.shape.count == 3, input.shape[1] == 1,
+              description.inputDescriptionsByName.count == 1,
+              let logits = description.outputDescriptionsByName[Feature.logits]?.multiArrayConstraint
+        else {
             throw CoreMLModelError.unexpectedSignature(
-                function: function, detail: "no float logits output among \(outputs.keys.sorted())"
+                function: headFunctionName,
+                detail: "expected fp16 `\(Feature.hidden)` [1, 1, D] → `\(Feature.logits)`"
             )
         }
-        guard let ringOutputName else {
-            throw CoreMLModelError.unexpectedSignature(
-                function: function, detail: "no int32 ring output among \(outputs.keys.sorted())"
-            )
-        }
+        return HeadIO(inputShape: input.shape, logitsShape: logits.shape, logitsDataType: logits.dataType)
+    }
 
-        // The ring input is the same feature one step earlier, so the exporter
-        // names it either identically or with the `_out` suffix stripped.
-        var ringCandidates = [ringOutputName]
-        if ringOutputName.hasSuffix("_out") {
-            ringCandidates.append(String(ringOutputName.dropLast("_out".count)))
-        }
-        let ringInputName = ringCandidates.first { inputs[$0] != nil }
-        guard let ringInputName, let ringConstraint = inputs[ringInputName]?.multiArrayConstraint else {
+    /// The embedding inputs' widths must be the shipped tables' widths: the
+    /// token table for `token_embed`, and the per-layer table split across the
+    /// chunks' `ple_rows`, in order.
+    private static func checkEmbeddingShapes(_ io: PhaseIO, against embeddings: HostEmbeddings) throws {
+        let tokenWidth = io.hiddenShape[2].intValue
+        let pleWidth = io.chunks.map { $0.pleRowsShape[2].intValue }.reduce(0, +)
+        guard tokenWidth == embeddings.token.cols, pleWidth == embeddings.perLayer.cols else {
             throw CoreMLModelError.unexpectedSignature(
-                function: function,
-                detail: "no input matching ring output '\(ringOutputName)' among \(inputs.keys.sorted())"
+                function: "layer chunks",
+                detail: "embedding inputs are \(tokenWidth) / \(pleWidth) wide in total, but the Embeddings/ tables have \(embeddings.token.cols) / \(embeddings.perLayer.cols) columns"
             )
         }
-
-        // Token and position are all that is left: the caches are state, and
-        // `concretize_cache_length` folds each function's own cache length into
-        // the graph, so nothing else crosses the boundary.
-        let control = inputs.keys.filter { $0 != ringInputName }.sorted()
-        guard control.count == 2 else {
-            throw CoreMLModelError.unexpectedSignature(
-                function: function,
-                detail: "expected token + position inputs, got \(control)"
-            )
-        }
-        let (tokenName, positionName) = identifyTokenAndPosition(control, inputs: inputs)
-        let tokenLength = inputs[tokenName]?.multiArrayConstraint?.shape
-            .map { $0.intValue }.reduce(1, *) ?? 1
-
-        return FunctionIO(
-            logitsOutputName: logitsName,
-            logitsShape: logitsConstraint.shape,
-            logitsDataType: logitsConstraint.dataType,
-            tokenInputName: tokenName,
-            tokenLength: tokenLength,
-            positionInputName: positionName,
-            ringInputName: ringInputName,
-            ringOutputName: ringOutputName,
-            ringShape: ringConstraint.shape,
-            ringDataType: ringConstraint.dataType,
-            stateNames: stateNames
-        )
     }
 
     /// `k_<n>` / `v_<n>`: a KV cache tensor on the function signature.
@@ -1224,29 +1301,54 @@ public final class CoreMLModel: @unchecked Sendable {
         let rest = String(chars.dropFirst(digits.count))
         return rest.isEmpty || rest == "_out"
     }
+}
 
-    /// Tell the token input from the position input. Prefill's token input is
-    /// `[1, chunk]` so element count settles it; decode's are both `[1]`, where
-    /// the name does.
-    private static func identifyTokenAndPosition(
-        _ names: [String], inputs: [String: MLFeatureDescription]
-    ) -> (token: String, position: String) {
-        func count(_ name: String) -> Int {
-            inputs[name]?.multiArrayConstraint?.shape.map { $0.intValue }.reduce(1, *) ?? 1
-        }
-        let (a, b) = (names[0], names[1])
-        if count(a) != count(b) {
-            return count(a) > count(b) ? (a, b) : (b, a)
-        }
-        if a.contains("token") { return (a, b) }
-        if b.contains("token") { return (b, a) }
-        return (a, b)
+// MARK: - Serial functions
+
+/// One loaded function, predicting one call at a time.
+///
+/// Core ML's synchronous `prediction` is not safe to call concurrently on one
+/// `MLModel`, and every conversation shares the loaded functions (see
+/// ``CoreMLModel``). The lock is uncontended in a single conversation — tens
+/// of nanoseconds against milliseconds of prediction — and when two callers do
+/// meet on a function, the second waits for the first's step to finish, which
+/// is all the hardware underneath could offer it anyway.
+final class SerialFunction: @unchecked Sendable {
+    /// For reading the description only; predict through the methods below.
+    let model: MLModel
+    private let lock = NSLock()
+
+    init(_ model: MLModel) {
+        self.model = model
+    }
+
+    func prediction(
+        from input: MLFeatureProvider, using state: MLState, options: MLPredictionOptions
+    ) throws -> MLFeatureProvider {
+        lock.lock()
+        defer { lock.unlock() }
+        return try model.prediction(from: input, using: state, options: options)
+    }
+
+    func prediction(
+        from input: MLFeatureProvider, options: MLPredictionOptions
+    ) throws -> MLFeatureProvider {
+        lock.lock()
+        defer { lock.unlock() }
+        return try model.prediction(from: input, options: options)
+    }
+
+    func makeState() -> MLState {
+        lock.lock()
+        defer { lock.unlock() }
+        return model.makeState()
     }
 }
 
 // MARK: - Input Provider
 
-/// Minimal `MLFeatureProvider` over a name → array dictionary.
+/// Minimal `MLFeatureProvider` over a name → array dictionary. The arrays are
+/// wrapped once; refilling them in place feeds the next prediction.
 final class CoreMLInputProvider: MLFeatureProvider {
     let featureNames: Set<String>
     private let values: [String: MLFeatureValue]
@@ -1264,16 +1366,24 @@ final class CoreMLInputProvider: MLFeatureProvider {
 // MARK: - Errors
 
 public enum CoreMLModelError: Error, LocalizedError {
-    /// The artifact declares no materialized function pairs at all.
+    /// The artifact declares no materialized function set at all.
     case notMaterialized(String)
+    /// The artifact declares the per-size `decode_<N>` / `prefill_<N>` pairs
+    /// of the exports before the layer chunks.
+    case modelPredatesLayerChunks(String)
     /// The artifact declares materialized functions, but none usable in the
-    /// requested mode (e.g. prefill wanted, only `decode_<N>` exported).
+    /// requested mode (e.g. prefill wanted, only decode chunks exported).
     case noUsableMaterializedFunctions(decodeSizes: [Int], prefillSizes: [Int])
     /// A KV cache still crosses the function signature, i.e. the artifact was
     /// exported before the caches became CoreML state.
     case modelPredatesCacheStates(function: String, cacheFeatures: [String])
+    /// The function takes token ids rather than embedding rows, i.e. the
+    /// artifact was exported before the lookups moved to the host.
+    case modelPredatesHostEmbeddings(function: String, inputs: [String])
     /// The function's inputs/outputs are not the shape this runtime expects.
     case unexpectedSignature(function: String, detail: String)
+    /// `MLModel.load` failed for one function.
+    case functionLoadFailed(function: String, computeUnits: String, underlying: Error)
     /// A declared output was missing from a prediction result.
     case missingOutput(String)
     /// A token position doesn't fit the allocated KV cache.
@@ -1282,13 +1392,22 @@ public enum CoreMLModelError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .notMaterialized(let name):
-            "\(name) declares no `decode_<N>` functions — run `uv run gemma-materialize` on the exported package"
+            "\(name) declares no `decode_c<k>_<N>` / `state_<N>` / `head` functions — export it with `uv run gemma-export`"
+        case .modelPredatesLayerChunks(let name):
+            "\(name) runs each step as one function per size — it predates the layer chunks the runtime now expects. Re-run `uv run gemma-export`."
         case .noUsableMaterializedFunctions(let decodeSizes, let prefillSizes):
-            "No usable materialized function pairs (decode sizes: \(decodeSizes), prefill sizes: \(prefillSizes))"
+            "No usable materialized sizes (decode sizes: \(decodeSizes), prefill sizes: \(prefillSizes))"
         case .modelPredatesCacheStates(let function, let cacheFeatures):
             "Function '\(function)' passes KV caches through its signature (\(cacheFeatures.isEmpty ? "no state features at all" : cacheFeatures.joined(separator: ", "))) — this model predates global-cache states. Re-run `uv run gemma-export`."
+        case .modelPredatesHostEmbeddings(let function, let inputs):
+            "Function '\(function)' takes \(inputs.joined(separator: ", ")) instead of the fp16 `token_embed` / `ple_rows` embedding rows — this model predates host-side embedding lookups. Re-run `uv run gemma-export`."
         case .unexpectedSignature(let function, let detail):
             "Function '\(function)' has an unexpected signature: \(detail)"
+        case .functionLoadFailed(let function, let computeUnits, let underlying):
+            "Could not load '\(function)' (\(computeUnits)): \(underlying.localizedDescription)"
+                + (computeUnits.contains("ANE") || computeUnits == "all"
+                    ? " — with the Neural Engine this usually means the ANE compiler rejected the function (details only in `log show --predicate 'process == \"ANECompilerService\"'`). It rejects cache sizes of 32768 and up: stay at --max-context 16384 or below, or use cpu-and-gpu."
+                    : "")
         case .missingOutput(let name):
             "Prediction result is missing output '\(name)'"
         case .positionOutOfRange(let position, let cacheSize):

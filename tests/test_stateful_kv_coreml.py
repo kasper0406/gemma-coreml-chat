@@ -64,9 +64,11 @@ def _trace_step():
 
     Argument order mirrors the real export: ``[N, pos, sliding, glob]`` — JAX
     prepends a dimension-variable argument for the symbolic global length.
-    Result order is ``[sliding_total, glob_total, sliding_out, glob_out]``; the
-    two sums are how the test observes cache contents once both caches are
-    state and nothing comes back out of the model.
+    Result order is ``[sliding_total, sliding_after, glob_total, glob_after,
+    sliding_out, glob_out]``; the sums are how the test observes cache contents
+    once both caches are state and nothing comes back out of the model.  The
+    ``*_after`` sums read each cache after its write, as the attention does: a
+    write nothing reads is rejected by ``global_kv_caches_to_states``.
     """
     (N,) = jax_export.symbolic_shape("N", constraints=["N >= 1"])
 
@@ -82,8 +84,10 @@ def _trace_step():
         sliding_out = jnp.where(mask, value, sliding)
         glob_out = jax.lax.dynamic_update_slice(glob, value, (0, pos, 0, 0))
         sliding_total = jnp.sum(sliding.astype(jnp.float32)).reshape(1)
+        sliding_after = jnp.sum(sliding_out.astype(jnp.float32)).reshape(1)
         glob_total = jnp.sum(glob.astype(jnp.float32)).reshape(1)
-        return sliding_total, glob_total, sliding_out, glob_out
+        glob_after = jnp.sum(glob_out.astype(jnp.float32)).reshape(1)
+        return sliding_total, sliding_after, glob_total, glob_after, sliding_out, glob_out
 
     traced = jax.jit(step).trace(
         jax.ShapeDtypeStruct((1,), jnp.int32),                 # pos
@@ -109,8 +113,10 @@ def _build_dynamic_package(dest: Path) -> None:
     """Convert + rename + flex-shape + save, mirroring `export.py`."""
     module = _trace_step()
 
-    # arg 2 (`sliding`) becomes state, updated by result 2.
-    states = {2: StateSpec(output=2, name="sliding")}
+    # arg 2 (`sliding`) becomes state, updated by result 3.  The exporter
+    # names every cache `k_<slot>` / `v_<slot>`, the global one's write-back
+    # `k_<slot>_out` — the names `global_kv_caches_to_states` converts.
+    states = {2: StateSpec(output=4, name="k_0")}
     mil = hlo_to_mil(module, minimum_deployment_target=ct.target.iOS18, states=states)
     model = ct.convert(
         mil,
@@ -127,21 +133,22 @@ def _build_dynamic_package(dest: Path) -> None:
     # this stage; only materialization makes its shape concrete enough to be
     # state.
     assert len(spec.description.input) == 3, [i.name for i in spec.description.input]
-    assert len(spec.description.output) == 3, [o.name for o in spec.description.output]
-    assert [s.name for s in spec.description.state] == ["sliding"]
+    assert len(spec.description.output) == 5, [o.name for o in spec.description.output]
+    assert [s.name for s in spec.description.state] == ["k_0"]
 
-    for feat, new in zip(list(spec.description.input), ["N", "pos", "glob"]):
+    for feat, new in zip(list(spec.description.input), ["N", "pos", "k_1"]):
         if feat.name != new:
             rename_feature(spec, feat.name, new, rename_outputs=False)
     for feat, new in zip(
-        list(spec.description.output), ["sliding_total", "glob_total", "glob_out"],
+        list(spec.description.output),
+        ["sliding_total", "sliding_after", "glob_total", "glob_after", "k_1_out"],
     ):
         if feat.name != new:
             rename_feature(spec, feat.name, new, rename_inputs=False)
 
     default_shape = (1, SIZES[0], 1, HEAD_DIM)
     for feat in list(spec.description.input) + list(spec.description.output):
-        if feat.name in ("glob", "glob_out"):
+        if feat.name in ("k_1", "k_1_out"):
             _apply_flexible_dim1(feat, 1, max(SIZES), default_shape)
 
     if dest.exists():
@@ -190,12 +197,14 @@ def test_materialize_makes_every_cache_a_state(materialized_package):
     by_name = {fd.name: fd for fd in spec.description.functions}
     for size in SIZES:
         fd = by_name[f"step_{size}"]
-        assert [s.name for s in fd.state] == ["sliding", "glob"]
+        assert [s.name for s in fd.state] == ["k_0", "k_1"]
         assert [i.name for i in fd.input] == ["pos"]
-        assert [o.name for o in fd.output] == ["sliding_total", "glob_total"]
-        glob = next(s for s in fd.state if s.name == "glob")
+        assert [o.name for o in fd.output] == [
+            "sliding_total", "sliding_after", "glob_total", "glob_after",
+        ]
+        glob = next(s for s in fd.state if s.name == "k_1")
         assert list(glob.type.stateType.arrayType.shape) == [1, size, 1, HEAD_DIM]
-        sliding = next(s for s in fd.state if s.name == "sliding")
+        sliding = next(s for s in fd.state if s.name == "k_0")
         # The sliding cache is size-independent; the global one is not, which is
         # why the runtime cannot reuse one state across sizes any more.
         assert list(sliding.type.stateType.arrayType.shape) == [1, WINDOW, 1, HEAD_DIM]
@@ -287,7 +296,7 @@ def test_state_is_shared_across_prefill_and_decode_of_one_size(merged_package):
     names = {fd.name for fd in spec.description.functions}
     assert names == {f"{p}_{s}" for p in ("prefill", "decode") for s in SIZES}
     for fd in spec.description.functions:
-        assert [s.name for s in fd.state] == ["sliding", "glob"], fd.name
+        assert [s.name for s in fd.state] == ["k_0", "k_1"], fd.name
         assert [i.name for i in fd.input] == ["pos"], fd.name
 
     size = SIZES[0]
@@ -309,3 +318,84 @@ def test_state_is_shared_across_prefill_and_decode_of_one_size(merged_package):
     assert r["glob_total"][0] == pytest.approx(HEAD_DIM * 1)
     r = _predict(prefill, state, pos=2, size=size)
     assert r["glob_total"][0] == pytest.approx(HEAD_DIM * (1 + 2))
+
+
+# ── The chunked layout: a read-only reader and a size-independent head ──────
+
+
+def _build_reader_and_head(dest_dir: Path) -> tuple[Path, Path]:
+    """A function that only *reads* the global cache (as the KV-shared layer
+    chunks read layer 14's), and a head with no cache at all."""
+    (N,) = jax_export.symbolic_shape("N", constraints=["N >= 1"])
+
+    def read(glob):
+        return (jnp.sum(glob.astype(jnp.float32)) * 10).reshape(1)
+
+    module = jax.jit(read).trace(
+        jax.ShapeDtypeStruct((1, N, 1, HEAD_DIM), jnp.float16),
+    ).lower().compiler_ir("stablehlo")
+    reader = ct.convert(
+        hlo_to_mil(module, minimum_deployment_target=ct.target.iOS18),
+        source="milinternal", minimum_deployment_target=ct.target.iOS18,
+        compute_precision=ct.precision.FLOAT32, skip_model_load=True,
+    )
+    spec = reader._spec
+    for feat, new in zip(list(spec.description.input), ["N", "k_1"]):
+        rename_feature(spec, feat.name, new, rename_outputs=False)
+    rename_feature(spec, spec.description.output[0].name, "total", rename_inputs=False)
+    for feat in spec.description.input:
+        if feat.name == "k_1":
+            _apply_flexible_dim1(feat, 1, max(SIZES), (1, SIZES[0], 1, HEAD_DIM))
+    reader_path = dest_dir / "reader.mlpackage"
+    reader.save(str(reader_path))
+
+    head_module = jax.jit(lambda x: x * 2).trace(
+        jax.ShapeDtypeStruct((1, 4), jnp.float16),
+    ).lower().compiler_ir("stablehlo")
+    head = ct.convert(
+        hlo_to_mil(head_module, minimum_deployment_target=ct.target.iOS18),
+        source="milinternal", minimum_deployment_target=ct.target.iOS18,
+        compute_precision=ct.precision.FLOAT32, skip_model_load=True,
+    )
+    head_path = dest_dir / "head.mlpackage"
+    head.save(str(head_path))
+    return reader_path, head_path
+
+
+def test_read_only_reader_shares_the_state_and_the_head_is_kept_once(dynamic_package: Path):
+    from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
+    from gemma_chat.materialize import materialize_mlpackage
+
+    reader, head = _build_reader_and_head(dynamic_package.parent)
+    desc = MultiFunctionDescriptor()
+    desc.add_function(str(dynamic_package), src_function_name="main", target_function_name="decode")
+    desc.add_function(str(reader), src_function_name="main", target_function_name="reader")
+    desc.add_function(str(head), src_function_name="main", target_function_name="head")
+    desc.default_function_name = "decode"
+    combined = dynamic_package.parent / "chunked.mlpackage"
+    save_multifunction(desc, str(combined))
+    out = dynamic_package.parent / "chunked-mat.mlpackage"
+    materialize_mlpackage(combined, out, list(SIZES))
+
+    spec = ct.models.MLModel(str(out), skip_model_load=True)._spec
+    by_name = {fd.name: fd for fd in spec.description.functions}
+    assert set(by_name) == {f"{f}_{s}" for f in ("decode", "reader") for s in SIZES} | {"head"}
+    assert spec.description.defaultFunctionName == f"decode_{SIZES[0]}"
+    for size in SIZES:
+        fd = by_name[f"reader_{size}"]
+        assert [s.name for s in fd.state] == ["k_1"]
+        assert [i.name for i in fd.input] == []
+    # Size-independent, so carried over once and untouched.
+    assert len(by_name["head"].input) == 1 and not by_name["head"].state
+
+    size = SIZES[0]
+    load = lambda fn: ct.models.MLModel(
+        str(out), function_name=fn, compute_units=ct.ComputeUnit.CPU_ONLY,
+    )
+    decode, reader_fn = load(f"decode_{size}"), load(f"reader_{size}")
+    state = decode.make_state()
+    for pos in range(3):
+        _predict(decode, state, pos=pos, size=size)
+    # The reader sees what decode wrote into the shared global cache.
+    total = reader_fn.predict({}, state=state)["total"][0]
+    assert total == pytest.approx(10 * HEAD_DIM * (1 + 2 + 3))

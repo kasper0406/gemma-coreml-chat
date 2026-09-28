@@ -64,7 +64,7 @@ final class ChatViewModel {
         // the next turn just re-prefills.
         Task { await eagerPrefill?.reset() }
         genContext.reset()
-        // TODO: also evict cached `MLModel` function pairs, which dwarf the KV
+        // TODO: also evict cached `MLModel` functions, which dwarf the KV
         // caches. Not done here because `CoreMLModel.getFunction` is a
         // synchronous `fatalError`-on-miss lookup: evicting while the detached
         // generate task is between `ensureLoaded` and `decode` crashes the app.
@@ -72,12 +72,12 @@ final class ChatViewModel {
         // eviction barrier that waits for in-flight predictions) first.
     }
 
-    /// Largest materialized function pair to keep resident on device.
+    /// Largest materialized size to keep resident on device.
     ///
-    /// Every retained size is a separate `MLModel`; `CoreMLModel.load`'s own
-    /// docs note that loading all 16 exported pairs OOMs on iPhone. A chat turn
-    /// plus `maxNewTokens` fits comfortably inside 2048 tokens, and the engine
-    /// truncates the prompt to `effectiveMaxSeqLen` if a conversation runs long.
+    /// Every retained size is a separate set of `MLModel`s; loading every
+    /// exported size OOMs on iPhone. A chat turn
+    /// plus `maxNewTokens` fits comfortably inside 2048 tokens, and a longer
+    /// conversation drops its oldest turns to keep `maxNewTokens` free.
     private static let deviceMaxContextSize = 2048
 
     /// Whether to skip prefill functions entirely and prefill via per-token
@@ -102,7 +102,7 @@ final class ChatViewModel {
             tokenizer = tok
 
             guard let modelURL = Bundle.main.url(forResource: "gemma4-e2b", withExtension: "mlpackage") else {
-                throw CoreMLModelError.modelNotFound
+                throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: "gemma4-e2b.mlpackage"])
             }
 
             #if targetEnvironment(simulator)
@@ -142,7 +142,8 @@ final class ChatViewModel {
             eagerPrefill = EagerPrefillManager(
                 engine: eng,
                 tokenizer: tok,
-                model: coreml
+                model: coreml,
+                promptBudget: eng.promptBudget(reservingForReply: maxNewTokens)
             )
 
             // Listen for memory warnings (view model lives for app lifetime)
@@ -215,6 +216,9 @@ final class ChatViewModel {
         generateTask = Task { [weak self] in
             guard let self else { return }
 
+            var genIDs: [Int32] = []
+            var textStream = TextStream(tokenizer: tokenizer)
+            var failure: Error?
             do {
                 // Get prefill state (finishes any pending eager prefill)
                 let history = messages.filter { $0.role != .system }
@@ -235,19 +239,26 @@ final class ChatViewModel {
                     context: genContext
                 )
 
-                var genIDs: [Int32] = []
                 for try await tokenID in stream {
                     if Task.isCancelled { break }
 
                     if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
                     genIDs.append(tokenID)
-
-                    // O(1) per token: decode only the new token for streaming.
-                    // Full-sequence decode at finalization ensures accuracy.
-                    streamingText += tokenizer.decode([Int(tokenID)])
+                    streamingText += textStream.push(tokenID)
                     generatedTokenCount = genIDs.count
                 }
+            } catch {
+                failure = error
+            }
+            // However generation ended, show what the stream still held.
+            streamingText += textStream.finish()
 
+            if let failure {
+                messages.append(ChatMessage(
+                    role: .system,
+                    content: "Error: \(failure.localizedDescription)"
+                ))
+            } else {
                 // Finalize
                 let reply = tokenizer.decode(genIDs.map { Int($0) })
                 messages.append(ChatMessage(role: .assistant, content: reply))
@@ -255,12 +266,6 @@ final class ChatViewModel {
 
                 // Seed eager prefill with post-generation KV state for next turn
                 await eagerPrefill.seedFromGeneration(genContext)
-
-            } catch {
-                messages.append(ChatMessage(
-                    role: .system,
-                    content: "Error: \(error.localizedDescription)"
-                ))
             }
 
             isGenerating = false

@@ -13,7 +13,7 @@ any more and the mask folds to a constant.
 
 Concrete shapes would also let ``fuse_attention_to_sdpa`` — which bails on
 symbolic dimensions — finally fuse these global sites.  That fusion is
-deliberately *not* re-run (two Apple defects; see
+deliberately *not* re-run (Apple defects; see
 ``materialize._concretize_cache_lengths``), so the site must come out of the
 pass still decomposed as ``matmul → select → softmax → matmul``.  That is
 asserted here, because re-adding the fusion is a one-line change and this test
@@ -203,7 +203,7 @@ def test_the_global_attention_stays_decomposed(concretized):
 
     If someone re-adds ``common::fuse_attention_to_sdpa`` to
     ``_concretize_cache_lengths``, this is the test that fails, and the comment
-    at that call site says which two Apple defects have to be fixed first.
+    at that call site says which Apple defects have to be fixed first.
     """
     counts = _op_types(concretized)
     assert counts["scaled_dot_product_attention"] == 0

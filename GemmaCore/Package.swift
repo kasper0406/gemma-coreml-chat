@@ -17,5 +17,10 @@ let package = Package(
                 .product(name: "Transformers", package: "swift-transformers"),
             ]
         ),
+        .testTarget(
+            name: "GemmaCoreTests",
+            dependencies: ["GemmaCore"],
+            resources: [.copy("Fixtures"), .copy("TinyModel.mlpackage")]
+        ),
     ]
 )

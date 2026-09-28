@@ -21,14 +21,18 @@ private let flagsWithValue: Set<String> = [
     "--model", "--compute-units", "--log-file", "--max-context",
 ]
 
-/// Default cap on retained materialized function pairs.
+/// Default cap on retained materialized sizes.
 ///
-/// A materialized export ships a pair per size up to `GemmaConfig.maxSeqLen`,
-/// and each retained pair is a separate resident `MLModel`. Keeping all of them
+/// A materialized export ships a function set per size up to
+/// `GemmaConfig.maxSeqLen`, each function a separate resident `MLModel`. Keeping all of them
 /// swap-thrashes a 16 GB Mac, and an interactive chat session's context is
 /// bounded well below the export's ceiling anyway. Raise it with
 /// `--max-context` when you actually need a longer conversation.
 private let defaultMaxContext = 8192
+
+/// Longest reply, in tokens; a conversation keeps this much of the context
+/// (at most half of it) free by dropping its oldest turns.
+private let maxReplyTokens = 1024
 
 @main
 struct GemmaChatCLI {
@@ -73,7 +77,7 @@ struct GemmaChatCLI {
 
         // --- First-run warm-up ---
         // If the ANE / E5RT cache has never been populated for this model +
-        // compute units, compile all function pairs up front rather than
+        // compute units, compile all functions up front rather than
         // stalling mid-chat when the user crosses a context-size boundary.
         if !model.isWarmed {
             print("First launch: compiling all functions for this device (this may take a few minutes)...")
@@ -145,8 +149,11 @@ struct GemmaChatCLI {
             // Add user message
             history.append(ChatMessage(role: .user, content: input))
 
-            // Encode conversation
-            let promptIDs = tokenizer.encodeChatPrompt(history: history).map { Int32($0) }
+            // Encode the conversation, dropping its oldest turns if it would
+            // leave too little of the context for the reply.
+            let promptIDs = tokenizer.encodeChatPrompt(
+                history: history, budget: engine.promptBudget(reservingForReply: maxReplyTokens)
+            ).map { Int32($0) }
 
             // Check if we can reuse KV cache from the previous turn
             let (existingKV, prefillOffset) = resolveKVReuse(
@@ -158,32 +165,34 @@ struct GemmaChatCLI {
             fflush(stdout)
 
             var responseTokens: [Int32] = []
+            var textStream = TextStream(tokenizer: tokenizer)
             let genStart = CFAbsoluteTimeGetCurrent()
             let stream = engine.generate(
                 promptIDs: promptIDs,
-                maxNewTokens: 1024,
+                maxNewTokens: maxReplyTokens,
                 existingKVState: existingKV,
                 prefillOffset: prefillOffset,
                 context: genContext
             )
 
+            var failure: Error?
             do {
                 for try await tokenID in stream {
                     if GemmaConfig.stopTokenIDs.contains(tokenID) { break }
                     responseTokens.append(tokenID)
-                    let text = tokenizer.decode(responseTokens.map { Int($0) })
-                    // Print incremental text by computing delta
-                    let prevText = responseTokens.count > 1
-                        ? tokenizer.decode(responseTokens.dropLast().map { Int($0) })
-                        : ""
-                    let delta = String(text.dropFirst(prevText.count))
+                    let delta = textStream.push(tokenID)
                     if !delta.isEmpty {
                         print(delta, terminator: "")
                         fflush(stdout)
                     }
                 }
             } catch {
-                print("\n[error] \(error.localizedDescription)\n")
+                failure = error
+            }
+            // However generation ended, print what the stream still held.
+            print(textStream.finish(), terminator: "")
+            if let failure {
+                print("\n[error] \(failure.localizedDescription)\n")
                 continue
             }
 

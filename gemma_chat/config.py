@@ -14,6 +14,17 @@ MAX_SEQ_LEN = 65536
 # the cache); `gemma-export` enforces that on --materialize-sizes.
 CHUNK_SIZE = 128
 
+# First layer of each layer chunk: every prefill / decode step runs as one
+# function per chunk (``decode_coreml.layer_chunks``), then the logit head.
+# The Neural Engine compiles no function past a size limit, so the chunks must
+# stay under it at every exported size.  Measured on an M4 Pro (macOS 27): with
+# the head in a function of its own, all 35 layers fit in one function for
+# prefill and decode at every size up to 16384, and each extra chunk costs
+# ~0.7 ms per GPU decode step while saving nothing on the ANE — so one chunk.
+# (0, 18) is the measured-eligible two-chunk layout for a device with a lower
+# limit.  See README ("Layer chunks").
+LAYER_CHUNK_STARTS = (0,)
+
 # Full Gemma4-E2B architecture (35 layers: 7 × [SLIDING×4, GLOBAL])
 _ATTENTION_PATTERN = (
     AttentionType.LOCAL_SLIDING,

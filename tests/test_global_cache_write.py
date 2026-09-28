@@ -148,9 +148,13 @@ def decode_write(cache, value, position):
     return _entry_sum(cache), _row_write(cache, value, position[0])
 
 
-def prefill_write(cache, value, start_position):
+def prefill_write(k_0, value, start_position):
+    """``k_0`` is named like an exported cache, which is what
+    ``global_kv_caches_to_states`` converts; the second sum reads the updated
+    cache after the write, as the attention does, so the write is not a sink."""
     slots = start_position[0] + jnp.arange(CHUNK, dtype=jnp.int32)
-    return _entry_sum(cache), _chunk_write(cache, value, slots)
+    updated = _chunk_write(k_0, value, slots)
+    return _entry_sum(k_0), _entry_sum(updated), updated
 
 
 def slice_update_write(cache, value, position):
@@ -194,9 +198,10 @@ def state_model():
     prog = _convert(prefill_write, *_prefill_args())
     func = prog.functions["main"]
     # The exporter renames the traced results; ``global_kv_caches_to_states``
-    # pairs an input ``X`` with an output ``X_out``.
+    # pairs a cache input ``k_<slot>`` with an output ``k_<slot>_out``.
     func.outputs[0].set_name("entry")
-    func.outputs[1].set_name("cache_out")
+    func.outputs[1].set_name("after")
+    func.outputs[2].set_name("k_0_out")
     global_kv_caches_to_states().apply(prog)
     return ct.convert(
         prog,
