@@ -11,16 +11,18 @@ Method (see benchmarks/README.md for the why):
   with the exact phase window (:mod:`benchmarks.power`).  Idle power is the
   mean of the two idle windows; above-idle energy subtracts it over the
   phase's duration.
-* **Background CPU** — once, after priming: an idle-baseline calibration
-  (:func:`calibrate`) of the CPU use of every process outside the harness's
-  own tree, with the display/session state it was taken in.  Before every
-  run the gate (:func:`quiet_gate`) wants AC power, no Low Power Mode, the
-  same display/session state and quiet samples, and pauses and retries
-  otherwise (giving the run up after :data:`GATE_TIMEOUT_S`); during every
-  run a monitor keeps sampling, and a run whose measured span saw a spike,
-  a drifted mean or an unsampled stretch, or one of whose windows drifted on
-  its own, is not kept.  Nothing is exempt;
-  busy processes are logged.
+* **Quiet machine** — once, after priming: an idle-baseline calibration
+  (:func:`calibrate`) of the CPU use of every process but the harness (this
+  process, its descendants and its parent), in a machine state — AC power,
+  no Low Power Mode, display/session (:func:`machine_state`) — that must
+  hold throughout it.  Before every run the gate (:func:`quiet_gate`) wants
+  that state and quiet samples, and pauses and retries otherwise (giving
+  the run up after :data:`GATE_TIMEOUT_S`).  During every run a monitor
+  polls the state and samples the CPU from launch to exit; a run is not
+  kept if the state changed at any poll, or if its measured span saw a
+  spike, a drifted mean or an unsampled stretch, or one of its windows
+  drifted on its own (:func:`judge_run`; load and warm-up are exempt from
+  the CPU check only).  No other process is exempt; busy ones are logged.
 * **Anchor** — a run whose power samples have contradictory stamps, a
   malformed document, or an anchor wider than :data:`ANCHOR_MAX_FRACTION`
   of its shortest window is not kept.
@@ -52,7 +54,7 @@ from benchmarks.power import RAILS, PowerMonitor
 # Path to the Swift bench package under the repo.
 _SWIFT_BENCH_PKG = Path(__file__).resolve().parent / "swift" / "bench"
 
-# Background CPU (the processes outside the harness, in percent of one core,
+# Background CPU (every process but the harness, in percent of one core,
 # from one-second ``top`` samples) is judged against an idle baseline measured
 # once per invocation: CALIBRATION_SAMPLES samples give its median m and robust
 # spread σ = 1.4826·MAD, floored at SIGMA_FLOOR so a perfectly steady baseline
@@ -149,32 +151,36 @@ class RunRecord:
 # ── Machine state ───────────────────────────────────────────────────────────
 
 
-def power_source() -> dict:
-    """``{"source": "AC Power" | "Battery Power" | ..., "low_power_mode": bool}``."""
-    batt = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
-    m = re.search(r"drawing from '([^']+)'", batt)
-    settings = subprocess.run(["pmset", "-g"], capture_output=True, text=True).stdout
-    lpm = re.search(r"lowpowermode\s+(\d)", settings)
-    return {
-        "source": m.group(1) if m else "unknown",
-        "low_power_mode": bool(lpm and lpm.group(1) == "1"),
-        "battery": batt.strip().splitlines()[-1].strip() if batt.strip() else "",
-    }
+def machine_state() -> dict:
+    """Power source, Low Power Mode, display power and console session — what
+    every run must share with the calibration (battery and Low Power Mode
+    change clocks; a lit display keeps WindowServer drawing).  ``None`` where
+    a value could not be read, which never matches a calibrated state."""
+    def run(*cmd: str) -> str:
+        return subprocess.run(cmd, capture_output=True, text=True).stdout
 
-
-def session_state() -> dict:
-    """Display power and console session, which change background load (a lit
-    display keeps WindowServer drawing).  Every run must see what the
-    calibration saw; ``None`` where the state could not be read."""
-    fb = subprocess.run(["ioreg", "-r", "-d1", "-w0", "-c", "IOMobileFramebufferShim"],
-                        capture_output=True, text=True).stdout
+    source = re.search(r"drawing from '([^']+)'", run("pmset", "-g", "batt"))
+    lpm = re.search(r"lowpowermode\s+(\d)", run("pmset", "-g"))
+    fb = run("ioreg", "-r", "-d1", "-w0", "-c", "IOMobileFramebufferShim")
     states = [int(v) for v in re.findall(r'"CurrentPowerState"=(\d+)', fb)]
-    users = subprocess.run(["ioreg", "-n", "Root", "-d1", "-w0"],
-                           capture_output=True, text=True).stdout
+    users = run("ioreg", "-n", "Root", "-d1", "-w0")
     return {
+        "power": source.group(1) if source else None,
+        "low_power_mode": bool(lpm and lpm.group(1) == "1"),
         "display_on": any(states) if states else None,
         "screen_locked": "CGSSessionScreenIsLocked" in users if "IOConsoleUsers" in users else None,
     }
+
+
+def judge_state(states: list[dict], expected: dict) -> list[str]:
+    """Reasons the machine did not stay in ``expected`` (empty if every poll
+    in ``states`` matches it)."""
+    if not states:
+        return ["no machine-state polls"]
+    changed = [s for s in states if s != expected]
+    if not changed:
+        return []
+    return [f"machine state {changed[0]} ≠ {expected} in {len(changed)} of {len(states)} poll(s)"]
 
 
 def parse_top(out: str) -> list[tuple[int, float, str]]:
@@ -217,9 +223,9 @@ def _process_tree(root: int) -> set[int]:
 
 
 def background_cpu() -> dict:
-    """One one-second sample of every process outside the harness's own tree
-    (this process, its parent, and their children: the bench binary,
-    ``powermetrics``, ``top`` itself).  Fails closed: a ``top`` or ``ps``
+    """One one-second sample of every process except the harness: this
+    process, its descendants (the bench binary, ``powermetrics``, ``top``
+    itself) and its parent process (not the parent's other children).  Fails closed: a ``top`` or ``ps``
     failure or unparseable output raises ``RuntimeError``."""
     own = _process_tree(os.getpid()) | {os.getppid()}
     proc = subprocess.Popen(
@@ -317,7 +323,13 @@ def judge_run(samples: list[dict], span: dict[str, tuple[float, float]],
     """Reasons a run's background was not quiet: :func:`judge_window` over
     its whole measured span (``idle_pre`` start to ``idle_post`` end), and
     drift in each measured window on its own — a phase can drift while the
-    whole run's average does not."""
+    whole run's average does not.
+
+    Load and warm-up, before ``idle_pre``, are not judged here (their machine
+    state is): nothing is measured there, and the CoreML/ANE daemons that
+    load and compile for the bench (``aned``, ``ANECompilerService``, …) are
+    outside the harness, so their CPU there is the workload's, not
+    background.  Whatever the load leaves running shows up in ``idle_pre``."""
     reasons = judge_window(samples, span["idle_pre"][0], span["idle_post"][1], limits)
     for w in WINDOWS:
         inside = _overlapping(samples, *span[w])
@@ -327,20 +339,27 @@ def judge_run(samples: list[dict], span: dict[str, tuple[float, float]],
 
 
 def calibrate() -> dict:
-    """Measure the idle background: the state it was taken in and the
-    distribution of :data:`CALIBRATION_SAMPLES` one-second samples.  A
-    calibration whose state changed or whose baseline is unsteady
-    (:func:`cpu_limits`) is retaken, for up to :data:`GATE_TIMEOUT_S`."""
+    """Measure the idle background: the machine state it was taken in (AC
+    power, no Low Power Mode, polled with every sample and unchanged
+    throughout) and the distribution of :data:`CALIBRATION_SAMPLES`
+    one-second samples.  A calibration that fails either, or whose baseline
+    is unsteady (:func:`cpu_limits`), is retaken, for up to
+    :data:`GATE_TIMEOUT_S`."""
     deadline = time.monotonic() + GATE_TIMEOUT_S
     while True:
-        state = session_state()
+        state = machine_state()
         print(f"Calibrating the idle background ({CALIBRATION_SAMPLES} × 1 s, {state}) …",
               flush=True)
-        samples = [background_cpu() for _ in range(CALIBRATION_SAMPLES)]
+        samples, states = [], []
+        for _ in range(CALIBRATION_SAMPLES):
+            samples.append(background_cpu())
+            states.append(machine_state())
         totals = [s["total"] for s in samples]
         try:
-            if session_state() != state:
-                raise ValueError(f"display/session state changed ({state} → {session_state()})")
+            if state["power"] != "AC Power" or state["low_power_mode"]:
+                raise ValueError("needs AC power and Low Power Mode off")
+            if changed := judge_state(states, state):
+                raise ValueError(changed[0])
             limits = cpu_limits(totals)
             break
         except ValueError as e:
@@ -362,22 +381,15 @@ def calibrate() -> dict:
 
 
 def quiet_gate(calibration: dict) -> dict:
-    """Wait until the machine is as it was calibrated: AC power, no Low Power
-    Mode, the same display/session state, and :data:`GATE_SAMPLES` background
-    samples within the limits.  The record says what was seen."""
+    """Wait until the machine is as it was calibrated: the same machine state
+    (AC power, no Low Power Mode, display/session) and :data:`GATE_SAMPLES`
+    background samples within the limits.  The record says what was seen."""
     deadline = time.monotonic() + GATE_TIMEOUT_S
     attempts = 0
     while True:
         attempts += 1
-        ps = power_source()
-        state = session_state()
-        reasons = []
-        if ps["source"] != "AC Power":
-            reasons.append(f"on {ps['source']}")
-        if ps["low_power_mode"]:
-            reasons.append("Low Power Mode")
-        if state != calibration["state"]:
-            reasons.append(f"display/session {state} ≠ calibrated {calibration['state']}")
+        state = machine_state()
+        reasons = judge_state([state], calibration["state"])
         try:
             samples = [background_cpu() for _ in range(GATE_SAMPLES)]
             reasons += judge_cpu(samples, calibration["limits"])
@@ -385,8 +397,8 @@ def quiet_gate(calibration: dict) -> dict:
             samples = []
             reasons.append(str(e))
         record = {
-            "passed": not reasons, "attempts": attempts, "power_source": ps,
-            "session": state, "samples": samples, "reasons": reasons,
+            "passed": not reasons, "attempts": attempts, "state": state,
+            "samples": samples, "reasons": reasons,
         }
         if not reasons or time.monotonic() > deadline:
             return record
@@ -395,12 +407,15 @@ def quiet_gate(calibration: dict) -> dict:
 
 
 class BackgroundMonitor:
-    """Takes :func:`background_cpu` samples back to back on a thread for the
-    length of a run.  A failed sample ends the monitoring and is reported, so
-    the window check then finds the gap: the monitor fails closed."""
+    """For the length of a run — launch, load and warm-up included — polls
+    :func:`machine_state` and takes a :func:`background_cpu` sample, back to
+    back on a thread (a poll every ~2 s), with one last poll after the bench
+    exits.  A failed sample ends the monitoring and is reported, so the
+    window check then finds the gap: the monitor fails closed."""
 
     def __init__(self) -> None:
         self.samples: list[dict] = []
+        self.states: list[dict] = []
         self.error: str | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -408,10 +423,12 @@ class BackgroundMonitor:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
+                self.states.append(machine_state())
                 self.samples.append(background_cpu())
             except (RuntimeError, subprocess.TimeoutExpired) as e:
                 self.error = str(e)
                 return
+        self.states.append(machine_state())
 
     def start(self) -> None:
         self._thread.start()
@@ -510,7 +527,8 @@ def run_one(exe: Path, config: BenchmarkConfig, c: Configuration, repetition: in
         time.sleep(0.3)  # let the sample covering the last window land
         pm.stop()
         monitor.stop()
-    rec.background = {"samples": monitor.samples, "error": monitor.error}
+    rec.background = {"samples": monitor.samples, "states": monitor.states,
+                      "error": monitor.error}
 
     rec.samples_file = str(samples_dir / f"{c.id}-r{repetition}.json")
     samples_dir.mkdir(parents=True, exist_ok=True)
@@ -523,7 +541,10 @@ def run_one(exe: Path, config: BenchmarkConfig, c: Configuration, repetition: in
         b = rec.bench
         span = {w: (b[w]["start_ns"] / 1e9 + offset, b[w]["end_ns"] / 1e9 + offset)
                 for w in WINDOWS}
-        reasons = judge_run(monitor.samples, span, calibration["limits"])
+        # Machine state over the whole process life; background CPU over the
+        # measured windows only (see judge_run for why not load/warm-up).
+        reasons = judge_state(monitor.states, calibration["state"])
+        reasons += judge_run(monitor.samples, span, calibration["limits"])
         if monitor.error:
             reasons.append(f"background monitor failed: {monitor.error}")
         if reasons:
@@ -567,10 +588,9 @@ def run_benchmark(config: BenchmarkConfig, out_dir: Path) -> list[RunRecord]:
     results_path = out_dir / "results.json"
     print(f"Results → {results_path}", flush=True)
 
-    ps = power_source()
-    if ps["source"] != "AC Power" or ps["low_power_mode"]:
-        raise SystemExit(f"refusing to measure: {ps['source']}"
-                         f"{', Low Power Mode' if ps['low_power_mode'] else ''} — "
+    state = machine_state()
+    if state["power"] != "AC Power" or state["low_power_mode"]:
+        raise SystemExit(f"refusing to measure: {state} — "
                          "connect AC power and turn Low Power Mode off")
 
     for c in configs:

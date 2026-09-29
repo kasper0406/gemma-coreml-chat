@@ -61,26 +61,41 @@ Idle power is the mean of the two idle windows; *above idle* subtracts it
 over the phase's duration. Reported per token: ms/token, mJ/token (total and
 above idle) and the mean W of each rail.
 
-**Quiet machine** — CPU use of every process outside the harness's own tree
-(one-second `top` samples of all processes; nothing is exempt, busy processes
-are logged). After priming, a calibration takes 60 samples of the idle
-background and records the display/session state (display on, screen locked)
-it saw; its median *m* and robust spread *σ* (1.4826·MAD, at least 1 point of
-a core) set the limits: a sample above *m* + 4σ is a spike, a mean above
-*m* + 2σ is drift. σ only describes a steady baseline, so a calibration whose
-10th–90th percentiles span more than 10 points (or half its median, if
-larger) is refused and retaken (for up to 15 minutes), and the limits are
+**Quiet machine** — the *machine state* (power source, Low Power Mode,
+display on, screen locked) and the *background CPU*: the CPU use of every
+process except the harness — this process, its descendants (the bench
+binary, `powermetrics`, `top`) and its parent process (whatever launched it;
+not the parent's other children) — from one-second `top` samples of all
+processes; nothing else is exempt, and busy processes are logged.
+
+After priming, a calibration takes 60 samples of the idle background, polling
+the machine state with each; it wants AC power and no Low Power Mode, and
+that state unchanged throughout. The samples' median *m* and robust spread
+*σ* (1.4826·MAD, at least 1 point of a core) set the limits: a sample above
+*m* + 4σ is a spike, a mean above *m* + 2σ is drift. σ only describes a
+steady baseline, so a calibration whose 10th–90th percentiles span more than
+10 points (or half its median, if larger) is refused, and the limits are
 capped whatever σ says: drift at the calibration's 90th percentile + 2 and at
 *m* + 10, a spike at *m* + 25. Those caps are the gate's sensitivity: a
-sustained rise of a tenth of a core over the idle median never passes. Before every run the gate wants AC power, no Low Power
-Mode, the calibrated display/session state and three samples within the
-limits; otherwise it pauses 15 s and retries, and gives the run up after 15
-minutes. During every run a monitor keeps sampling: a run whose span from the
-start of `idle_pre` to the end of `idle_post` saw a spike, drift, or more than
-2 s unsampled, or any one of its windows (`idle_pre`, `prefill`, `decode`,
-`idle_post`) drifted on its own, is not kept. A `top` or `ps` failure, or output that does not
-parse, fails the gate or the run. The calibration and every gate record land
-in `results.json`. The runner refuses to start at all on battery.
+sustained rise of a tenth of a core over the idle median never passes. A
+refused calibration is retaken, for up to 15 minutes.
+
+Before every run the gate wants the calibrated machine state and three
+samples within the limits; otherwise it pauses 15 s and retries, and gives
+the run up after 15 minutes. During every run a monitor polls the machine
+state and takes a CPU sample back to back (a poll every ~2 s) from before the
+bench launches until after it exits, load and warm-up included. A run is not
+kept if any poll differs from the calibrated state, or if its span from the
+start of `idle_pre` to the end of `idle_post` saw a spike, drift, or more
+than 2 s unsampled, or any one of its windows (`idle_pre`, `prefill`,
+`decode`, `idle_post`) drifted on its own. Load and warm-up are exempt from
+the CPU check only: nothing is measured there, and the CoreML/ANE daemons
+that load and compile for the bench (`aned`, `ANECompilerService`, …) are
+outside the harness, so their CPU there is the workload's; whatever the load
+leaves running shows up in `idle_pre`. A `top` or `ps` failure, or output
+that does not parse, fails the gate or the run. The calibration and every
+gate record land in `results.json`, and every run's CPU samples and state
+polls with it. The runner refuses to start at all on battery.
 
 **Anchor** — a run is not kept if its power samples' stamps admit no common
 start (a dropped sample or a clock step), a `powermetrics` document was

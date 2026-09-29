@@ -184,7 +184,10 @@ def _bench(t0):
     return out
 
 
-def _fake_run(monkeypatch, tmp_path, samples, background, t0=1000.0, config=None):
+STATE = {"power": "AC Power", "low_power_mode": False, "display_on": False, "screen_locked": True}
+
+
+def _fake_run(monkeypatch, tmp_path, samples, background, t0=1000.0, config=None, states=None):
     class FakePower:
         def __init__(self):
             self.trace = PowerTrace(list(samples))
@@ -196,6 +199,7 @@ def _fake_run(monkeypatch, tmp_path, samples, background, t0=1000.0, config=None
     class FakeMonitor:
         def __init__(self):
             self.samples, self.error = background, None
+            self.states = [STATE] * 12 if states is None else states
 
         def start(self): pass
 
@@ -210,7 +214,8 @@ def _fake_run(monkeypatch, tmp_path, samples, background, t0=1000.0, config=None
     config = config or runner.BenchmarkConfig(models=["/a/m.mlpackage"], compute_units=["cpu-and-ne"],
                                               context_lengths=[512])
     c = config.configurations()[0]
-    return runner.run_one(Path("/bin/true"), config, c, 0, tmp_path, {"limits": LIMITS})
+    return runner.run_one(Path("/bin/true"), config, c, 0, tmp_path,
+                          {"limits": LIMITS, "state": STATE})
 
 
 def _quiet(t0=1000.0):
@@ -245,6 +250,64 @@ def test_background_activity_during_the_run_drops_it(monkeypatch, tmp_path):
     busy[6] = _s(busy[6]["end"], 95, ["mds_stores"])   # inside the decode window
     rec = _fake_run(monkeypatch, tmp_path, samples, busy)
     assert not rec.kept and "spike" in rec.error and "mds_stores" in rec.error
+
+
+@pytest.mark.parametrize("change", [
+    {"power": "Battery Power"}, {"low_power_mode": True}, {"display_on": True},
+    {"screen_locked": False}, {"display_on": None},
+])
+def test_a_machine_state_change_during_the_run_drops_it(monkeypatch, tmp_path, change):
+    states = [STATE] * 5 + [STATE | change] + [STATE] * 5
+    rec = _fake_run(monkeypatch, tmp_path, _tiled(999.7, 117_000_000, 200), _quiet(),
+                    states=states)
+    assert not rec.kept and "machine state" in rec.error and "1 of 11" in rec.error
+    rec = _fake_run(monkeypatch, tmp_path, _tiled(999.7, 117_000_000, 200), _quiet(), states=[])
+    assert not rec.kept and "no machine-state polls" in rec.error
+
+
+def test_the_monitor_polls_the_state_with_every_sample_and_after_the_run(monkeypatch):
+    import time
+    polls = iter(range(10**6))
+    monkeypatch.setattr(runner, "machine_state", lambda: {"poll": next(polls)})
+
+    def sample():
+        time.sleep(0.005)
+        return {"end": time.time(), "total": 1.0, "busy": []}
+
+    monkeypatch.setattr(runner, "background_cpu", sample)
+    m = runner.BackgroundMonitor()
+    m.start()
+    time.sleep(0.05)
+    m.stop()
+    assert m.samples and len(m.states) == len(m.samples) + 1
+
+
+def test_calibration_refuses_a_state_change_or_an_unsteady_baseline(monkeypatch):
+    monkeypatch.setattr(runner, "GATE_TIMEOUT_S", -1)
+    totals = iter([10.0, 50.0] * 30)
+    monkeypatch.setattr(runner, "background_cpu", lambda: _s(1.0, next(totals)))
+    monkeypatch.setattr(runner, "machine_state", lambda: STATE)
+    with pytest.raises(SystemExit, match="unsteady"):
+        runner.calibrate()
+    polls = iter([STATE] * 30 + [STATE | {"display_on": True}] * 31)
+    monkeypatch.setattr(runner, "background_cpu", lambda: _s(1.0, 12.0))
+    monkeypatch.setattr(runner, "machine_state", lambda: next(polls))
+    with pytest.raises(SystemExit, match="machine state"):
+        runner.calibrate()
+    monkeypatch.setattr(runner, "machine_state", lambda: STATE)
+    cal = runner.calibrate()
+    assert cal["state"] == STATE and cal["limits"]["median"] == 12.0
+
+
+def test_the_gate_checks_the_machine_state(monkeypatch):
+    monkeypatch.setattr(runner, "GATE_TIMEOUT_S", -1)
+    monkeypatch.setattr(runner, "background_cpu", lambda: _s(1.0, 45))
+    monkeypatch.setattr(runner, "machine_state", lambda: STATE)
+    cal = {"limits": LIMITS, "state": STATE}
+    assert runner.quiet_gate(cal)["passed"]
+    monkeypatch.setattr(runner, "machine_state", lambda: STATE | {"power": "Battery Power"})
+    gate = runner.quiet_gate(cal)
+    assert not gate["passed"] and "Battery Power" in gate["reasons"][0]
 
 
 def test_same_named_packages_get_distinct_ids_and_sample_files(monkeypatch, tmp_path):
