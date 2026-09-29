@@ -100,6 +100,57 @@ final class CoreMLModelTests: XCTestCase {
     }
 }
 
+/// Decode-only mode (the iOS path below 7 GiB) prefills through `decode`,
+/// one token at a time, and hands the engine the last token's logits.
+final class DecodeOnlyPrefillTests: XCTestCase {
+    private static func load(decodeOnly: Bool) async throws -> CoreMLModel {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "TinyModel", withExtension: "mlpackage"))
+        let model = try await CoreMLModel.load(
+            from: url, computeUnits: .cpuOnly, decodeOnly: decodeOnly, backgroundPreload: false
+        )
+        for size in model.materializedSizes {
+            try await model.ensureLoaded(forGlobalCacheSize: size)
+        }
+        return model
+    }
+
+    private static func floats(_ logits: MLMultiArray) -> [Float] {
+        logits.withUnsafeBufferPointer(ofType: Float16.self) { $0.map(Float.init) }
+    }
+
+    /// The prefill logits are all of head's `(slices, rows)`, equal to those
+    /// of the same decode steps run directly — the fixture's head is two
+    /// slices, so a copy of the first row alone loses half the vocabulary —
+    /// and the engine's first token is their argmax.
+    func testDecodeOnlyPrefillReturnsTheWholeVocabulary() async throws {
+        let decodeOnly = try await Self.load(decodeOnly: true)
+        let full = try await Self.load(decodeOnly: false)
+        XCTAssertTrue(decodeOnly.isDecodeOnly)
+        XCTAssertEqual(decodeOnly.chunkSize, 1)
+        let prompt: [Int32] = [3, 1, 4, 1, 5, 7, 2]
+
+        let engine = InferenceEngine(model: decodeOnly, temperature: 0)
+        let (logits, kv) = try await engine.fullPrefill(ids: prompt)
+
+        let reference = try full.makeEmptyKVState(size: kv.size)
+        var want: MLMultiArray?
+        for (i, token) in prompt.enumerated() {
+            want = try full.decode(token: token, position: Int32(i), kvState: reference)
+        }
+        let expected = try XCTUnwrap(want)
+        XCTAssertEqual(logits.shape, expected.shape)
+        XCTAssertEqual(logits.count, 8)
+        XCTAssertEqual(Self.floats(logits), Self.floats(expected))
+
+        var generated: [Int32] = []
+        for try await id in engine.generate(promptIDs: prompt, maxNewTokens: 3, respectStopTokens: false) {
+            generated.append(id)
+        }
+        XCTAssertEqual(generated.count, 3)
+        XCTAssertEqual(generated.first, Sampling.sampleNextToken(logits: expected, temperature: 0))
+    }
+}
+
 final class SerialFunctionTests: XCTestCase {
     /// Two threads predicting through one `SerialFunction` never overlap:
     /// the input provider below sees how many predictions are reading it at

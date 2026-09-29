@@ -1102,9 +1102,9 @@ public final class CoreMLModel: @unchecked Sendable {
                     token: token, position: startPosition + Int32(i), kvState: kvState
                 )
                 if i == logitsRow {
-                    // Copy: the decode logits live in a backing that a later
-                    // step overwrites.
-                    row = try PredictionBuffer.extractRow(0, from: logits, what: "decode logits")
+                    // Copy all of them, `(slices, rows)` like head's: the decode
+                    // logits live in a backing that a later step overwrites.
+                    row = try PredictionBuffer.copy(logits, what: "decode logits")
                 }
             }
         }

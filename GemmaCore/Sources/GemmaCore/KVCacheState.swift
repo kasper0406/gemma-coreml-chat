@@ -385,26 +385,15 @@ enum PredictionBuffer {
         }
     }
 
-    /// Copy row `row` of a `[rows, width]` array into a fresh tightly-packed
-    /// `[width]` array of the same dtype.
-    static func extractRow(
-        _ row: Int, from array: MLMultiArray, what: String
-    ) throws -> MLMultiArray {
+    /// A fresh tightly-packed copy of `array`, same shape and dtype.
+    static func copy(_ array: MLMultiArray, what: String) throws -> MLMultiArray {
         try requireTightlyPacked(array, what: what)
-        let shape = array.shape.map { $0.intValue }
-        let width = shape.last ?? array.count
-        let rows = array.count / max(width, 1)
-        guard row >= 0, row < rows else {
-            throw KVCacheError.unexpectedBufferLayout(
-                "\(what): row \(row) out of range for shape \(shape)"
-            )
-        }
-        let out = try MLMultiArray(shape: [NSNumber(value: width)], dataType: array.dataType)
-        let elementSize = bytesPerElement(of: array.dataType)
+        let out = try MLMultiArray(shape: array.shape, dataType: array.dataType)
+        let bytes = array.count * bytesPerElement(of: array.dataType)
         array.withUnsafeBytes { source in
             out.withUnsafeMutableBytes { destination, _ in
                 guard let s = source.baseAddress, let d = destination.baseAddress else { return }
-                memcpy(d, s.advanced(by: row * width * elementSize), width * elementSize)
+                memcpy(d, s, bytes)
             }
         }
         return out
