@@ -23,10 +23,13 @@ The fixtures below reproduce the real stream layout: NUL-separated plists,
 each bigger than one 4 KiB read, with the power fields under ``processor``.
 """
 
+import datetime
 import io
 import plistlib
 
-from benchmarks.power import PowerMonitor, PowerTrace, _parse_power_plist
+import pytest
+
+from benchmarks.power import PowerMonitor, PowerSample, PowerTrace, _parse_power_plist, anchor
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────
@@ -34,7 +37,8 @@ from benchmarks.power import PowerMonitor, PowerTrace, _parse_power_plist
 READ_SIZE = 4096  # must match PowerMonitor._reader's read size
 
 
-def _sample_plist(cpu_mw: float, gpu_mw: float, ane_mw: float) -> dict:
+def _sample_plist(cpu_mw: float, gpu_mw: float, ane_mw: float,
+                  stamp: datetime.datetime = datetime.datetime(2026, 9, 29, 7, 0, 0)) -> dict:
     """One powermetrics sample, shaped like the real thing.
 
     Power lives under ``processor``.  The top-level ``gpu`` dict is present
@@ -45,6 +49,7 @@ def _sample_plist(cpu_mw: float, gpu_mw: float, ane_mw: float) -> dict:
     return {
         "is_delta": True,
         "elapsed_ns": 200_000_000,
+        "timestamp": stamp,
         "hw_model": "Mac16,10",
         "gpu": {
             "dvfm_states": [{"freq": 444, "used_ratio": 0.5}],
@@ -106,16 +111,50 @@ def test_gpu_power_read_from_processor():
     print("  ✓ test_gpu_power_read_from_processor passed")
 
 
-def test_trace_means_report_gpu():
-    """End-to-end: the aggregated trace reports non-zero GPU watts."""
+def test_timestamp_parsed_as_utc_seconds():
+    """plistlib hands back naive UTC datetimes; the sample keeps epoch seconds."""
     samples, _ = _parse_power_plist(_stream(SAMPLES))
-    d = PowerTrace(samples=samples).to_dict()
+    expected = datetime.datetime(2026, 9, 29, 7, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    assert all(s.timestamp == expected for s in samples)
+    assert all(s.elapsed_ns == 200_000_000 for s in samples)
 
-    assert d["n_samples"] == len(SAMPLES)
-    assert d["mean_cpu_w"] == 2.0        # (1000 + 2000 + 3000) / 3 mW → W
-    assert d["mean_gpu_w"] == 0.15       # (75.1 + 150.2 + 225.3) / 3 mW → W
-    assert d["mean_ane_w"] == 0.292      # (500 + 250 + 125) / 3 mW → W
-    print("  ✓ test_trace_means_report_gpu passed")
+
+def _tiled(t0: float, elapsed_ns: list[int], mw: list[float]) -> list[PowerSample]:
+    """Samples as powermetrics stamps them: end time floored to the second."""
+    out, t = [], t0
+    for e, p in zip(elapsed_ns, mw):
+        t += e / 1e9
+        out.append(PowerSample(timestamp=float(int(t)), elapsed_ns=e, cpu_mw=p))
+    return out
+
+
+def test_anchor_recovers_start_from_whole_second_stamps():
+    """Intersecting every stamp's constraint pins the start to milliseconds."""
+    t0 = 1_000.4567
+    elapsed = [117_000_000 + 1_000_000 * (i % 3) for i in range(200)]
+    t, lo, hi = anchor(_tiled(t0, elapsed, [1.0] * 200))
+    assert lo <= t0 < hi
+    assert hi - lo < 0.01
+    assert abs(t - t0) < 0.005
+
+
+def test_energy_is_power_times_overlap():
+    """A window straddling samples takes each one's share of its interval."""
+    # 10 samples of 100 ms from t0 = 50.0 s, power 1000·(k+1) mW.
+    trace = PowerTrace(_tiled(50.0, [100_000_000] * 10, [1000.0 * (k + 1) for k in range(10)]))
+    trace.samples[-1].timestamp = 51.0  # the last end lands exactly on 51.0
+    # 50.15 .. 50.35: half of sample 1, all of sample 2, half of sample 3.
+    t, _, _ = anchor(trace.samples)
+    e = trace.energy_mj(t + 0.15, t + 0.35)
+    assert e["cpu"] == pytest.approx(2000 * 0.05 + 3000 * 0.1 + 4000 * 0.05)
+    assert e["gpu"] == 0.0
+
+
+def test_energy_rejects_uncovered_window():
+    trace = PowerTrace(_tiled(50.0, [100_000_000] * 10, [1000.0] * 10))
+    t, _, _ = anchor(trace.samples)
+    with pytest.raises(ValueError):
+        trace.energy_mj(t + 0.5, t + 1.5)
 
 
 def test_incomplete_tail_is_returned_not_dropped():
@@ -161,7 +200,6 @@ def test_reader_thread_collects_all_samples():
     assert len(pm.trace.samples) == n, \
         f"reader dropped samples: {len(pm.trace.samples)}/{n}"
     assert [s.gpu_mw for s in pm.trace.samples] == [p[1] for p in powers]
-    assert pm.trace.mean_gpu_w > 0
     print("  ✓ test_reader_thread_collects_all_samples passed")
 
 
@@ -194,7 +232,10 @@ if __name__ == "__main__":
     test_fixture_matches_real_stream_layout()
     test_parses_every_nul_separated_sample()
     test_gpu_power_read_from_processor()
-    test_trace_means_report_gpu()
+    test_timestamp_parsed_as_utc_seconds()
+    test_anchor_recovers_start_from_whole_second_stamps()
+    test_energy_is_power_times_overlap()
+    test_energy_rejects_uncovered_window()
     test_incomplete_tail_is_returned_not_dropped()
     test_chunked_reads_lose_nothing()
     test_reader_thread_collects_all_samples()

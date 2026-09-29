@@ -1,75 +1,94 @@
 # Benchmarks
 
-Measures CoreML inference performance for the Gemma4-E2B model on Apple Silicon.
+Measures prefill and decode speed of the exported model on Apple Silicon, and
+the energy per token of the **CPU, GPU and ANE rails** as `powermetrics`
+reports them — not whole-system energy (no DRAM, display or the rest of the
+machine).
 
-Unlike Python's coremltools — which recompiles on every `MLModel` load — the
-benchmark runner drives a **Swift** executable (`benchmarks/swift/bench/`) that
-links the shared `GemmaCore` library, reuses the same inference path as the
-CLI and iOS app, and caches compiled `.mlmodelc` artifacts between runs. The
-Python layer only orchestrates: it loops over the (backend × context × run)
-matrix, spawns the Swift binary per measurement, and optionally records a
-`powermetrics` trace alongside each run.
-
-## What we benchmark
-
-- **Prefill latency** — wall time from `engine.generate` start until the first
-  yielded token (i.e. the sample drawn from the final prefill chunk's logits),
-  divided by the synthetic prompt length to get tokens/sec.
-- **Decode throughput** — tokens/sec measured over the time between the first
-  and last yielded tokens, which brackets pure decode-model predictions.
-- **Power consumption** — CPU, GPU, and ANE milliwatts via `powermetrics`
-  (requires passwordless `sudo`, else silently skipped).
+`uv run gemma-bench` drives a **Swift** executable (`benchmarks/swift/bench/`)
+that links `GemmaCore` and makes the same prefill / decode / head calls as the
+CLI and the iOS app, with greedy sampling. The Python side (`runner.py`,
+`power.py`) runs the matrix, records power and does the arithmetic.
 
 ## Usage
 
 ```bash
-# Full benchmark suite (builds the Swift binary on first invocation)
-uv run gemma-bench
-
-# Specific backends and context lengths
-uv run gemma-bench --backends cpu,ane --context-lengths 128,512,2048
-
-# Skip power monitoring
-uv run gemma-bench --no-power
-
-# More decode tokens per run, fewer repetitions
-uv run gemma-bench --decode-tokens 128 --runs 3
+# Compare two exports on the GPU and the Neural Engine at 512 and 2048 tokens
+uv run gemma-bench --models base.mlpackage,new.mlpackage \
+    --compute-units cpu-and-gpu,cpu-and-ne --context-lengths 512,2048 --runs 3
 ```
 
-Results are saved as JSON to `benchmarks/results/` and plots are generated
-automatically.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--models` | `gemma4-e2b.mlpackage` | Comma-separated packages, compared A/B |
+| `--compute-units` | `cpu-and-gpu,cpu-and-ne` | From `cpu-and-gpu`, `cpu-and-ne`, `all`, `cpu-only` |
+| `--context-lengths` | `512,2048` | Cache sizes; each must be exported |
+| `--runs` | `3` | Repetitions per configuration (at least 3) |
+| `--timeout` | `1800` | Per-run timeout in seconds (a first ANE compile takes minutes) |
+| `--output-dir` | `benchmarks/results/<timestamp>` | Where results go |
+
+The output directory gets `results.json` (every run, the gate record and the
+summary), `summary.md` (the tables printed at the end) and `power/`, one file
+per run with its raw `powermetrics` samples.
+
+## Method
+
+**Workload** — fixed in the Swift binary, identical for every configuration.
+After loading, compiling and a warm-up (none of it measured), one process runs:
+
+| window | what |
+|---|---|
+| `idle_pre` | 4 s of sleep, the model loaded |
+| `prefill` | 4096 prompt tokens as whole-cache prompts, each into a fresh cache: 8 × 512 at context 512, 2 × 2048 at 2048 |
+| `decode` | 256 greedy tokens after a 128-token prompt, into a cache of the context length |
+| `idle_post` | 4 s of sleep |
+
+with a 1 s pause after prefill and after decode, so a phase's power tail does
+not land in the next window. The binary reports every window boundary as a
+`CLOCK_UPTIME_RAW` timestamp; the runner maps them to wall-clock time.
+
+**Power** — `sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 100
+-f plist` runs for the whole process. Each sample is the mean power of each
+rail over the `elapsed_ns` since the previous one, so samples tile time. Their
+`timestamp` is wall-clock, truncated to the second, at the end of the sample:
+intersecting the constraint every sample puts on the start of the first one
+anchors the whole sequence to a few milliseconds (the width is recorded per
+run, next to how long after its reconstructed end each sample arrived).
+
+**Energy** — for each phase, `Σ P × overlap(sample, phase window)` per rail:
+every sample counts for exactly the part of its interval inside the window.
+Idle power is the mean of the two idle windows; *above idle* subtracts it
+over the phase's duration. Reported per token: ms/token, mJ/token (total and
+above idle) and the mean W of each rail.
+
+**Quiet-machine gate** — before every run: on AC power, not in Low Power Mode,
+and the other processes' CPU (one-second `top` sample) below 15% of one core,
+not counting the exempt daemons (`EXEMPT_PROCESSES`, e.g. `suggestd`) — which
+are logged, as is every busy process. Otherwise the runner pauses 15 s and
+retries, and gives the run up after 15 minutes. The gate records land in
+`results.json`. The runner refuses to start at all on battery.
+
+**Order** — one unmeasured priming run per configuration (it compiles and
+caches every function), then the repetitions, with the configuration order
+rotated by one each repetition.
+
+**Summary** — the median of the kept runs (gate passed, no error) with the
+min–max spread; dropped runs are listed with the reason.
 
 ## Prerequisites
 
 - **Xcode** (not just the Command Line Tools). The Swift bench targets
-  macOS 15, which needs the Xcode SDK. Select it before the first run:
+  macOS 15, which needs the Xcode SDK:
 
   ```bash
   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
   ```
 
-- **Passwordless `powermetrics`** (optional, for power data). Add to
-  `/etc/sudoers`:
+- **Passwordless `powermetrics`**. Add to `/etc/sudoers`:
 
   ```
   %admin ALL = (root) NOPASSWD: /usr/bin/powermetrics
   ```
-
-  Without this, power monitoring is silently skipped.
-
-## CLI options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model` | `gemma4-e2b.mlpackage` | Path to the exported `.mlpackage` |
-| `--backends` | `cpu,gpu,ane,all` | Comma-separated compute backends |
-| `--context-lengths` | 128–16384 | Comma-separated prompt lengths |
-| `--runs` | `3` | Repetitions per configuration |
-| `--decode-tokens` | `32` | Tokens to decode per run |
-| `--timeout` | `300` | Per-run timeout in seconds |
-| `--output-dir` | `benchmarks/results` | Where to write JSON + plots |
-| `--no-power` | off | Disable power monitoring |
-| `--no-warmup` | off | Skip the primer prefill+decode |
 
 ## Standalone Swift bench (legacy)
 

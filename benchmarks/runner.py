@@ -1,11 +1,27 @@
-"""Benchmark runner that drives the GemmaBench Swift binary.
+"""Measured runs of the GemmaBench Swift binary, with rail energy per phase.
 
-The Python layer only orchestrates: loops over the (backend × context × run)
-matrix, spawns the Swift binary for each measurement, and optionally records
-a `powermetrics` trace alongside each run.  All CoreML work happens inside
-the Swift binary, which reuses the `GemmaCore` inference path and benefits
-from `.mlmodelc` compilation caching on disk — something Python's coremltools
-does not do reliably.
+Method (see benchmarks/README.md for the why):
+
+* **Workload** — fixed in the Swift binary: prefill of 4096 tokens per window
+  (whole-cache prompts: 8 × 512 or 2 × 2048), then greedy decode of 256 tokens
+  after a 128-token prompt, with ~4 s of idle before and after.  The binary
+  reports every phase boundary as a ``CLOCK_UPTIME_RAW`` timestamp.
+* **Power** — ``powermetrics -i 100`` (CPU, GPU and ANE rails) runs for the
+  whole process; each phase's energy is ``sum(P × overlap)`` of the samples
+  with the exact phase window (:mod:`benchmarks.power`).  Idle power is the
+  mean of the two idle windows; above-idle energy subtracts it over the
+  phase's duration.
+* **Quiet-machine gate** — before every run: on AC power, not in Low Power
+  Mode, and the other processes' CPU below :data:`QUIET_CPU_PERCENT` of one
+  core, with :data:`EXEMPT_PROCESSES` not counted (and logged); otherwise it
+  pauses and retries, and gives the run up after :data:`GATE_TIMEOUT_S`.
+* **Order** — one unmeasured priming run per configuration (compiles and
+  caches it), then ``runs`` repetitions of every configuration, the
+  configuration order rotated by one each repetition.
+* **Summary** — medians of the kept runs (gate passed, no error), with
+  min–max spread.
+
+Each run's power samples are written next to the results, one JSON per run.
 """
 
 from __future__ import annotations
@@ -13,260 +29,365 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
+import statistics
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-import numpy as np
-
-from benchmarks.power import PowerMonitor, PowerTrace
-
+from benchmarks.power import RAILS, PowerMonitor
 
 # Path to the Swift bench package under the repo.
 _SWIFT_BENCH_PKG = Path(__file__).resolve().parent / "swift" / "bench"
 
+# Other processes may use at most this much CPU, in percent of one core, summed.
+QUIET_CPU_PERCENT = 15.0
+# Background daemons that are not counted against the gate (but are logged).
+EXEMPT_PROCESSES = ("suggestd",)
+GATE_RETRY_S = 15
+GATE_TIMEOUT_S = 900
 
-# ---------------------------------------------------------------------------
-# Result / config dataclasses
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class RunResult:
-    """One measurement from the Swift bench binary, plus optional power."""
-
-    context_length: int
-    backend: str
-    run_index: int
-    prefill_time_s: float = 0.0
-    prefill_tokens_per_sec: float = 0.0
-    decode_time_s: float = 0.0
-    decode_tokens_per_sec: float = 0.0
-    decode_tokens_generated: int = 0
-    load_time_s: float = 0.0
-    total_time_s: float = 0.0
-    power: dict = field(default_factory=dict)
-    timed_out: bool = False
-    error: str | None = None
+COMPUTE_UNITS = ("cpu-and-gpu", "cpu-and-ne", "all", "cpu-only")
+PHASES = ("prefill", "decode")
 
 
 @dataclass
 class BenchmarkConfig:
-    model_path: str
-    backends: list[str]
+    models: list[str]
+    compute_units: list[str]
     context_lengths: list[int]
-    num_runs: int = 5
-    decode_tokens: int = 32
-    timeout_s: int = 300
-    enable_power: bool = True
-    no_warmup: bool = False
+    runs: int = 3
+    timeout_s: int = 1800
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def configurations(self) -> list[tuple[str, str, int]]:
+        return [(m, cu, n) for m in self.models for cu in self.compute_units
+                for n in self.context_lengths]
 
 
-# Map the Python-side backend name to what the Swift binary expects.
-_BACKEND_TO_SWIFT = {
-    "cpu": "cpu",
-    "gpu": "cpu-gpu",
-    "ane": "cpu-ane",
-    "all": "all",
-}
+@dataclass
+class RunRecord:
+    model: str
+    compute_units: str
+    context_length: int
+    repetition: int
+    started: str = ""
+    kept: bool = False
+    error: str | None = None
+    gate: dict = field(default_factory=dict)
+    bench: dict = field(default_factory=dict)
+    power: dict = field(default_factory=dict)      # anchor diagnostics
+    idle_w: dict = field(default_factory=dict)     # per rail, and total
+    phases: dict = field(default_factory=dict)     # phase -> metrics
+    samples_file: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Swift binary build / invocation
-# ---------------------------------------------------------------------------
+# ── Machine state ───────────────────────────────────────────────────────────
 
 
-def ensure_swift_bench_built(verbose: bool = True) -> Path:
-    """Build the Swift bench binary and return the executable path.
+def power_source() -> dict:
+    """``{"source": "AC Power" | "Battery Power" | ..., "low_power_mode": bool}``."""
+    batt = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
+    m = re.search(r"drawing from '([^']+)'", batt)
+    settings = subprocess.run(["pmset", "-g"], capture_output=True, text=True).stdout
+    lpm = re.search(r"lowpowermode\s+(\d)", settings)
+    return {
+        "source": m.group(1) if m else "unknown",
+        "low_power_mode": bool(lpm and lpm.group(1) == "1"),
+        "battery": batt.strip().splitlines()[-1].strip() if batt.strip() else "",
+    }
 
-    The build always runs.  GemmaCore is the code under benchmark, so an
-    existing binary says nothing about whether it matches the current
-    sources — skipping the build silently measures the previous revision.
-    An up-to-date `swift build` is a ~1 s no-op.
 
-    Requires Xcode (not Command Line Tools) — the package targets
-    macOS 15, which the CommandLineTools SDK doesn't provide.
+def other_processes_cpu(own_pids: set[int]) -> tuple[float, list[dict], list[dict]]:
+    """CPU use of every other process over one second, in percent of a core.
+
+    ``top``'s second sample is the one-second delta (its first is a since-boot
+    average).  Returns the counted total, the counted busy processes and the
+    exempt ones.
     """
-    exe = _SWIFT_BENCH_PKG / ".build" / "release" / "GemmaBench"
-    if verbose:
-        print("Building GemmaBench (swift build -c release) …", flush=True)
-    r = subprocess.run(
-        ["swift", "build", "-c", "release"],
-        cwd=str(_SWIFT_BENCH_PKG),
+    out = subprocess.run(
+        ["top", "-l", "2", "-s", "1", "-n", "40", "-o", "cpu", "-stats", "pid,cpu,command"],
         capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        msg = (
+    ).stdout
+    second = out.split("PID")[-1].splitlines()[1:]
+    counted, exempt, total = [], [], 0.0
+    for line in second:
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, cpu = int(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        name = parts[2].strip()
+        if pid in own_pids or name.startswith("top") or cpu <= 0.0:
+            continue
+        entry = {"pid": pid, "cpu": cpu, "command": name}
+        if any(name.startswith(e) for e in EXEMPT_PROCESSES):
+            exempt.append(entry)
+            continue
+        counted.append(entry)
+        total += cpu
+    return total, [c for c in counted if c["cpu"] >= 1.0], exempt
+
+
+def quiet_gate() -> dict:
+    """Wait until the machine is fit to measure; the record says what was seen."""
+    own = {os.getpid(), os.getppid()}
+    deadline = time.monotonic() + GATE_TIMEOUT_S
+    attempts = 0
+    while True:
+        attempts += 1
+        ps = power_source()
+        total, busy, exempt = other_processes_cpu(own)
+        reasons = []
+        if ps["source"] != "AC Power":
+            reasons.append(f"on {ps['source']}")
+        if ps["low_power_mode"]:
+            reasons.append("Low Power Mode")
+        if total >= QUIET_CPU_PERCENT:
+            reasons.append(f"other processes at {total:.0f}% CPU")
+        record = {
+            "passed": not reasons, "attempts": attempts, "power_source": ps,
+            "other_cpu_percent": round(total, 1), "busy": busy, "exempt": exempt,
+            "reasons": reasons,
+        }
+        if not reasons or time.monotonic() > deadline:
+            return record
+        print(f"    gate: {', '.join(reasons)} — retrying in {GATE_RETRY_S}s "
+              f"({', '.join(f'{b['command']} {b['cpu']:.0f}%' for b in busy[:4])})",
+              flush=True)
+        time.sleep(GATE_RETRY_S)
+
+
+def _uptime_to_wall_offset() -> float:
+    """``wall - uptime`` (seconds), from the tightest of several paired reads."""
+    best = None
+    for _ in range(20):
+        a = time.time()
+        u = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) / 1e9
+        b = time.time()
+        if best is None or b - a < best[0]:
+            best = (b - a, (a + b) / 2 - u)
+    return best[1]
+
+
+# ── Swift binary ────────────────────────────────────────────────────────────
+
+
+def ensure_swift_bench_built() -> Path:
+    """Build the Swift bench binary (always: GemmaCore is the code under test,
+    and an up-to-date ``swift build`` is a ~1 s no-op)."""
+    exe = _SWIFT_BENCH_PKG / ".build" / "release" / "GemmaBench"
+    print("Building GemmaBench (swift build -c release) …", flush=True)
+    r = subprocess.run(["swift", "build", "-c", "release"], cwd=str(_SWIFT_BENCH_PKG),
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not exe.exists():
+        raise RuntimeError(
             "swift build failed — make sure Xcode is installed and selected:\n"
             "   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer\n\n"
             f"--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}"
         )
-        raise RuntimeError(msg)
-    if not exe.exists():
-        raise RuntimeError(f"GemmaBench built but not at {exe}")
     return exe
 
 
-# ---------------------------------------------------------------------------
-# Single run
-# ---------------------------------------------------------------------------
-
-
-def _invoke_bench(
-    exe: Path,
-    model_path: str,
-    backend: str,
-    context_length: int,
-    decode_tokens: int,
-    run_index: int,
-    timeout_s: int,
-    no_warmup: bool,
-) -> dict:
-    """Run the Swift bench binary, return its parsed JSON output (1 line)."""
-    cu = _BACKEND_TO_SWIFT.get(backend, backend)
-    cmd = [
-        str(exe),
-        "--model", model_path,
-        "--compute-units", cu,
-        "--context-length", str(context_length),
-        "--decode-tokens", str(decode_tokens),
-        "--run-index", str(run_index),
-    ]
-    if no_warmup:
-        cmd.append("--no-warmup")
+def _invoke_bench(exe: Path, model: str, cu: str, n: int, timeout_s: int) -> dict:
+    cmd = [str(exe), "--model", model, "--compute-units", cu, "--context-length", str(n)]
     try:
-        r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout_s,
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        return {"__timed_out": True}
+        raise RuntimeError(f"timeout after {timeout_s}s")
     if r.returncode != 0:
-        return {"__error": f"exit {r.returncode}: {r.stderr.strip()[:400]}"}
-    # Binary emits exactly one JSON line on stdout.
+        raise RuntimeError(f"exit {r.returncode}: {r.stderr.strip()[-400:]}")
     line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), None)
     if not line:
-        return {"__error": f"no JSON on stdout. stderr: {r.stderr[:400]}"}
+        raise RuntimeError(f"no JSON on stdout; stderr: {r.stderr[-400:]}")
+    return json.loads(line)
+
+
+# ── One run ─────────────────────────────────────────────────────────────────
+
+
+def _phase_metrics(trace, offset: float, start_ns: int, end_ns: int, tokens: int,
+                   idle_w: dict) -> dict:
+    start, end = start_ns / 1e9 + offset, end_ns / 1e9 + offset
+    dur = end - start
+    e = trace.energy_mj(start, end)
+    total = sum(e.values())
+    above = total - idle_w["total"] * 1000 * dur
+    return {
+        "tokens": tokens,
+        "seconds": dur,
+        "ms_per_token": dur * 1000 / tokens,
+        "w": {r: e[r] / 1000 / dur for r in RAILS} | {"total": total / 1000 / dur},
+        "mj_per_token": total / tokens,
+        "mj_per_token_above_idle": above / tokens,
+    }
+
+
+def run_one(exe: Path, config: BenchmarkConfig, model: str, cu: str, n: int,
+            repetition: int, samples_dir: Path) -> RunRecord:
+    rec = RunRecord(model=model, compute_units=cu, context_length=n,
+                    repetition=repetition, started=time.strftime("%FT%T%z"))
+    rec.gate = quiet_gate()
+    if not rec.gate["passed"]:
+        rec.error = "quiet-machine gate: " + ", ".join(rec.gate["reasons"])
+        return rec
+
+    offset = _uptime_to_wall_offset()
+    pm = PowerMonitor()
+    pm.start()
     try:
-        return json.loads(line)
-    except json.JSONDecodeError as e:
-        return {"__error": f"bad JSON: {e}. line: {line[:400]}"}
-
-
-def run_single(
-    exe: Path,
-    config: BenchmarkConfig,
-    backend: str,
-    context_length: int,
-    run_index: int,
-) -> RunResult:
-    result = RunResult(
-        context_length=context_length,
-        backend=backend,
-        run_index=run_index,
-    )
-
-    pm: PowerMonitor | None = None
-    if config.enable_power:
-        pm = PowerMonitor(sample_ms=200)
-        pm.start()
-
-    try:
-        out = _invoke_bench(
-            exe,
-            model_path=config.model_path,
-            backend=backend,
-            context_length=context_length,
-            decode_tokens=config.decode_tokens,
-            run_index=run_index,
-            timeout_s=config.timeout_s,
-            no_warmup=config.no_warmup,
-        )
+        rec.bench = _invoke_bench(exe, model, cu, n, config.timeout_s)
+    except RuntimeError as e:
+        rec.error = str(e)
     finally:
-        if pm is not None:
-            pm.stop()
-            if pm.trace.samples:
-                result.power = pm.trace.to_dict()
+        time.sleep(0.3)  # let the sample covering the last window land
+        pm.stop()
 
-    if out.get("__timed_out"):
-        result.timed_out = True
-        result.error = f"timeout after {config.timeout_s}s"
-        return result
-    if "__error" in out:
-        result.error = out["__error"]
-        return result
+    name = f"{Path(model).stem}-{cu}-{n}-r{repetition}.json"
+    rec.samples_file = str(samples_dir / name)
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    Path(rec.samples_file).write_text(json.dumps(
+        {"uptime_to_wall_offset_s": offset, **pm.trace.to_dict()}))
+    if rec.error:
+        return rec
 
-    result.prefill_time_s = float(out.get("prefill_time_s", 0.0))
-    result.decode_time_s = float(out.get("decode_time_s", 0.0))
-    result.decode_tokens_generated = int(out.get("decode_tokens_generated", 0))
-    result.prefill_tokens_per_sec = float(out.get("prefill_tokens_per_sec", 0.0))
-    result.decode_tokens_per_sec = float(out.get("decode_tokens_per_sec", 0.0))
-    result.load_time_s = float(out.get("load_time_s", 0.0))
-    result.total_time_s = float(out.get("total_time_s", 0.0))
-    return result
+    try:
+        _, rec.power = pm.trace.windows()
+        b = rec.bench
+        idle = {}
+        for w in ("idle_pre", "idle_post"):
+            start = b[w]["start_ns"] / 1e9 + offset
+            end = b[w]["end_ns"] / 1e9 + offset
+            e = pm.trace.energy_mj(start, end)
+            idle[w] = {r: e[r] / 1000 / (end - start) for r in RAILS}
+        rec.idle_w = {r: (idle["idle_pre"][r] + idle["idle_post"][r]) / 2 for r in RAILS}
+        rec.idle_w["total"] = sum(rec.idle_w.values())
+        rec.idle_w["pre_total"] = sum(idle["idle_pre"].values())
+        rec.idle_w["post_total"] = sum(idle["idle_post"].values())
+        for phase in PHASES:
+            p = b[phase]
+            rec.phases[phase] = _phase_metrics(
+                pm.trace, offset, p["start_ns"], p["end_ns"], p["tokens"], rec.idle_w)
+        rec.kept = True
+    except (KeyError, ValueError) as e:
+        rec.error = f"power analysis: {e}"
+    return rec
 
 
-# ---------------------------------------------------------------------------
-# Full benchmark
-# ---------------------------------------------------------------------------
+# ── The matrix ──────────────────────────────────────────────────────────────
 
 
-def run_benchmark(config: BenchmarkConfig, output_path: Path) -> list[RunResult]:
-    """Run the full matrix, rewriting `output_path` after every completed run.
-
-    Results are persisted incrementally so a crash (or an OOM kill) loses at
-    most the run that was in flight.
-    """
+def run_benchmark(config: BenchmarkConfig, out_dir: Path) -> list[RunRecord]:
+    """Prime every configuration, then run the rotated repetitions, rewriting
+    ``out_dir/results.json`` after every run."""
     exe = ensure_swift_bench_built()
-    results: list[RunResult] = []
-    n_cfg = len(config.backends) * len(config.context_lengths) * config.num_runs
-    print(
-        f"Running {n_cfg} benchmark runs "
-        f"({len(config.backends)} backends × {len(config.context_lengths)} "
-        f"context lengths × {config.num_runs} runs)",
-        flush=True,
-    )
-    print(f"Results → {output_path} (rewritten after every run)", flush=True)
-    i = 0
-    for backend in config.backends:
-        for context_length in config.context_lengths:
-            for run_index in range(config.num_runs):
-                i += 1
-                label = (
-                    f"[{i}/{n_cfg}] backend={backend} ctx={context_length} "
-                    f"run={run_index}"
-                )
-                print(f"  {label} …", flush=True)
-                r = run_single(exe, config, backend, context_length, run_index)
-                if r.timed_out or r.error:
-                    note = r.error or "timed out"
-                    print(f"    ✗ {note}", flush=True)
-                else:
-                    print(
-                        f"    ✓ prefill {r.prefill_tokens_per_sec:.1f} tok/s, "
-                        f"decode {r.decode_tokens_per_sec:.1f} tok/s",
-                        flush=True,
-                    )
-                results.append(r)
-                save_results(results, output_path, config)
-    return results
+    configs = config.configurations()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_path = out_dir / "results.json"
+    print(f"Results → {results_path}", flush=True)
+
+    ps = power_source()
+    if ps["source"] != "AC Power" or ps["low_power_mode"]:
+        raise SystemExit(f"refusing to measure: {ps['source']}"
+                         f"{', Low Power Mode' if ps['low_power_mode'] else ''} — "
+                         "connect AC power and turn Low Power Mode off")
+
+    for model, cu, n in configs:
+        print(f"  priming {Path(model).name} {cu} {n} …", flush=True)
+        try:
+            _invoke_bench(exe, model, cu, n, config.timeout_s)
+        except RuntimeError as e:
+            print(f"    ✗ priming failed: {e}", flush=True)
+
+    records: list[RunRecord] = []
+    total = len(configs) * config.runs
+    for rep in range(config.runs):
+        k = rep % len(configs)
+        for model, cu, n in configs[k:] + configs[:k]:
+            print(f"  [{len(records) + 1}/{total}] rep {rep} {Path(model).name} {cu} {n} …",
+                  flush=True)
+            r = run_one(exe, config, model, cu, n, rep, out_dir / "power")
+            if r.kept:
+                pf, dc = r.phases["prefill"], r.phases["decode"]
+                print(f"    ✓ prefill {pf['ms_per_token']:.3f} ms/tok {pf['mj_per_token']:.2f} mJ/tok"
+                      f" | decode {dc['ms_per_token']:.2f} ms/tok {dc['mj_per_token']:.1f} mJ/tok"
+                      f" | idle {r.idle_w['total']:.2f} W", flush=True)
+            else:
+                print(f"    ✗ {r.error}", flush=True)
+            records.append(r)
+            save_results(records, results_path, config)
+    return records
 
 
-def save_results(results: list[RunResult], path: Path, config: BenchmarkConfig) -> None:
+def summarize(records: list[RunRecord]) -> list[dict]:
+    """Per configuration: medians of the kept runs, with min–max spread."""
+    groups: dict[tuple, list[RunRecord]] = {}
+    for r in records:
+        groups.setdefault((r.model, r.compute_units, r.context_length), []).append(r)
+    rows = []
+    for (model, cu, n), runs in groups.items():
+        kept = [r for r in runs if r.kept]
+        row = {"model": model, "compute_units": cu, "context_length": n,
+               "runs": len(runs), "kept": len(kept),
+               "dropped": [r.error for r in runs if not r.kept]}
+        if kept:
+            def stat(values):
+                return {"median": statistics.median(values), "min": min(values), "max": max(values)}
+            row["idle_w"] = stat([r.idle_w["total"] for r in kept])
+            for phase in PHASES:
+                ps = [r.phases[phase] for r in kept]
+                row[phase] = {
+                    "ms_per_token": stat([p["ms_per_token"] for p in ps]),
+                    "mj_per_token": stat([p["mj_per_token"] for p in ps]),
+                    "mj_per_token_above_idle": stat([p["mj_per_token_above_idle"] for p in ps]),
+                    "w": {k: stat([p["w"][k] for p in ps]) for k in (*RAILS, "total")},
+                }
+        rows.append(row)
+    return rows
+
+
+def format_summary(rows: list[dict]) -> str:
+    """Markdown tables: median [min–max] of the kept runs."""
+    def cell(s, fmt):
+        return f"{s['median']:{fmt}} [{s['min']:{fmt}}–{s['max']:{fmt}}]"
+
+    out = ["CPU+GPU+ANE rail energy (powermetrics), not whole-system energy. "
+           "Median [min–max] of kept runs."]
+    for phase in PHASES:
+        out += ["", f"### {phase}", "",
+                "| model | units | ctx | kept | ms/token | mJ/token | mJ/token above idle "
+                "| CPU W | GPU W | ANE W | idle W |",
+                "|---|---|---|---|---|---|---|---|---|---|---|"]
+        for r in rows:
+            if phase not in r:
+                out.append(f"| {Path(r['model']).name} | {r['compute_units']} | "
+                           f"{r['context_length']} | 0/{r['runs']} | — | — | — | — | — | — | — |")
+                continue
+            p = r[phase]
+            out.append(
+                f"| {Path(r['model']).name} | {r['compute_units']} | {r['context_length']} "
+                f"| {r['kept']}/{r['runs']} | {cell(p['ms_per_token'], '.3f')} "
+                f"| {cell(p['mj_per_token'], '.2f')} | {cell(p['mj_per_token_above_idle'], '.2f')} "
+                f"| {p['w']['cpu']['median']:.2f} | {p['w']['gpu']['median']:.2f} "
+                f"| {p['w']['ane']['median']:.2f} | {r['idle_w']['median']:.2f} |")
+    return "\n".join(out)
+
+
+def save_results(records: list[RunRecord], path: Path, config: BenchmarkConfig) -> None:
     """Write the results JSON atomically (temp file in the same dir + rename)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     out = {
         "timestamp": time.strftime("%FT%T%z"),
-        "hardware": {
-            "node": platform.node(),
-            "machine": platform.machine(),
-            "mac_ver": platform.mac_ver()[0],
-        },
-        "config": config.to_dict(),
-        "results": [asdict(r) for r in results],
+        "energy_scope": "CPU+GPU+ANE rails (powermetrics), not whole-system energy",
+        "hardware": {"node": platform.node(), "machine": platform.machine(),
+                     "mac_ver": platform.mac_ver()[0]},
+        "gate": {"quiet_cpu_percent": QUIET_CPU_PERCENT, "exempt": list(EXEMPT_PROCESSES),
+                 "retry_s": GATE_RETRY_S, "timeout_s": GATE_TIMEOUT_S},
+        "config": asdict(config),
+        "summary": summarize(records),
+        "runs": [asdict(r) for r in records],
     }
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(out, indent=2))
