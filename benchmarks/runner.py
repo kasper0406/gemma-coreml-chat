@@ -80,6 +80,8 @@ CALIBRATION_MAX_REL_SPREAD = 0.5
 DRIFT_MARGIN = 2.0
 DRIFT_MAX_EXCESS = 10.0
 SPIKE_MAX_EXCESS = 25.0
+# Longest any one machine-state or process-list command may take.
+COMMAND_TIMEOUT_S = 30
 # Consecutive samples the gate wants inside the limits before a run starts.
 GATE_SAMPLES = 3
 GATE_RETRY_S = 15
@@ -151,24 +153,43 @@ class RunRecord:
 # ── Machine state ───────────────────────────────────────────────────────────
 
 
-def machine_state() -> dict:
-    """Power source, Low Power Mode, display power and console session — what
-    every run must share with the calibration (battery and Low Power Mode
-    change clocks; a lit display keeps WindowServer drawing).  ``None`` where
-    a value could not be read, which never matches a calibrated state."""
-    def run(*cmd: str) -> str:
-        return subprocess.run(cmd, capture_output=True, text=True).stdout
+def _output(*cmd: str) -> str:
+    """``cmd``'s stdout.  Fails closed: a non-zero exit or a run longer than
+    :data:`COMMAND_TIMEOUT_S` raises ``RuntimeError``."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=COMMAND_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{cmd[0]} timed out after {COMMAND_TIMEOUT_S}s") from None
+    if r.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)} exited {r.returncode}: {r.stderr.strip()[-200:]}")
+    return r.stdout
 
-    source = re.search(r"drawing from '([^']+)'", run("pmset", "-g", "batt"))
-    lpm = re.search(r"lowpowermode\s+(\d)", run("pmset", "-g"))
-    fb = run("ioreg", "-r", "-d1", "-w0", "-c", "IOMobileFramebufferShim")
-    states = [int(v) for v in re.findall(r'"CurrentPowerState"=(\d+)', fb)]
-    users = run("ioreg", "-n", "Root", "-d1", "-w0")
+
+def machine_state() -> dict:
+    """Power source, Low Power Mode, display power and screen lock — what
+    every run must share with the calibration (battery and Low Power Mode
+    change clocks; a lit display keeps WindowServer drawing).  Fails closed:
+    a command that fails or times out, or output without the value, raises
+    ``RuntimeError`` — an unreadable state is never a reading."""
+    def need(value, what: str):
+        if not value:
+            raise RuntimeError(f"cannot read the {what}")
+        return value
+
+    source = need(re.search(r"drawing from '([^']+)'", _output("pmset", "-g", "batt")),
+                  "power source")
+    # `powermode` (0 automatic, 1 low, 2 high) on Macs that have power modes.
+    lpm = need(re.search(r"\b(?:low)?powermode\s+(\d)", _output("pmset", "-g")),
+               "Low Power Mode")
+    fb = _output("ioreg", "-r", "-d1", "-w0", "-c", "IOMobileFramebufferShim")
+    displays = need(re.findall(r'"CurrentPowerState"=(\d+)', fb), "display power state")
+    users = _output("ioreg", "-n", "Root", "-d1", "-w0")
+    need("IOConsoleUsers" in users, "console session")
     return {
-        "power": source.group(1) if source else None,
-        "low_power_mode": bool(lpm and lpm.group(1) == "1"),
-        "display_on": any(states) if states else None,
-        "screen_locked": "CGSSessionScreenIsLocked" in users if "IOConsoleUsers" in users else None,
+        "power": source.group(1),
+        "low_power_mode": lpm.group(1) == "1",
+        "display_on": any(int(v) for v in displays),
+        "screen_locked": "CGSSessionScreenIsLocked" in users,
     }
 
 
@@ -207,11 +228,8 @@ def parse_top(out: str) -> list[tuple[int, float, str]]:
 
 def _process_tree(root: int) -> set[int]:
     """``root`` and every descendant of it."""
-    r = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"ps exited {r.returncode}")
     children: dict[int, list[int]] = {}
-    for ln in r.stdout.splitlines():
+    for ln in _output("ps", "-A", "-o", "pid=,ppid=").splitlines():
         pid, ppid = map(int, ln.split())
         children.setdefault(ppid, []).append(pid)
     tree, todo = set(), [root]
@@ -226,14 +244,19 @@ def background_cpu() -> dict:
     """One one-second sample of every process except the harness: this
     process, its descendants (the bench binary, ``powermetrics``, ``top``
     itself) and its parent process (not the parent's other children).
-    Fails closed: a ``top`` or ``ps`` failure or unparseable output raises
-    ``RuntimeError``."""
+    Fails closed: a ``top`` or ``ps`` failure or timeout, or unparseable
+    output, raises ``RuntimeError``."""
     own = _process_tree(os.getpid()) | {os.getppid()}
     proc = subprocess.Popen(
         ["top", "-l", "2", "-s", "1", "-o", "cpu", "-stats", "pid,cpu,command"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    out, err = proc.communicate(timeout=30)
+    try:
+        out, err = proc.communicate(timeout=COMMAND_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise RuntimeError(f"top timed out after {COMMAND_TIMEOUT_S}s") from None
     end = time.time()
     if proc.returncode != 0:
         raise RuntimeError(f"top exited {proc.returncode}: {err.strip()[-200:]}")
@@ -348,22 +371,21 @@ def calibrate() -> dict:
     :data:`GATE_TIMEOUT_S`."""
     deadline = time.monotonic() + GATE_TIMEOUT_S
     while True:
-        state = machine_state()
-        print(f"Calibrating the idle background ({CALIBRATION_SAMPLES} × 1 s, {state}) …",
-              flush=True)
-        samples, states = [], []
-        for _ in range(CALIBRATION_SAMPLES):
-            samples.append(background_cpu())
-            states.append(machine_state())
-        totals = [s["total"] for s in samples]
+        print(f"Calibrating the idle background ({CALIBRATION_SAMPLES} × 1 s) …", flush=True)
         try:
+            state = machine_state()
             if state["power"] != "AC Power" or state["low_power_mode"]:
-                raise ValueError("needs AC power and Low Power Mode off")
+                raise ValueError(f"{state}: needs AC power and Low Power Mode off")
+            samples, states = [], []
+            for _ in range(CALIBRATION_SAMPLES):
+                samples.append(background_cpu())
+                states.append(machine_state())
             if changed := judge_state(states, state):
                 raise ValueError(changed[0])
+            totals = [s["total"] for s in samples]
             limits = cpu_limits(totals)
             break
-        except ValueError as e:
+        except (ValueError, RuntimeError) as e:
             if time.monotonic() > deadline:
                 raise SystemExit(f"no usable idle calibration: {e}; leave the machine alone")
             print(f"  calibration refused: {e} — retrying in {GATE_RETRY_S}s", flush=True)
@@ -389,14 +411,13 @@ def quiet_gate(calibration: dict) -> dict:
     attempts = 0
     while True:
         attempts += 1
-        state = machine_state()
-        reasons = judge_state([state], calibration["state"])
         try:
+            state = machine_state()
+            reasons = judge_state([state], calibration["state"])
             samples = [background_cpu() for _ in range(GATE_SAMPLES)]
             reasons += judge_cpu(samples, calibration["limits"])
         except RuntimeError as e:
-            samples = []
-            reasons.append(str(e))
+            state, samples, reasons = None, [], [str(e)]
         record = {
             "passed": not reasons, "attempts": attempts, "state": state,
             "samples": samples, "reasons": reasons,
@@ -411,8 +432,8 @@ class BackgroundMonitor:
     """For the length of a run — launch, load and warm-up included — polls
     :func:`machine_state` and takes a :func:`background_cpu` sample, back to
     back on a thread (a poll every ~2 s), with one last poll after the bench
-    exits.  A failed sample ends the monitoring and is reported, so the
-    window check then finds the gap: the monitor fails closed."""
+    exits.  A failed poll or sample ends the monitoring and is reported as
+    :attr:`error`, which drops the run: the monitor fails closed."""
 
     def __init__(self) -> None:
         self.samples: list[dict] = []
@@ -422,21 +443,22 @@ class BackgroundMonitor:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
+        try:
+            while not self._stop.is_set():
                 self.states.append(machine_state())
                 self.samples.append(background_cpu())
-            except (RuntimeError, subprocess.TimeoutExpired) as e:
-                self.error = str(e)
-                return
-        self.states.append(machine_state())
+            self.states.append(machine_state())
+        except RuntimeError as e:
+            self.error = str(e)
 
     def start(self) -> None:
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=60)
+        self._thread.join(timeout=4 * COMMAND_TIMEOUT_S)
+        if self._thread.is_alive():
+            self.error = "the monitor did not finish its last poll"
 
 
 def _uptime_to_wall_offset() -> float:

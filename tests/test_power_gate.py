@@ -187,7 +187,8 @@ def _bench(t0):
 STATE = {"power": "AC Power", "low_power_mode": False, "display_on": False, "screen_locked": True}
 
 
-def _fake_run(monkeypatch, tmp_path, samples, background, t0=1000.0, config=None, states=None):
+def _fake_run(monkeypatch, tmp_path, samples, background, t0=1000.0, config=None, states=None,
+              monitor_error=None):
     class FakePower:
         def __init__(self):
             self.trace = PowerTrace(list(samples))
@@ -198,7 +199,7 @@ def _fake_run(monkeypatch, tmp_path, samples, background, t0=1000.0, config=None
 
     class FakeMonitor:
         def __init__(self):
-            self.samples, self.error = background, None
+            self.samples, self.error = background, monitor_error
             self.states = [STATE] * 12 if states is None else states
 
         def start(self): pass
@@ -254,7 +255,7 @@ def test_background_activity_during_the_run_drops_it(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("change", [
     {"power": "Battery Power"}, {"low_power_mode": True}, {"display_on": True},
-    {"screen_locked": False}, {"display_on": None},
+    {"screen_locked": False},
 ])
 def test_a_machine_state_change_during_the_run_drops_it(monkeypatch, tmp_path, change):
     states = [STATE] * 5 + [STATE | change] + [STATE] * 5
@@ -280,6 +281,76 @@ def test_the_monitor_polls_the_state_with_every_sample_and_after_the_run(monkeyp
     time.sleep(0.05)
     m.stop()
     assert m.samples and len(m.states) == len(m.samples) + 1
+
+
+# ── machine state: fails closed ─────────────────────────────────────────────
+
+GOOD = {
+    ("pmset", "-g", "batt"): "Now drawing from 'AC Power'\n",
+    ("pmset", "-g"): " displaysleep 10\n powermode            0\n",
+    ("ioreg", "-r", "-d1", "-w0", "-c", "IOMobileFramebufferShim"): '"CurrentPowerState"=0\n',
+    ("ioreg", "-n", "Root", "-d1", "-w0"): '"IOConsoleUsers" = ({"CGSSessionScreenIsLocked"=Yes})',
+}
+
+
+def _fake_output(outputs):
+    def output(*cmd):
+        out = outputs[cmd]
+        if isinstance(out, Exception):
+            raise out
+        return out
+    return output
+
+
+def test_machine_state_reads_every_value(monkeypatch):
+    monkeypatch.setattr(runner, "_output", _fake_output(GOOD))
+    assert runner.machine_state() == STATE
+    lpm = GOOD | {("pmset", "-g"): " lowpowermode 1\n"}
+    monkeypatch.setattr(runner, "_output", _fake_output(lpm))
+    assert runner.machine_state()["low_power_mode"] is True
+
+
+@pytest.mark.parametrize("cmd, out", [
+    (("pmset", "-g", "batt"), RuntimeError("pmset -g batt exited 1")),
+    (("pmset", "-g"), " displaysleep 10\n"),              # no Low Power Mode line
+    (("ioreg", "-r", "-d1", "-w0", "-c", "IOMobileFramebufferShim"), ""),
+    (("ioreg", "-n", "Root", "-d1", "-w0"), "no session"),
+])
+def test_an_unreadable_machine_state_raises(monkeypatch, cmd, out):
+    monkeypatch.setattr(runner, "_output", _fake_output(GOOD | {cmd: out}))
+    with pytest.raises(RuntimeError):
+        runner.machine_state()
+
+
+def test_a_failing_or_hanging_command_raises(monkeypatch):
+    with pytest.raises(RuntimeError, match="exited 1"):
+        runner._output("false")
+    monkeypatch.setattr(runner, "COMMAND_TIMEOUT_S", 0.2)
+    with pytest.raises(RuntimeError, match="timed out"):
+        runner._output("sleep", "5")
+
+
+def test_an_unreadable_state_refuses_the_calibration_fails_the_gate_and_stops_the_monitor(monkeypatch):
+    def unreadable():
+        raise RuntimeError("cannot read the Low Power Mode")
+
+    monkeypatch.setattr(runner, "GATE_TIMEOUT_S", -1)
+    monkeypatch.setattr(runner, "background_cpu", lambda: _s(1.0, 12.0))
+    monkeypatch.setattr(runner, "machine_state", unreadable)
+    with pytest.raises(SystemExit, match="Low Power Mode"):
+        runner.calibrate()
+    gate = runner.quiet_gate({"limits": LIMITS, "state": STATE})
+    assert not gate["passed"] and "Low Power Mode" in gate["reasons"][0]
+    m = runner.BackgroundMonitor()
+    m.start()
+    m.stop()
+    assert m.error and "Low Power Mode" in m.error
+
+
+def test_a_failed_monitor_drops_the_run(monkeypatch, tmp_path):
+    rec = _fake_run(monkeypatch, tmp_path, _tiled(999.7, 117_000_000, 200), _quiet(),
+                    monitor_error="cannot read the display power state")
+    assert not rec.kept and "monitor failed" in rec.error
 
 
 def test_calibration_refuses_a_state_change_or_an_unsteady_baseline(monkeypatch):
