@@ -693,10 +693,12 @@ _HEAD_MAX_ROWS = 32768
 # Rows the head computes apart at the end of every slice (:func:`logits_head`).
 # Measured on head-only models (16 x 16384 int8 per-channel, K = 1536, M = 1;
 # M4 Pro, macOS 27), per call:
-# * GPU: the matmul runs ~3x slower whenever N_out is a multiple of 32 —
-#   6.0-6.4 ms for N_out 16384, 16416, 16448, 16512, 15424 or 32768 against
-#   1.9-2.2 ms for N_out = 16 mod 32 (16400, 16392, 29136, 32784, or 16368 +
-#   16).  (The 9 x 29136 head this one replaced ran in 2.4 ms.)
+# * GPU: a head prediction runs ~3x slower whenever the slices' N_out is a
+#   multiple of 32 — 6.0-6.4 ms per call for N_out 16384, 16416, 16448,
+#   16512, 15424 or 32768 against 1.9-2.2 ms when it is not (16400, 16392,
+#   29136, 32784, or 16368 + 16).  These are whole-call timings; which kernel
+#   is slow was not isolated.  (The 9 x 29136 head this one replaced ran in
+#   2.4 ms.)
 # * ANE: a slice's row assembled from two matmuls concatenated along it runs
 #   in 3.26 ms against 5.59 ms as one matmul — however it is split (16368 +
 #   16, 8192 + 8192, four pieces); 32 one-matmul rows of 8192 are 5.59 ms too.
