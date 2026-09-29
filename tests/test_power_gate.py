@@ -393,3 +393,53 @@ def test_the_cli_refuses_a_missing_package_before_measuring(monkeypatch, tmp_pat
     with pytest.raises(SystemExit) as e:
         cli.main()
     assert e.value.code == 2
+
+
+def _record(config_id, kept, rep=0):
+    r = runner.RunRecord(config_id=config_id, model="/m.mlpackage", compute_units="cpu-and-ne",
+                         context_length=512, repetition=rep, kept=kept,
+                         error=None if kept else "background: prefill: drifted")
+    if kept:
+        r.idle_w = {"total": 1.0}
+        stat = {"ms_per_token": 1.0, "mj_per_token": 1.0, "mj_per_token_above_idle": 0.5,
+                "w": {k: 1.0 for k in (*runner.RAILS, "total")}}
+        r.phases = {p: stat for p in runner.PHASES}
+    return r
+
+
+@pytest.mark.parametrize("kept, fails", [
+    ([False, False, False], True),     # every run dropped
+    ([True, False, False], True),      # 1 of 3
+    ([True, True, False], False),      # 2 of 3: a majority
+])
+def test_the_cli_fails_unless_every_configuration_keeps_a_majority(monkeypatch, tmp_path, kept, fails):
+    from benchmarks import cli
+    (tmp_path / "m.mlpackage").mkdir()
+    records = [_record("c00", k, rep) for rep, k in enumerate(kept)] + \
+              [_record("c01", True, rep) for rep in range(3)]
+    monkeypatch.setattr(cli, "check_power_available", lambda: True)
+    monkeypatch.setattr(cli, "run_benchmark", lambda config, out: (out.mkdir(), records)[1])
+    monkeypatch.setattr("sys.argv", ["gemma-bench", "--models", str(tmp_path / "m.mlpackage"),
+                                     "--output-dir", str(tmp_path / "out")])
+    if fails:
+        with pytest.raises(SystemExit, match="too few kept runs.*c00") as e:
+            cli.main()
+        assert e.value.code not in (0, None)
+    else:
+        cli.main()
+    summary = (tmp_path / "out" / "summary.md").read_text()
+    assert "Dropped runs" in summary and "c00 rep 2: background: prefill: drifted" in summary
+
+
+def test_a_failed_priming_run_ends_the_invocation(monkeypatch, tmp_path):
+    def fail(*a):
+        raise RuntimeError("exit 1: no such function")
+
+    monkeypatch.setattr(runner, "ensure_swift_bench_built", lambda: Path("/bin/false"))
+    monkeypatch.setattr(runner, "machine_state", lambda: STATE)
+    monkeypatch.setattr(runner, "_invoke_bench", fail)
+    monkeypatch.setattr(runner, "calibrate", lambda: pytest.fail("measured after a failed priming"))
+    config = runner.BenchmarkConfig(models=["/a/m.mlpackage"], compute_units=["cpu-and-ne"],
+                                    context_lengths=[512])
+    with pytest.raises(SystemExit, match="priming .* failed: exit 1"):
+        runner.run_benchmark(config, tmp_path)

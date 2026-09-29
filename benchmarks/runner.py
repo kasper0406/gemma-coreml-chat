@@ -27,7 +27,7 @@ Method (see benchmarks/README.md for the why):
   malformed document, or an anchor wider than :data:`ANCHOR_MAX_FRACTION`
   of its shortest window is not kept.
 * **Order** — one unmeasured priming run per configuration (compiles and
-  caches it), then ``runs`` repetitions of every configuration, the
+  caches it; a failed one ends the invocation), then ``runs`` repetitions of every configuration, the
   configuration order rotated by one each repetition.
 * **Summary** — medians of the kept runs (gate passed, no error), with
   min–max spread.
@@ -592,7 +592,7 @@ def run_benchmark(config: BenchmarkConfig, out_dir: Path) -> list[RunRecord]:
         try:
             _invoke_bench(exe, c.model, c.compute_units, c.context_length, config.timeout_s)
         except RuntimeError as e:
-            print(f"    ✗ priming failed: {e}", flush=True)
+            raise SystemExit(f"priming {c.id} failed: {e}")
 
     calibration = calibrate()
     records: list[RunRecord] = []
@@ -626,7 +626,7 @@ def summarize(records: list[RunRecord]) -> list[dict]:
         row = {"config_id": config_id, "model": first.model,
                "compute_units": first.compute_units, "context_length": first.context_length,
                "runs": len(runs), "kept": len(kept),
-               "dropped": [r.error for r in runs if not r.kept]}
+               "dropped": [f"rep {r.repetition}: {r.error}" for r in runs if not r.kept]}
         if kept:
             def stat(values):
                 return {"median": statistics.median(values), "min": min(values), "max": max(values)}
@@ -644,8 +644,8 @@ def summarize(records: list[RunRecord]) -> list[dict]:
 
 
 def format_summary(rows: list[dict]) -> str:
-    """Markdown tables: median [min–max] of the kept runs, then which package
-    each configuration id ran."""
+    """Markdown tables: median [min–max] of the kept runs, which package each
+    configuration id ran, and why each dropped run was dropped."""
     def cell(s, fmt):
         return f"{s['median']:{fmt}} [{s['min']:{fmt}}–{s['max']:{fmt}}]"
 
@@ -669,6 +669,9 @@ def format_summary(rows: list[dict]) -> str:
     out += ["", "| config | package | units | ctx |", "|---|---|---|---|"]
     out += [f"| {r['config_id']} | {r['model']} | {r['compute_units']} | {r['context_length']} |"
             for r in rows]
+    dropped = [f"- {r['config_id']} {d}" for r in rows for d in r["dropped"]]
+    if dropped:
+        out += ["", "Dropped runs:", "", *dropped]
     return "\n".join(out)
 
 

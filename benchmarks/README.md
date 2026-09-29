@@ -108,11 +108,12 @@ which package path each id ran, so two packages with the same file name stay
 apart.
 
 **Order** — one unmeasured priming run per configuration (it compiles and
-caches every function), then the repetitions, with the configuration order
-rotated by one each repetition.
+caches every function; a failed one ends the invocation), then the
+repetitions, with the configuration order rotated by one each repetition.
 
 **Summary** — the median of the kept runs (gate passed, no error) with the
-min–max spread; dropped runs are listed with the reason.
+min–max spread; dropped runs are listed with the reason. `gemma-bench` exits
+non-zero unless every configuration kept a majority of its runs (2 of 3).
 
 ## Prerequisites
 

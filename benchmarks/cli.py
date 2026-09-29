@@ -58,6 +58,11 @@ def main() -> None:
     )
     out_dir = Path(args.output_dir or f"benchmarks/results/{time.strftime('%Y%m%d-%H%M%S')}")
     records = run_benchmark(config, out_dir)
-    summary = format_summary(summarize(records))
+    rows = summarize(records)
+    summary = format_summary(rows)
     (out_dir / "summary.md").write_text(summary + "\n")
     print("\n" + summary)
+    # A configuration's median needs a majority of its runs kept (2 of 3).
+    short = [r["config_id"] for r in rows if 2 * r["kept"] <= r["runs"]]
+    if short:
+        sys.exit(f"too few kept runs (a majority of {config.runs} needed): {', '.join(short)}")
