@@ -63,4 +63,22 @@ final class HostInputsTests: XCTestCase {
             }
         }
     }
+
+    /// A step crossing the end of a global cache writes the rows that fit and
+    /// no others; the ring wraps them instead.
+    func testAWriteCrossingTheEndOfTheCacheTakesOnlyTheRowsThatFit() throws {
+        let (slots, rows, start) = (8, 4, 6)
+        for wraps in [false, true] {
+            let array = try MLMultiArray(shape: [1, NSNumber(value: slots), NSNumber(value: rows)], dataType: .float16)
+            try HostInputs.fillWrite(array, start: start, wraps: wraps)
+            let got = array.withUnsafeBufferPointer(ofType: Float16.self) { Array($0) }
+            var want = [Float16](repeating: 0, count: slots * rows)
+            for r in 0..<rows {
+                let p = start + r
+                if wraps { want[(p % slots) * rows + r] = 1 } else if p < slots { want[p * rows + r] = 1 }
+            }
+            XCTAssertEqual(got, want, "wraps=\(wraps)")
+            XCTAssertEqual(got.filter { $0 == 1 }.count, wraps ? rows : slots - start)
+        }
+    }
 }

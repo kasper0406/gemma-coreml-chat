@@ -162,10 +162,35 @@ def empty_pos_ring(cfg: Gemma4Config = E2B_CONFIG) -> jnp.ndarray:
     return jnp.full((1, sliding_ring_length(cfg)), -1, dtype=jnp.int32)
 
 
-# The additive attention mask of a slot a query may not see.  Far below any real
-# score (|q.k| stays in the tens), and far from fp16's range limit (65504) even
-# after the score is added to it; exp() of it underflows to exactly 0.
+# The additive attention mask of a slot a query may not see.  It works only
+# while every score stays far above it and it stays finite in fp16 once a score
+# is added.  q and k are RMS-normed, scaled by q_norm / k_norm and rotated
+# (which keeps their norm), with no 1/sqrt(hd), so |q.k| <= hd * max|s_q| *
+# max|s_k| for every input (:func:`attention_score_bound`): 32.4 for E2B
+# (layers 3, 4 and 12).  The largest score measured, over a 1737-token and a
+# 55-token conversation on CPU in fp32, was 22.3 (a sliding layer; 19.9
+# global).  The export refuses weights past SCORE_BOUND.  After softmax's max
+# shift a masked slot is then within MASK_VALUE +- 2 * SCORE_BOUND: finite in
+# fp16 (-65504 minus a score overflows to -inf), and exp() of it is exactly 0
+# even in fp32 (below -104).  Every row sees at least its own slot
+# (:func:`host_inputs`), so no row is ever all mask.
 MASK_VALUE = -10000.0
+SCORE_BOUND = 34.0
+
+
+def attention_score_bound(params, cfg: Gemma4Config = E2B_CONFIG) -> float:
+    """An input-independent bound on any layer's ``|q.k|``: ``hd * max|s_q|
+    * max|s_k|`` (a KV-shared layer's keys are its source layer's), plus 1% for
+    the fp16 rounding of q, k and their norms."""
+    sources = kv_shared_sources(cfg)
+    bound = 0.0
+    for i in range(cfg.num_layers):
+        def scale(layer, norm):
+            sa = params[f'layers.{layer}']['self_attn']
+            return float(np.abs(np.asarray(sa[norm]['scale'], np.float32)).max())
+        hd = cfg.effective_head_dim(cfg.attention_types[i])
+        bound = max(bound, hd * scale(i, 'q_norm') * scale(sources.get(i, i), 'k_norm'))
+    return 1.01 * bound
 
 # Every input the host computes per step, in signature order.  A layer chunk
 # takes the ones its layers need (:func:`chunk_host_inputs`).

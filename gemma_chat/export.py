@@ -133,8 +133,8 @@ from gemma_chat.config import CHUNK_SIZE, HF_MODEL_ID, MAX_SEQ_LEN, VARIANTS
 from gemma_chat.model import Gemma4Transformer, Gemma4Config, AttentionType
 from gemma_chat.weight_mapper import load_params
 from gemma_chat.decode_coreml import (
-    LayerChunk, chunk_host_inputs, decode_chunk, host_input_shape, layer_chunks,
-    logits_head, prefill_chunk,
+    SCORE_BOUND, LayerChunk, attention_score_bound, chunk_host_inputs, decode_chunk,
+    host_input_shape, layer_chunks, logits_head, prefill_chunk,
 )
 from gemma_chat.cache_spec import build_cache_specs, sliding_ring_length
 from gemma_chat import host_embeddings
@@ -593,6 +593,14 @@ def export_phase(
     params = load_params(model_id=model_id, config=config)
     if num_layers is not None and num_layers < full_num_layers:
         _truncate_params(params, num_layers, config.per_layer_input_dim)
+    # The additive attention mask holds only for scores this far from it.
+    bound = attention_score_bound(params, config)
+    print(f"  |attention score| <= {bound:.1f} (the mask allows {SCORE_BOUND})")
+    if bound > SCORE_BOUND:
+        raise ValueError(
+            f"these weights allow attention scores up to {bound:.1f}, past "
+            f"decode_coreml.SCORE_BOUND = {SCORE_BOUND}: check MASK_VALUE's headroom"
+        )
 
     if not skip_warmup:
         from flax import nnx
