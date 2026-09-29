@@ -690,6 +690,19 @@ _ANE_NOTCH_GUARD = 64 << 10   # 4x the widest side of the measured slow band
 # this is margin), and one ANE weight kernel may not pass 128 MiB (this is
 # 48 MiB at K = 1536).
 _HEAD_MAX_ROWS = 32768
+# Rows the head computes apart at the end of every slice (:func:`logits_head`).
+# Measured on head-only models (16 x 16384 int8 per-channel, K = 1536, M = 1;
+# M4 Pro, macOS 27), per call:
+# * GPU: the matmul runs ~3x slower whenever N_out is a multiple of 32 —
+#   6.0-6.4 ms for N_out 16384, 16416, 16448, 16512, 15424 or 32768 against
+#   1.9-2.2 ms for N_out = 16 mod 32 (16400, 16392, 29136, 32784, or 16368 +
+#   16).  (The 9 x 29136 head this one replaced ran in 2.4 ms.)
+# * ANE: a slice's row assembled from two matmuls concatenated along it runs
+#   in 3.26 ms against 5.59 ms as one matmul — however it is split (16368 +
+#   16, 8192 + 8192, four pieces); 32 one-matmul rows of 8192 are 5.59 ms too.
+# 16 rows off a slice of 16384 leave 16368 = 16 mod 32, so both matmuls are
+# on the GPU's fast side, and the output layout does not change.
+_HEAD_TAIL_ROWS = 16
 
 
 def ane_core_payload(rows: int, cols: int, bytes_per_weight: int = 1) -> int:
@@ -727,9 +740,12 @@ def logits_head(params, hidden):
     ``(slices, rows)``, which read row-major are the ``vocab`` logits in order.
 
     Its own function in the export, shared by decode and prefill (the host
-    picks the prefill row it needs).  One fp16 matmul per vocab slice
-    (:func:`head_slices`), stacked — nothing else, so the whole head runs on
-    the Neural Engine.  The logits are *raw*: the host applies the final
+    picks the prefill row it needs).  Each vocab slice (:func:`head_slices`)
+    is two fp16 matmuls — all its rows but the last ``_HEAD_TAIL_ROWS``, then
+    those — joined along the row, and the rows are stacked: nothing else, so
+    the whole head runs on the Neural Engine.  The two-matmul row is what
+    keeps the GPU off its slow kernel and is faster on the Neural Engine too
+    (see ``_HEAD_TAIL_ROWS``).  The logits are *raw*: the host applies the final
     softcap, ``cap * tanh(x / cap)``, in fp32 when it samples (GemmaCore's
     ``Sampling``; greedy skips it, the softcap being monotone).  In the graph
     it would have to be fp16 — the Neural Engine has no fp32, and an fp32
@@ -745,10 +761,12 @@ def logits_head(params, hidden):
     # numpy slices at trace time: each becomes a [dim, rows] graph constant.
     table = np.asarray(params['embed_tokens'])
     h = hidden[0]                                              # (1, D)
-    logits = jnp.concatenate([
-        jnp.dot(h, table[a:b].T) for a, b in head_slices(*table.shape)
-    ])                                                         # (slices, rows)
-    return logits
+
+    def row(a, b):                                             # (1, b - a)
+        c = b - _HEAD_TAIL_ROWS
+        return jnp.concatenate([jnp.dot(h, table[a:c].T), jnp.dot(h, table[c:b].T)], axis=-1)
+
+    return jnp.concatenate([row(a, b) for a, b in head_slices(*table.shape)])  # (slices, rows)
 
 
 def decode_step(params, token_embed, ple_rows, position, kv_flat, sliding_pos_ring,

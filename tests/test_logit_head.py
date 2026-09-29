@@ -1,4 +1,5 @@
-"""The logit head: int8, one scale per vocab row, in equal slices the ANE streams fast.
+"""The logit head: int8, one scale per vocab row, in equal slices the ANE streams fast,
+each two matmuls the GPU runs fast.
 
 ``head`` is the only function whose weights are int8 (int4 is too lossy for
 logits) and it has to run on the Neural Engine under ``cpu-and-ne``, which
@@ -16,7 +17,9 @@ import numpy as np
 import pytest
 
 from gemma_chat.config import E2B_CONFIG
-from gemma_chat.decode_coreml import ane_core_payload, head_slices, in_ane_notch, logits_head
+from gemma_chat.decode_coreml import (
+    _HEAD_TAIL_ROWS, ane_core_payload, head_slices, in_ane_notch, logits_head,
+)
 
 MIB = 1 << 20
 
@@ -47,6 +50,10 @@ def test_the_e2b_head_is_sixteen_equal_slices_clear_of_the_notch():
         assert b - a == 16384
         payload = ane_core_payload(b - a, dim)
         assert not in_ane_notch(payload), (a, b, payload / MIB)
+    # Each slice's two matmuls: neither output width a multiple of 32, which
+    # the GPU runs ~3x slower (decode_coreml._HEAD_TAIL_ROWS).
+    for rows in (16384 - _HEAD_TAIL_ROWS, _HEAD_TAIL_ROWS):
+        assert rows % 32 == 16
 
 
 def test_a_small_vocab_is_one_slice():
@@ -82,7 +89,9 @@ def _convert_head(params, cfg):
 def test_the_head_exports_as_int8_per_channel_slices():
     import dataclasses
 
-    cfg = dataclasses.replace(E2B_CONFIG, num_embed=65536, embed_dim=64)
+    # 256 wide, so each slice's 16-row tail (4096 weights) is past the size
+    # the exporter quantizes from, as E2B's (16 x 1536) is.
+    cfg = dataclasses.replace(E2B_CONFIG, num_embed=65536, embed_dim=256)
     rng = np.random.default_rng(0)
     table = (rng.standard_normal((cfg.num_embed, cfg.embed_dim)) * 0.05).astype(np.float16)
     table[7] *= np.float16(20)  # a row whose scale is far from the others
@@ -92,8 +101,9 @@ def test_the_head_exports_as_int8_per_channel_slices():
 
     prog, model = _convert_head(params, cfg)
     matmuls = [op for op in prog.functions["main"].operations if op.op_type == "matmul"]
-    assert len(matmuls) == len(slices)
-    for op, (a, b) in zip(matmuls, slices):
+    pieces = [p for a, b in slices for p in ((a, b - _HEAD_TAIL_ROWS), (b - _HEAD_TAIL_ROWS, b))]
+    assert len(matmuls) == len(pieces)
+    for op, (a, b) in zip(matmuls, pieces):
         w = op.y.op
         assert w.op_type == "constexpr_blockwise_shift_scale"
         data, scale = w.inputs["data"].val, w.inputs["scale"].val
