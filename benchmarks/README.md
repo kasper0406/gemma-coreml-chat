@@ -61,12 +61,30 @@ Idle power is the mean of the two idle windows; *above idle* subtracts it
 over the phase's duration. Reported per token: ms/token, mJ/token (total and
 above idle) and the mean W of each rail.
 
-**Quiet-machine gate** — before every run: on AC power, not in Low Power Mode,
-and the other processes' CPU (one-second `top` sample) below 15% of one core,
-not counting the exempt daemons (`EXEMPT_PROCESSES`, e.g. `suggestd`) — which
-are logged, as is every busy process. Otherwise the runner pauses 15 s and
-retries, and gives the run up after 15 minutes. The gate records land in
-`results.json`. The runner refuses to start at all on battery.
+**Quiet machine** — CPU use of every process outside the harness's own tree
+(one-second `top` samples of all processes; nothing is exempt, busy processes
+are logged). After priming, a calibration takes 60 samples of the idle
+background and records the display/session state (display on, screen locked)
+it saw; its median *m* and robust spread *σ* (1.4826·MAD, at least 1 point of
+a core) set the limits: a sample above *m* + 4σ is a spike, a mean above
+*m* + 2σ is drift. Before every run the gate wants AC power, no Low Power
+Mode, the calibrated display/session state and three samples within the
+limits; otherwise it pauses 15 s and retries, and gives the run up after 15
+minutes. During every run a monitor keeps sampling: a run whose span from the
+start of `idle_pre` to the end of `idle_post` saw a spike, drift, or more than
+2 s unsampled is not kept. A `top` or `ps` failure, or output that does not
+parse, fails the gate or the run. The calibration and every gate record land
+in `results.json`. The runner refuses to start at all on battery.
+
+**Anchor** — a run is not kept if its power samples' stamps admit no common
+start (a dropped sample or a clock step), a `powermetrics` document was
+malformed, or the anchor is wider than 1% of the run's shortest window (the
+midpoint estimate then moves a boundary by at most 0.5% of any window).
+
+**Configurations** — each gets an id, `c<index>-<package stem>-<units>-<ctx>`,
+which names its raw-sample files and its summary row; the summary lists
+which package path each id ran, so two packages with the same file name stay
+apart.
 
 **Order** — one unmeasured priming run per configuration (it compiles and
 caches every function), then the repetitions, with the configuration order

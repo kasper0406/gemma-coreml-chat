@@ -14,7 +14,10 @@ end in wall-clock time, truncated to the second (measured: it always equals
 ``floor`` of the moment the sample is emitted), so ``T0`` lies in
 ``[ts_k - S_k, ts_k + 1 - S_k)`` for every ``k``.  Intersecting those intervals
 over a run of tens of seconds anchors ``T0`` to a few milliseconds
-(:func:`anchor`); the width is recorded with every run.
+(:func:`anchor`); the width is recorded with every run.  An empty
+intersection (stamps that contradict each other: a dropped or malformed
+sample, a clock step) raises, and so does a malformed document in the stream:
+the tiling is only as good as its every sample.
 
 These are the CPU, GPU and ANE rails only — not DRAM, display or the rest of
 the machine — and should be labelled as such.
@@ -53,9 +56,15 @@ class PowerTrace:
     """All samples of one monitoring session, plus their reconstructed windows."""
 
     samples: list[PowerSample] = field(default_factory=list)
+    malformed: int = 0      # plist documents that did not parse into a sample
 
     def windows(self) -> tuple[list[tuple[float, float]], dict]:
-        """Wall-clock ``(start, end)`` of every sample, and the anchor record."""
+        """Wall-clock ``(start, end)`` of every sample, and the anchor record.
+
+        Raises ``ValueError`` if a document in the stream was malformed or the
+        stamps admit no common start (:func:`anchor`)."""
+        if self.malformed:
+            raise ValueError(f"{self.malformed} malformed powermetrics document(s)")
         t0, lo, hi = anchor(self.samples)
         out, t = [], t0
         for s in self.samples:
@@ -65,7 +74,7 @@ class PowerTrace:
         late = [s.arrival - w[1] for s, w in zip(self.samples, out) if s.arrival]
         info = {
             "t0": t0,
-            "anchor_width_s": hi - lo,  # negative: the stamps disagree by that much
+            "anchor_width_s": hi - lo,
             # How long after its reconstructed end each sample reached us.
             "arrival_lag_s": [min(late), max(late)] if late else None,
         }
@@ -90,12 +99,14 @@ class PowerTrace:
         return e
 
     def to_dict(self) -> dict:
-        return {"samples": [asdict(s) for s in self.samples]}
+        return {"malformed": self.malformed, "samples": [asdict(s) for s in self.samples]}
 
 
 def anchor(samples: list[PowerSample]) -> tuple[float, float, float]:
     """``(T0, lo, hi)``: the wall-clock start of the first sample, and the
-    interval every sample's whole-second stamp confines it to."""
+    interval every sample's whole-second stamp confines it to.  Raises
+    ``ValueError`` when that interval is empty — the stamps contradict the
+    tiling, and no start is right."""
     if not samples:
         raise ValueError("no power samples")
     lo, hi, s_k = -float("inf"), float("inf"), 0.0
@@ -103,6 +114,8 @@ def anchor(samples: list[PowerSample]) -> tuple[float, float, float]:
         s_k += s.elapsed_ns / 1e9
         lo = max(lo, s.timestamp - s_k)
         hi = min(hi, s.timestamp + 1.0 - s_k)
+    if hi <= lo:
+        raise ValueError(f"sample stamps disagree by {lo - hi:.3f} s: no common start")
     return (lo + hi) / 2, lo, hi
 
 
@@ -110,7 +123,9 @@ _PLIST_START = b"<?xml"
 _PLIST_END = b"</plist>"
 
 
-def _parse_power_plist(data: bytes, arrival: float = 0.0) -> tuple[list[PowerSample], bytes]:
+def _parse_power_plist(
+    data: bytes, arrival: float = 0.0,
+) -> tuple[list[PowerSample], bytes, int]:
     """Parse a ``powermetrics -f plist`` byte stream into PowerSamples.
 
     ``powermetrics`` emits one XML plist per sample, separated by a NUL byte
@@ -122,8 +137,13 @@ def _parse_power_plist(data: bytes, arrival: float = 0.0) -> tuple[list[PowerSam
     streaming caller must keep that remainder and prepend it to its next read —
     a single sample is larger than a 4 KiB read, so dropping the remainder
     loses roughly every second sample.
+
+    The third value counts documents that did not make a sample — unparseable,
+    or without a timestamp or a positive ``elapsed_ns``.  Text that is not a
+    document at all (a warning line) is not counted.
     """
     samples: list[PowerSample] = []
+    malformed = 0
     pos = 0
     while (end := data.find(_PLIST_END, pos)) >= 0:
         end += len(_PLIST_END)
@@ -135,6 +155,7 @@ def _parse_power_plist(data: bytes, arrival: float = 0.0) -> tuple[list[PowerSam
         try:
             d = plistlib.loads(doc[start:])
         except Exception:
+            malformed += 1
             continue
 
         # Every power field lives under "processor"; the top-level "gpu" dict
@@ -144,9 +165,13 @@ def _parse_power_plist(data: bytes, arrival: float = 0.0) -> tuple[list[PowerSam
         if isinstance(stamp, _dt.datetime):
             # plistlib returns naive UTC datetimes.
             stamp = stamp.replace(tzinfo=_dt.timezone.utc).timestamp()
+        elapsed = d.get("elapsed_ns")
+        if not isinstance(stamp, (int, float)) or not isinstance(elapsed, int) or elapsed <= 0:
+            malformed += 1
+            continue
         samples.append(PowerSample(
-            timestamp=float(stamp or 0.0),
-            elapsed_ns=int(d.get("elapsed_ns", 0)),
+            timestamp=float(stamp),
+            elapsed_ns=elapsed,
             cpu_mw=float(proc.get("cpu_power", 0.0) or 0.0),
             gpu_mw=float(proc.get("gpu_power", 0.0) or 0.0),
             ane_mw=float(proc.get("ane_power", 0.0) or 0.0),
@@ -154,7 +179,7 @@ def _parse_power_plist(data: bytes, arrival: float = 0.0) -> tuple[list[PowerSam
         ))
     # Drop the separator (newline + NUL) so a caller's buffer is left empty
     # when the stream ends on a document boundary.
-    return samples, data[pos:].lstrip(b"\x00 \t\r\n")
+    return samples, data[pos:].lstrip(b"\x00 \t\r\n"), malformed
 
 
 class PowerMonitor:
@@ -190,8 +215,9 @@ class PowerMonitor:
         read = getattr(stdout, "read1", stdout.read)
         while chunk := read(4096):
             buf += chunk
-            samples, buf = _parse_power_plist(buf, arrival=time.time())
+            samples, buf, malformed = _parse_power_plist(buf, arrival=time.time())
             self.trace.samples.extend(samples)
+            self.trace.malformed += malformed
 
     def stop(self) -> None:
         proc = self._proc

@@ -92,7 +92,7 @@ def test_fixture_matches_real_stream_layout():
 
 def test_parses_every_nul_separated_sample():
     """All three samples parse — the NUL must not kill samples 1..n-1."""
-    samples, remainder = _parse_power_plist(_stream(SAMPLES))
+    samples, remainder, malformed = _parse_power_plist(_stream(SAMPLES))
 
     assert len(samples) == len(SAMPLES), \
         f"expected {len(SAMPLES)} samples, got {len(samples)}"
@@ -103,7 +103,7 @@ def test_parses_every_nul_separated_sample():
 
 def test_gpu_power_read_from_processor():
     """GPU power comes from processor.gpu_power, not the top-level gpu dict."""
-    samples, _ = _parse_power_plist(_stream(SAMPLES))
+    samples, _, _ = _parse_power_plist(_stream(SAMPLES))
 
     assert [s.gpu_mw for s in samples] == [p[1] for p in POWERS]
     assert all(s.gpu_mw > 0 for s in samples), "gpu power must not be 0"
@@ -113,7 +113,7 @@ def test_gpu_power_read_from_processor():
 
 def test_timestamp_parsed_as_utc_seconds():
     """plistlib hands back naive UTC datetimes; the sample keeps epoch seconds."""
-    samples, _ = _parse_power_plist(_stream(SAMPLES))
+    samples, _, _ = _parse_power_plist(_stream(SAMPLES))
     expected = datetime.datetime(2026, 9, 29, 7, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
     assert all(s.timestamp == expected for s in samples)
     assert all(s.elapsed_ns == 200_000_000 for s in samples)
@@ -136,6 +136,40 @@ def test_anchor_recovers_start_from_whole_second_stamps():
     assert lo <= t0 < hi
     assert hi - lo < 0.01
     assert abs(t - t0) < 0.005
+
+
+def test_anchor_rejects_contradictory_stamps():
+    """A stamp one second off (a dropped sample, a clock step) leaves no
+    common start: that is an error, not the midpoint of an empty interval."""
+    samples = _tiled(1_000.4567, [117_000_000] * 100, [1.0] * 100)
+    samples[50].timestamp += 1.0
+    with pytest.raises(ValueError, match="disagree"):
+        anchor(samples)
+    with pytest.raises(ValueError):
+        PowerTrace(samples).windows()
+
+
+def test_anchor_width_is_recorded():
+    """Samples of whole seconds pin nothing below a second: the width says so."""
+    trace = PowerTrace(_tiled(10.25, [1_000_000_000] * 5, [1.0] * 5))
+    _, info = trace.windows()
+    assert info["anchor_width_s"] == pytest.approx(1.0)
+
+
+def test_malformed_documents_are_counted_and_fail_the_trace():
+    """A document that does not parse, or lacks a stamp or an interval, is
+    counted; a trace holding one refuses to reconstruct its windows."""
+    broken = plistlib.dumps(SAMPLES[0]).replace(b"<dict>", b"<dict><bogus>", 1)
+    no_interval = dict(SAMPLES[1], elapsed_ns=0)
+    data = b"\x00".join([plistlib.dumps(SAMPLES[0]), broken, plistlib.dumps(no_interval)])
+    samples, remainder, malformed = _parse_power_plist(data)
+    assert len(samples) == 1 and malformed == 2 and remainder == b""
+
+    pm = PowerMonitor()
+    pm._reader(io.BytesIO(data))
+    assert pm.trace.malformed == 2
+    with pytest.raises(ValueError, match="malformed"):
+        pm.trace.windows()
 
 
 def test_energy_is_power_times_overlap():
@@ -161,11 +195,11 @@ def test_incomplete_tail_is_returned_not_dropped():
     """A document cut mid-stream comes back as the remainder, intact."""
     data = _stream(SAMPLES)
     cut = data.rindex(b"</plist>") - 100  # chop the last sample in half
-    samples, remainder = _parse_power_plist(data[:cut])
+    samples, remainder, malformed = _parse_power_plist(data[:cut])
 
     assert len(samples) == len(SAMPLES) - 1
     # Feeding the remainder plus the rest recovers the missing sample.
-    rest, tail = _parse_power_plist(remainder + data[cut:])
+    rest, tail, _ = _parse_power_plist(remainder + data[cut:])
     assert len(rest) == 1
     assert rest[0].gpu_mw == POWERS[-1][1]
     assert tail == b""
@@ -179,7 +213,7 @@ def test_chunked_reads_lose_nothing():
     collected = []
     for off in range(0, len(data), READ_SIZE):
         buf += data[off:off + READ_SIZE]
-        parsed, buf = _parse_power_plist(buf)
+        parsed, buf, _ = _parse_power_plist(buf)
         collected.extend(parsed)
 
     assert len(collected) == len(SAMPLES), \
@@ -206,13 +240,14 @@ def test_reader_thread_collects_all_samples():
 def test_junk_and_partial_documents_are_skipped():
     """Non-plist noise around the stream is ignored, not fatal."""
     data = b"powermetrics: unable to get SMC data\n" + _stream(SAMPLES)
-    samples, remainder = _parse_power_plist(data)
+    samples, remainder, malformed = _parse_power_plist(data)
     assert len(samples) == len(SAMPLES)
     assert remainder == b""
+    assert malformed == 0  # a warning line is not a document
 
     # No complete document yet → nothing parsed, everything buffered.
     head = _stream(SAMPLES)[:200]
-    samples, remainder = _parse_power_plist(head)
+    samples, remainder, malformed = _parse_power_plist(head)
     assert samples == []
     assert remainder == head
     print("  ✓ test_junk_and_partial_documents_are_skipped passed")
@@ -234,6 +269,9 @@ if __name__ == "__main__":
     test_gpu_power_read_from_processor()
     test_timestamp_parsed_as_utc_seconds()
     test_anchor_recovers_start_from_whole_second_stamps()
+    test_anchor_rejects_contradictory_stamps()
+    test_anchor_width_is_recorded()
+    test_malformed_documents_are_counted_and_fail_the_trace()
     test_energy_is_power_times_overlap()
     test_energy_rejects_uncovered_window()
     test_incomplete_tail_is_returned_not_dropped()

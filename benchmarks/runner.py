@@ -11,10 +11,18 @@ Method (see benchmarks/README.md for the why):
   with the exact phase window (:mod:`benchmarks.power`).  Idle power is the
   mean of the two idle windows; above-idle energy subtracts it over the
   phase's duration.
-* **Quiet-machine gate** — before every run: on AC power, not in Low Power
-  Mode, and the other processes' CPU below :data:`QUIET_CPU_PERCENT` of one
-  core, with :data:`EXEMPT_PROCESSES` not counted (and logged); otherwise it
-  pauses and retries, and gives the run up after :data:`GATE_TIMEOUT_S`.
+* **Background CPU** — once, after priming: an idle-baseline calibration
+  (:func:`calibrate`) of the CPU use of every process outside the harness's
+  own tree, with the display/session state it was taken in.  Before every
+  run the gate (:func:`quiet_gate`) wants AC power, no Low Power Mode, the
+  same display/session state and quiet samples, and pauses and retries
+  otherwise (giving the run up after :data:`GATE_TIMEOUT_S`); during every
+  run a monitor keeps sampling, and a run whose measured span saw a spike,
+  a drifted mean or an unsampled stretch is not kept.  Nothing is exempt;
+  busy processes are logged.
+* **Anchor** — a run whose power samples have contradictory stamps, a
+  malformed document, or an anchor wider than :data:`ANCHOR_MAX_FRACTION`
+  of its shortest window is not kept.
 * **Order** — one unmeasured priming run per configuration (compiles and
   caches it), then ``runs`` repetitions of every configuration, the
   configuration order rotated by one each repetition.
@@ -33,6 +41,7 @@ import re
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -42,15 +51,49 @@ from benchmarks.power import RAILS, PowerMonitor
 # Path to the Swift bench package under the repo.
 _SWIFT_BENCH_PKG = Path(__file__).resolve().parent / "swift" / "bench"
 
-# Other processes may use at most this much CPU, in percent of one core, summed.
-QUIET_CPU_PERCENT = 15.0
-# Background daemons that are not counted against the gate (but are logged).
-EXEMPT_PROCESSES = ("suggestd",)
+# Background CPU (the processes outside the harness's own tree, in percent of
+# one core, from one-second ``top`` samples) is judged against an idle
+# baseline measured once per invocation: CALIBRATION_SAMPLES samples give its
+# median m and robust spread σ = 1.4826·MAD, floored at SIGMA_FLOOR so a
+# perfectly steady baseline does not reject a one-point wobble.  A sample
+# above m + SPIKE_SIGMAS·σ is a spike; a window whose samples average above
+# m + DRIFT_SIGMAS·σ has drifted.
+CALIBRATION_SAMPLES = 60
+SIGMA_FLOOR = 1.0
+SPIKE_SIGMAS = 4.0
+DRIFT_SIGMAS = 2.0
+# Consecutive samples the gate wants inside the limits before a run starts.
+GATE_SAMPLES = 3
 GATE_RETRY_S = 15
 GATE_TIMEOUT_S = 900
+# While a run is measured, no stretch of it may go unsampled for longer than
+# this.  A sample covers one second, and ``top`` takes ~1.7 s to return one
+# (its first, since-boot pass over every process is the rest), longer on a
+# loaded machine; so about 60% of the span is observed, and nothing can hide
+# in the unobserved part for longer than this.
+MAX_SAMPLE_GAP_S = 2.0
+# The power anchor's uncertainty is its width; the midpoint estimate is off by
+# at most half of it, which moves each window boundary by that much.  Keeping
+# the width under 1% of the shortest measured window bounds the energy error
+# from the anchor at 0.5% of any window (a boundary shift δ changes a window's
+# energy by at most δ·P_max, against P·duration).
+ANCHOR_MAX_FRACTION = 0.01
 
 COMPUTE_UNITS = ("cpu-and-gpu", "cpu-and-ne", "all", "cpu-only")
 PHASES = ("prefill", "decode")
+WINDOWS = ("idle_pre", *PHASES, "idle_post")
+
+
+@dataclass
+class Configuration:
+    """One measured configuration.  ``id`` is unique within an invocation (its
+    index comes first), so two packages with the same file name never share
+    raw-sample files or summary rows."""
+
+    id: str
+    model: str
+    compute_units: str
+    context_length: int
 
 
 @dataclass
@@ -61,13 +104,16 @@ class BenchmarkConfig:
     runs: int = 3
     timeout_s: int = 1800
 
-    def configurations(self) -> list[tuple[str, str, int]]:
-        return [(m, cu, n) for m in self.models for cu in self.compute_units
-                for n in self.context_lengths]
+    def configurations(self) -> list[Configuration]:
+        combos = [(m, cu, n) for m in self.models for cu in self.compute_units
+                  for n in self.context_lengths]
+        return [Configuration(f"c{i:02d}-{Path(m).stem}-{cu}-{n}", m, cu, n)
+                for i, (m, cu, n) in enumerate(combos)]
 
 
 @dataclass
 class RunRecord:
+    config_id: str
     model: str
     compute_units: str
     context_length: int
@@ -76,6 +122,7 @@ class RunRecord:
     kept: bool = False
     error: str | None = None
     gate: dict = field(default_factory=dict)
+    background: dict = field(default_factory=dict)  # CPU samples over the run
     bench: dict = field(default_factory=dict)
     power: dict = field(default_factory=dict)      # anchor diagnostics
     idle_w: dict = field(default_factory=dict)     # per rail, and total
@@ -99,66 +146,219 @@ def power_source() -> dict:
     }
 
 
-def other_processes_cpu(own_pids: set[int]) -> tuple[float, list[dict], list[dict]]:
-    """CPU use of every other process over one second, in percent of a core.
+def session_state() -> dict:
+    """Display power and console session, which change background load (a lit
+    display keeps WindowServer drawing).  Every run must see what the
+    calibration saw; ``None`` where the state could not be read."""
+    fb = subprocess.run(["ioreg", "-r", "-d1", "-w0", "-c", "IOMobileFramebufferShim"],
+                        capture_output=True, text=True).stdout
+    states = [int(v) for v in re.findall(r'"CurrentPowerState"=(\d+)', fb)]
+    users = subprocess.run(["ioreg", "-n", "Root", "-d1", "-w0"],
+                           capture_output=True, text=True).stdout
+    return {
+        "display_on": any(states) if states else None,
+        "screen_locked": "CGSSessionScreenIsLocked" in users if "IOConsoleUsers" in users else None,
+    }
 
-    ``top``'s second sample is the one-second delta (its first is a since-boot
-    average).  Returns the counted total, the counted busy processes and the
-    exempt ones.
-    """
-    out = subprocess.run(
-        ["top", "-l", "2", "-s", "1", "-n", "40", "-o", "cpu", "-stats", "pid,cpu,command"],
-        capture_output=True, text=True,
-    ).stdout
-    second = out.split("PID")[-1].splitlines()[1:]
-    counted, exempt, total = [], [], 0.0
-    for line in second:
-        parts = line.split(None, 2)
-        if len(parts) < 3:
+
+def parse_top(out: str) -> list[tuple[int, float, str]]:
+    """``(pid, cpu, command)`` of every process in the last sample of
+    ``top -l 2 -stats pid,cpu,command`` output (the first sample is a
+    since-boot average).  Raises ``ValueError`` on anything unexpected."""
+    lines = out.splitlines()
+    headers = [i for i, ln in enumerate(lines) if ln.split()[:2] == ["PID", "%CPU"]]
+    if len(headers) < 2:
+        raise ValueError(f"top output has {len(headers)} of 2 samples")
+    rows = []
+    for ln in lines[headers[-1] + 1:]:
+        if not ln.strip():
             continue
+        parts = ln.split(None, 2)
         try:
-            pid, cpu = int(parts[0]), float(parts[1])
-        except ValueError:
-            continue
-        name = parts[2].strip()
-        if pid in own_pids or name.startswith("top") or cpu <= 0.0:
-            continue
-        entry = {"pid": pid, "cpu": cpu, "command": name}
-        if any(name.startswith(e) for e in EXEMPT_PROCESSES):
-            exempt.append(entry)
-            continue
-        counted.append(entry)
-        total += cpu
-    return total, [c for c in counted if c["cpu"] >= 1.0], exempt
+            rows.append((int(parts[0]), float(parts[1]), parts[2].strip() if len(parts) > 2 else ""))
+        except (ValueError, IndexError):
+            raise ValueError(f"unparseable top line {ln!r}") from None
+    if not rows:
+        raise ValueError("top listed no processes")
+    return rows
 
 
-def quiet_gate() -> dict:
-    """Wait until the machine is fit to measure; the record says what was seen."""
-    own = {os.getpid(), os.getppid()}
+def _process_tree(root: int) -> set[int]:
+    """``root`` and every descendant of it."""
+    r = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ps exited {r.returncode}")
+    children: dict[int, list[int]] = {}
+    for ln in r.stdout.splitlines():
+        pid, ppid = map(int, ln.split())
+        children.setdefault(ppid, []).append(pid)
+    tree, todo = set(), [root]
+    while todo:
+        pid = todo.pop()
+        tree.add(pid)
+        todo += children.get(pid, [])
+    return tree
+
+
+def background_cpu() -> dict:
+    """One one-second sample of every process outside the harness's own tree
+    (this process, its parent, and their children: the bench binary,
+    ``powermetrics``, ``top`` itself).  Fails closed: a ``top`` or ``ps``
+    failure or unparseable output raises ``RuntimeError``."""
+    own = _process_tree(os.getpid()) | {os.getppid()}
+    proc = subprocess.Popen(
+        ["top", "-l", "2", "-s", "1", "-o", "cpu", "-stats", "pid,cpu,command"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    out, err = proc.communicate(timeout=30)
+    end = time.time()
+    if proc.returncode != 0:
+        raise RuntimeError(f"top exited {proc.returncode}: {err.strip()[-200:]}")
+    try:
+        rows = parse_top(out)
+    except ValueError as e:
+        raise RuntimeError(f"top: {e}") from None
+    own |= _process_tree(os.getpid()) | {proc.pid}
+    counted = [{"pid": pid, "cpu": cpu, "command": cmd}
+               for pid, cpu, cmd in rows if pid not in own and cpu > 0.0]
+    return {
+        "end": end,
+        "total": round(sum(c["cpu"] for c in counted), 2),
+        # Logged, never exempted: who was busy.
+        "busy": sorted((c for c in counted if c["cpu"] >= 1.0), key=lambda c: -c["cpu"])[:8],
+    }
+
+
+def cpu_limits(totals: list[float]) -> dict:
+    """The baseline's distribution and the limits derived from it."""
+    med = statistics.median(totals)
+    mad = statistics.median(abs(t - med) for t in totals)
+    sigma = max(1.4826 * mad, SIGMA_FLOOR)
+    ordered = sorted(totals)
+    return {
+        "n": len(totals), "median": med, "sigma": sigma,
+        "mean": statistics.fmean(totals), "p95": ordered[int(0.95 * (len(ordered) - 1))],
+        "max": ordered[-1],
+        "spike": med + SPIKE_SIGMAS * sigma, "drift": med + DRIFT_SIGMAS * sigma,
+    }
+
+
+def judge_cpu(samples: list[dict], limits: dict) -> list[str]:
+    """Reasons ``samples`` are not quiet against ``limits`` (empty if they are)."""
+    if not samples:
+        return ["no background CPU samples"]
+    reasons = []
+    spikes = [s for s in samples if s["total"] > limits["spike"]]
+    if spikes:
+        worst = max(spikes, key=lambda s: s["total"])
+        who = ", ".join(f"{b['command']} {b['cpu']:.0f}%" for b in worst["busy"][:4])
+        reasons.append(f"{len(spikes)} background CPU spike(s) up to {worst['total']:.0f}% "
+                       f"> {limits['spike']:.0f}% ({who})")
+    mean = statistics.fmean(s["total"] for s in samples)
+    if mean > limits["drift"]:
+        reasons.append(f"background CPU averaged {mean:.1f}% > {limits['drift']:.1f}%")
+    return reasons
+
+
+def judge_window(samples: list[dict], start: float, end: float, limits: dict) -> list[str]:
+    """Reasons the background was not quiet throughout ``[start, end)``:
+    a stretch longer than :data:`MAX_SAMPLE_GAP_S` with no sample covering it,
+    or the samples overlapping it failing :func:`judge_cpu`."""
+    inside = sorted((s for s in samples if s["end"] - 1.0 < end and s["end"] > start),
+                    key=lambda s: s["end"])
+    covered, gap = start, 0.0
+    for s in inside:
+        gap = max(gap, s["end"] - 1.0 - covered)
+        covered = max(covered, s["end"])
+    gap = max(gap, end - covered)
+    reasons = judge_cpu(inside, limits)
+    if gap > MAX_SAMPLE_GAP_S:
+        reasons.append(f"background CPU unsampled for {gap:.1f} s of the window")
+    return reasons
+
+
+def calibrate() -> dict:
+    """Measure the idle background: the state it was taken in and the
+    distribution of :data:`CALIBRATION_SAMPLES` one-second samples."""
+    state = session_state()
+    print(f"Calibrating the idle background ({CALIBRATION_SAMPLES} × 1 s, {state}) …",
+          flush=True)
+    samples = [background_cpu() for _ in range(CALIBRATION_SAMPLES)]
+    if session_state() != state:
+        raise SystemExit(f"display/session state changed during calibration "
+                         f"({state} → {session_state()}); leave the machine alone")
+    limits = cpu_limits([s["total"] for s in samples])
+    load: dict[str, float] = {}
+    for s in samples:
+        for b in s["busy"]:
+            load[b["command"]] = load.get(b["command"], 0.0) + b["cpu"] / len(samples)
+    print(f"  background CPU median {limits['median']:.1f}% σ {limits['sigma']:.1f} "
+          f"p95 {limits['p95']:.1f} → spike > {limits['spike']:.1f}%, "
+          f"drift > {limits['drift']:.1f}%", flush=True)
+    return {
+        "state": state, "limits": limits, "totals": [s["total"] for s in samples],
+        "mean_busy": dict(sorted(load.items(), key=lambda kv: -kv[1])[:10]),
+    }
+
+
+def quiet_gate(calibration: dict) -> dict:
+    """Wait until the machine is as it was calibrated: AC power, no Low Power
+    Mode, the same display/session state, and :data:`GATE_SAMPLES` background
+    samples within the limits.  The record says what was seen."""
     deadline = time.monotonic() + GATE_TIMEOUT_S
     attempts = 0
     while True:
         attempts += 1
         ps = power_source()
-        total, busy, exempt = other_processes_cpu(own)
+        state = session_state()
         reasons = []
         if ps["source"] != "AC Power":
             reasons.append(f"on {ps['source']}")
         if ps["low_power_mode"]:
             reasons.append("Low Power Mode")
-        if total >= QUIET_CPU_PERCENT:
-            reasons.append(f"other processes at {total:.0f}% CPU")
+        if state != calibration["state"]:
+            reasons.append(f"display/session {state} ≠ calibrated {calibration['state']}")
+        try:
+            samples = [background_cpu() for _ in range(GATE_SAMPLES)]
+            reasons += judge_cpu(samples, calibration["limits"])
+        except RuntimeError as e:
+            samples = []
+            reasons.append(str(e))
         record = {
             "passed": not reasons, "attempts": attempts, "power_source": ps,
-            "other_cpu_percent": round(total, 1), "busy": busy, "exempt": exempt,
-            "reasons": reasons,
+            "session": state, "samples": samples, "reasons": reasons,
         }
         if not reasons or time.monotonic() > deadline:
             return record
-        print(f"    gate: {', '.join(reasons)} — retrying in {GATE_RETRY_S}s "
-              f"({', '.join(f'{b['command']} {b['cpu']:.0f}%' for b in busy[:4])})",
-              flush=True)
+        print(f"    gate: {'; '.join(reasons)} — retrying in {GATE_RETRY_S}s", flush=True)
         time.sleep(GATE_RETRY_S)
+
+
+class BackgroundMonitor:
+    """Takes :func:`background_cpu` samples back to back on a thread for the
+    length of a run.  A failed sample ends the monitoring and is reported, so
+    the window check then finds the gap: the monitor fails closed."""
+
+    def __init__(self) -> None:
+        self.samples: list[dict] = []
+        self.error: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.samples.append(background_cpu())
+            except (RuntimeError, subprocess.TimeoutExpired) as e:
+                self.error = str(e)
+                return
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=60)
 
 
 def _uptime_to_wall_offset() -> float:
@@ -226,28 +426,33 @@ def _phase_metrics(trace, offset: float, start_ns: int, end_ns: int, tokens: int
     }
 
 
-def run_one(exe: Path, config: BenchmarkConfig, model: str, cu: str, n: int,
-            repetition: int, samples_dir: Path) -> RunRecord:
-    rec = RunRecord(model=model, compute_units=cu, context_length=n,
-                    repetition=repetition, started=time.strftime("%FT%T%z"))
-    rec.gate = quiet_gate()
+def run_one(exe: Path, config: BenchmarkConfig, c: Configuration, repetition: int,
+            samples_dir: Path, calibration: dict) -> RunRecord:
+    rec = RunRecord(config_id=c.id, model=c.model, compute_units=c.compute_units,
+                    context_length=c.context_length, repetition=repetition,
+                    started=time.strftime("%FT%T%z"))
+    rec.gate = quiet_gate(calibration)
     if not rec.gate["passed"]:
-        rec.error = "quiet-machine gate: " + ", ".join(rec.gate["reasons"])
+        rec.error = "quiet-machine gate: " + "; ".join(rec.gate["reasons"])
         return rec
 
     offset = _uptime_to_wall_offset()
     pm = PowerMonitor()
+    monitor = BackgroundMonitor()
+    monitor.start()
     pm.start()
     try:
-        rec.bench = _invoke_bench(exe, model, cu, n, config.timeout_s)
+        rec.bench = _invoke_bench(exe, c.model, c.compute_units, c.context_length,
+                                  config.timeout_s)
     except RuntimeError as e:
         rec.error = str(e)
     finally:
         time.sleep(0.3)  # let the sample covering the last window land
         pm.stop()
+        monitor.stop()
+    rec.background = {"samples": monitor.samples, "error": monitor.error}
 
-    name = f"{Path(model).stem}-{cu}-{n}-r{repetition}.json"
-    rec.samples_file = str(samples_dir / name)
+    rec.samples_file = str(samples_dir / f"{c.id}-r{repetition}.json")
     samples_dir.mkdir(parents=True, exist_ok=True)
     Path(rec.samples_file).write_text(json.dumps(
         {"uptime_to_wall_offset_s": offset, **pm.trace.to_dict()}))
@@ -255,12 +460,26 @@ def run_one(exe: Path, config: BenchmarkConfig, model: str, cu: str, n: int,
         return rec
 
     try:
-        _, rec.power = pm.trace.windows()
         b = rec.bench
+        span = {w: (b[w]["start_ns"] / 1e9 + offset, b[w]["end_ns"] / 1e9 + offset)
+                for w in WINDOWS}
+        reasons = judge_window(monitor.samples, span["idle_pre"][0], span["idle_post"][1],
+                               calibration["limits"])
+        if monitor.error:
+            reasons.append(f"background monitor failed: {monitor.error}")
+        if reasons:
+            raise ValueError("background: " + "; ".join(reasons))
+
+        _, rec.power = pm.trace.windows()
+        shortest = min(end - start for start, end in span.values())
+        rec.power["shortest_window_s"] = shortest
+        if rec.power["anchor_width_s"] > ANCHOR_MAX_FRACTION * shortest:
+            raise ValueError(f"anchor width {rec.power['anchor_width_s'] * 1000:.1f} ms exceeds "
+                             f"{ANCHOR_MAX_FRACTION:.0%} of the shortest window "
+                             f"({shortest:.2f} s)")
         idle = {}
         for w in ("idle_pre", "idle_post"):
-            start = b[w]["start_ns"] / 1e9 + offset
-            end = b[w]["end_ns"] / 1e9 + offset
+            start, end = span[w]
             e = pm.trace.energy_mj(start, end)
             idle[w] = {r: e[r] / 1000 / (end - start) for r in RAILS}
         rec.idle_w = {r: (idle["idle_pre"][r] + idle["idle_post"][r]) / 2 for r in RAILS}
@@ -281,8 +500,8 @@ def run_one(exe: Path, config: BenchmarkConfig, model: str, cu: str, n: int,
 
 
 def run_benchmark(config: BenchmarkConfig, out_dir: Path) -> list[RunRecord]:
-    """Prime every configuration, then run the rotated repetitions, rewriting
-    ``out_dir/results.json`` after every run."""
+    """Prime every configuration, calibrate the idle background, then run the
+    rotated repetitions, rewriting ``out_dir/results.json`` after every run."""
     exe = ensure_swift_bench_built()
     configs = config.configurations()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -295,21 +514,21 @@ def run_benchmark(config: BenchmarkConfig, out_dir: Path) -> list[RunRecord]:
                          f"{', Low Power Mode' if ps['low_power_mode'] else ''} — "
                          "connect AC power and turn Low Power Mode off")
 
-    for model, cu, n in configs:
-        print(f"  priming {Path(model).name} {cu} {n} …", flush=True)
+    for c in configs:
+        print(f"  priming {c.id} ({c.model}) …", flush=True)
         try:
-            _invoke_bench(exe, model, cu, n, config.timeout_s)
+            _invoke_bench(exe, c.model, c.compute_units, c.context_length, config.timeout_s)
         except RuntimeError as e:
             print(f"    ✗ priming failed: {e}", flush=True)
 
+    calibration = calibrate()
     records: list[RunRecord] = []
     total = len(configs) * config.runs
     for rep in range(config.runs):
         k = rep % len(configs)
-        for model, cu, n in configs[k:] + configs[:k]:
-            print(f"  [{len(records) + 1}/{total}] rep {rep} {Path(model).name} {cu} {n} …",
-                  flush=True)
-            r = run_one(exe, config, model, cu, n, rep, out_dir / "power")
+        for c in configs[k:] + configs[:k]:
+            print(f"  [{len(records) + 1}/{total}] rep {rep} {c.id} …", flush=True)
+            r = run_one(exe, config, c, rep, out_dir / "power", calibration)
             if r.kept:
                 pf, dc = r.phases["prefill"], r.phases["decode"]
                 print(f"    ✓ prefill {pf['ms_per_token']:.3f} ms/tok {pf['mj_per_token']:.2f} mJ/tok"
@@ -318,19 +537,21 @@ def run_benchmark(config: BenchmarkConfig, out_dir: Path) -> list[RunRecord]:
             else:
                 print(f"    ✗ {r.error}", flush=True)
             records.append(r)
-            save_results(records, results_path, config)
+            save_results(records, results_path, config, calibration)
     return records
 
 
 def summarize(records: list[RunRecord]) -> list[dict]:
     """Per configuration: medians of the kept runs, with min–max spread."""
-    groups: dict[tuple, list[RunRecord]] = {}
+    groups: dict[str, list[RunRecord]] = {}
     for r in records:
-        groups.setdefault((r.model, r.compute_units, r.context_length), []).append(r)
+        groups.setdefault(r.config_id, []).append(r)
     rows = []
-    for (model, cu, n), runs in groups.items():
+    for config_id, runs in groups.items():
         kept = [r for r in runs if r.kept]
-        row = {"model": model, "compute_units": cu, "context_length": n,
+        first = runs[0]
+        row = {"config_id": config_id, "model": first.model,
+               "compute_units": first.compute_units, "context_length": first.context_length,
                "runs": len(runs), "kept": len(kept),
                "dropped": [r.error for r in runs if not r.kept]}
         if kept:
@@ -350,7 +571,8 @@ def summarize(records: list[RunRecord]) -> list[dict]:
 
 
 def format_summary(rows: list[dict]) -> str:
-    """Markdown tables: median [min–max] of the kept runs."""
+    """Markdown tables: median [min–max] of the kept runs, then which package
+    each configuration id ran."""
     def cell(s, fmt):
         return f"{s['median']:{fmt}} [{s['min']:{fmt}}–{s['max']:{fmt}}]"
 
@@ -358,32 +580,36 @@ def format_summary(rows: list[dict]) -> str:
            "Median [min–max] of kept runs."]
     for phase in PHASES:
         out += ["", f"### {phase}", "",
-                "| model | units | ctx | kept | ms/token | mJ/token | mJ/token above idle "
+                "| config | kept | ms/token | mJ/token | mJ/token above idle "
                 "| CPU W | GPU W | ANE W | idle W |",
-                "|---|---|---|---|---|---|---|---|---|---|---|"]
+                "|---|---|---|---|---|---|---|---|---|"]
         for r in rows:
             if phase not in r:
-                out.append(f"| {Path(r['model']).name} | {r['compute_units']} | "
-                           f"{r['context_length']} | 0/{r['runs']} | — | — | — | — | — | — | — |")
+                out.append(f"| {r['config_id']} | 0/{r['runs']} | — | — | — | — | — | — | — |")
                 continue
             p = r[phase]
             out.append(
-                f"| {Path(r['model']).name} | {r['compute_units']} | {r['context_length']} "
-                f"| {r['kept']}/{r['runs']} | {cell(p['ms_per_token'], '.3f')} "
+                f"| {r['config_id']} | {r['kept']}/{r['runs']} | {cell(p['ms_per_token'], '.3f')} "
                 f"| {cell(p['mj_per_token'], '.2f')} | {cell(p['mj_per_token_above_idle'], '.2f')} "
                 f"| {p['w']['cpu']['median']:.2f} | {p['w']['gpu']['median']:.2f} "
                 f"| {p['w']['ane']['median']:.2f} | {r['idle_w']['median']:.2f} |")
+    out += ["", "| config | package | units | ctx |", "|---|---|---|---|"]
+    out += [f"| {r['config_id']} | {r['model']} | {r['compute_units']} | {r['context_length']} |"
+            for r in rows]
     return "\n".join(out)
 
 
-def save_results(records: list[RunRecord], path: Path, config: BenchmarkConfig) -> None:
+def save_results(records: list[RunRecord], path: Path, config: BenchmarkConfig,
+                 calibration: dict) -> None:
     """Write the results JSON atomically (temp file in the same dir + rename)."""
     out = {
         "timestamp": time.strftime("%FT%T%z"),
         "energy_scope": "CPU+GPU+ANE rails (powermetrics), not whole-system energy",
         "hardware": {"node": platform.node(), "machine": platform.machine(),
                      "mac_ver": platform.mac_ver()[0]},
-        "gate": {"quiet_cpu_percent": QUIET_CPU_PERCENT, "exempt": list(EXEMPT_PROCESSES),
+        "gate": {"calibration": calibration, "gate_samples": GATE_SAMPLES,
+                 "max_sample_gap_s": MAX_SAMPLE_GAP_S,
+                 "anchor_max_fraction": ANCHOR_MAX_FRACTION,
                  "retry_s": GATE_RETRY_S, "timeout_s": GATE_TIMEOUT_S},
         "config": asdict(config),
         "summary": summarize(records),
