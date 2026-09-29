@@ -5,7 +5,12 @@
 /// over the vocabulary and orders only as much of it as the nucleus walk
 /// consumes:
 ///
-///   * Probabilities: temperature, max-shift, exp and sum run through
+///   * Softcap: the logits are `head`'s raw output. The final softcap,
+///     `cap * tanh(x / cap)` (``GemmaConfig/finalLogitSoftcap``), runs here in
+///     fp32 — vDSP scale, vvtanhf, vDSP scale folded with the temperature —
+///     not in the fp16 graph. It maps ±inf to ±cap; greedy skips it (it is
+///     monotone).
+///   * Probabilities: softcap, temperature, max-shift, exp and sum run through
 ///     Accelerate on one Float buffer that is reused across calls. fp32 logits
 ///     are scaled straight into it; fp16 logits are converted once into it.
 ///     Normalizing is a single multiply per token, done only for the tokens
@@ -27,7 +32,7 @@
 ///     For this model the first band (within 6 nats of the top token, rarely
 ///     more than a hundred tokens) almost always holds the whole nucleus.
 ///   * Degenerate input: if the exp sum is not finite (1/temperature
-///     overflows, a logit is +inf or NaN, or every logit is -inf), the
+///     overflows or a logit is NaN), the
 ///     distribution is taken as a point mass on the first largest non-NaN
 ///     logit, and that token is returned.
 ///   * Greedy decoding (temperature <= 0) is a vDSP argmax over the logits
@@ -82,6 +87,7 @@ public enum Sampling {
         uniform: Float
     ) -> Int32 {
         scratch.withLock { s in
+            // Greedy deliberately takes the raw logits' argmax: the softcap is monotonic and only ties values for |raw| > ~300 (measured max 47).
             if temperature <= 0 { return s.argmax(logits) }
             s.nucleus(logits, temperature: temperature, topP: topP)
             var accum: Float = 0
@@ -171,16 +177,8 @@ public enum Sampling {
             let p = probs.baseAddress!
             let n = vDSP_Length(count)
 
-            // Temperature, then numerical-stability shift by the max.
-            var invTemp = 1.0 / temperature
-            if logits.dataType == .float32 {
-                logits.withUnsafeBufferPointer(ofType: Float.self) { buf in
-                    vDSP_vsmul(buf.baseAddress!, 1, &invTemp, p, 1, n)
-                }
-            } else {
-                Scratch.convertFloat16(logits, into: p)
-                vDSP_vsmul(p, 1, &invTemp, p, 1, n)
-            }
+            // Softcap and temperature, then numerical-stability shift by the max.
+            Scratch.softcap(logits, temperature: temperature, into: p)
             var maxVal: Float = 0
             vDSP_maxv(p, 1, &maxVal, n)
             var negMax = -maxVal
@@ -193,8 +191,8 @@ public enum Sampling {
             vvexpf(p, p, &count32)
             var sum: Float = 0
             vDSP_sve(p, 1, &sum, n)
-            // Any NaN, +inf logit, all -inf logits or overflowing 1/temperature
-            // ends up as a NaN here (inf - inf, 0 * inf, NaN - max).
+            // A NaN logit or an overflowing 1/temperature ends up as a NaN
+            // here (inf - inf, 0 * inf, NaN - max).
             guard sum.isFinite else { return pointMass(argmax(logits)) }
             let invSum = 1.0 / sum
 
@@ -333,6 +331,27 @@ public enum Sampling {
                 i += 1
             }
             return written
+        }
+
+        /// `cap * tanh(x / cap) / temperature` of every logit into
+        /// `destination`: a scale by 1/cap, vvtanhf, and a scale by
+        /// cap · (1/temperature).
+        static func softcap(_ logits: MLMultiArray, temperature: Float, into destination: UnsafeMutablePointer<Float>) {
+            let n = vDSP_Length(logits.count)
+            let cap = Float(GemmaConfig.finalLogitSoftcap)
+            var invCap = 1 / cap
+            if logits.dataType == .float32 {
+                logits.withUnsafeBufferPointer(ofType: Float.self) { buf in
+                    vDSP_vsmul(buf.baseAddress!, 1, &invCap, destination, 1, n)
+                }
+            } else {
+                convertFloat16(logits, into: destination)
+                vDSP_vsmul(destination, 1, &invCap, destination, 1, n)
+            }
+            var count = Int32(logits.count)
+            vvtanhf(destination, destination, &count)
+            var scale = cap * (1 / temperature)
+            vDSP_vsmul(destination, 1, &scale, destination, 1, n)
         }
 
         /// Materialize fp16 logits as Float32 in `destination`.

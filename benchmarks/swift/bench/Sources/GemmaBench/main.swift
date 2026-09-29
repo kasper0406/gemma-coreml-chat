@@ -1,307 +1,217 @@
-/// Swift benchmark runner for Gemma4-E2B CoreML models.
+/// One measured run of the Gemma model for `benchmarks/runner.py`.
 ///
-/// Links the shared `GemmaCore` library so it exercises the same inference
-/// path as the CLI and iOS app, and benefits from the compiled-model cache
-/// (`.mlmodelc` under $TMPDIR/gemma-bench-cache/).  Python's coremltools
-/// re-compiles on every load, which is why these measurements live in Swift.
+/// Links `GemmaCore` and drives ``CoreMLModel`` directly — the same prefill,
+/// decode and head calls the CLI and iOS app make — with greedy sampling.
+/// Loading, compilation and warm-up happen first and are not measured. Then,
+/// in this order, it runs and timestamps
+///
+///   idle_pre   `idleSeconds` of sleep, the model loaded
+///   prefill    `prefillTokens` prompt tokens: prompts of `contextLength`
+///              tokens (a whole cache), each into a fresh cache, back to back
+///   decode     `decodeTokens` greedy tokens, after a `decodePrompt`-token
+///              prompt, into a cache of `contextLength` rows
+///   idle_post  `idleSeconds` of sleep
+///
+/// with a `settleSeconds` pause after prefill and after decode, so neither
+/// phase's power tail lands in the next window. Every boundary is a
+/// `CLOCK_UPTIME_RAW` timestamp in nanoseconds; the runner maps them onto its
+/// powermetrics samples. Emits one JSON object on stdout.
 ///
 /// Usage:
-///   swift run -c release GemmaBench \
-///     --model ./gemma4-e2b.mlpackage \
-///     --compute-units all \
-///     --context-length 1024 \
-///     --decode-tokens 64 \
-///     --run-index 0
-///
-/// Writes one JSON object per run to stdout.  The orchestrator that invokes
-/// this binary (benchmarks/runner.py) is responsible for looping over the
-/// backend × context-length × run matrix and aggregating the output.
+///   GemmaBench --model <path> --compute-units cpu-and-ne --context-length 512
 
 import CoreML
 import Foundation
 import GemmaCore
 
+// Fixed workload, identical for every configuration.
+let prefillTokens = 4096        // per window: 8 × 512 or 2 × 2048 tokens
+let decodePrompt = 128
+let decodeTokens = 256
+let idleSeconds = 4.0
+let settleSeconds = 1.0
 
-// ── Args ─────────────────────────────────────────────────────────────────
-
-
-struct BenchArgs {
-    var modelPath: String = "./gemma4-e2b.mlpackage"
-    var computeUnitsName: String = "cpu-gpu"
-    var contextLength: Int = 128
-    var decodeTokens: Int = 32
-    var runIndex: Int = 0
-    var warmup: Bool = true                  // do one prefill+decode to prime caches
+struct Args {
+    var modelPath = ""
+    var computeUnits = ""
+    var contextLength = 0
 }
 
+func fail(_ message: String, code: Int32) -> Never {
+    FileHandle.standardError.write(Data("error: \(message)\n".utf8))
+    exit(code)
+}
 
-func parseArgs() -> BenchArgs {
+func parseArgs() -> Args {
     let av = CommandLine.arguments
-    var a = BenchArgs()
+    var a = Args()
     var i = 1
-    while i < av.count {
-        let flag = av[i]
-        let next: String? = (i + 1 < av.count) ? av[i + 1] : nil
-        switch flag {
-        case "--model":            a.modelPath = next!; i += 2
-        case "--compute-units":    a.computeUnitsName = next!; i += 2
-        case "--context-length":   a.contextLength = Int(next!)!; i += 2
-        case "--decode-tokens":    a.decodeTokens = Int(next!)!; i += 2
-        case "--run-index":        a.runIndex = Int(next!)!; i += 2
-        case "--no-warmup":        a.warmup = false; i += 1
-        case "--help", "-h":
-            printUsage()
-            exit(0)
-        default:
-            FileHandle.standardError.write(Data("Unknown flag: \(flag)\n".utf8))
-            printUsage()
-            exit(2)
+    while i + 1 < av.count {
+        switch av[i] {
+        case "--model": a.modelPath = av[i + 1]
+        case "--compute-units": a.computeUnits = av[i + 1]
+        case "--context-length": a.contextLength = Int(av[i + 1]) ?? 0
+        default: fail("unknown flag \(av[i])", code: 2)
         }
+        i += 2
+    }
+    guard i == av.count, !a.modelPath.isEmpty, a.contextLength > 0 else {
+        fail("usage: GemmaBench --model <path> --compute-units <cpu-and-gpu|cpu-and-ne|all|cpu-only> --context-length <N>", code: 2)
     }
     return a
 }
 
-
-func printUsage() {
-    let msg = """
-    Usage: GemmaBench --model <path> [options]
-
-      --model PATH              .mlpackage or .mlmodelc (required)
-      --compute-units UNITS     cpu | cpu-gpu | cpu-ane | all   (default: cpu-gpu)
-      --context-length N        tokens in the fake prompt       (default: 128)
-      --decode-tokens N         decode steps to time            (default: 32)
-      --run-index N             metadata only, echoed back      (default: 0)
-      --no-warmup               skip the priming prefill+decode
-
-    Emits one JSON object on stdout.
-
-    """
-    FileHandle.standardError.write(Data(msg.utf8))
-}
-
-
-func parseComputeUnits(_ s: String) -> MLComputeUnits {
-    switch s.lowercased() {
-    case "cpu":      return .cpuOnly
-    case "cpu-gpu":  return .cpuAndGPU
-    case "cpu-ane", "ane":  return .cpuAndNeuralEngine
-    case "all":      return .all
-    default:
-        FileHandle.standardError.write(Data("Unknown compute unit '\(s)', using cpu-gpu\n".utf8))
-        return .cpuAndGPU
+func computeUnits(_ s: String) -> MLComputeUnits {
+    switch s {
+    case "cpu-only": return .cpuOnly
+    case "cpu-and-gpu": return .cpuAndGPU
+    case "cpu-and-ne": return .cpuAndNeuralEngine
+    case "all": return .all
+    default: fail("unknown compute units '\(s)'", code: 2)
     }
 }
 
+func uptimeNs() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
 
-// ── Utility ──────────────────────────────────────────────────────────────
-
-
-func now() -> Double { CFAbsoluteTimeGetCurrent() }
-
-
-/// Build a synthetic prompt of `length` token IDs.  We use a rolling
-/// sequence seeded by `seed` so different runs touch different KV rows
-/// (defeats any fast-path caching of identical prompts inside CoreML).
-func syntheticPrompt(length: Int, seed: Int) -> [Int32] {
-    var out = [Int32](); out.reserveCapacity(length)
-    // Gemma vocab is 262144; stay in a simple mid range of "safe" IDs.
-    var rng: UInt64 = 0x9E37_79B9_7F4A_7C15 &+ UInt64(bitPattern: Int64(seed))
-    for _ in 0..<length {
+/// A reproducible synthetic prompt; ids stay clear of 0 (padding) and the
+/// special tokens.
+func syntheticPrompt(length: Int, seed: UInt64) -> [Int32] {
+    var rng = 0x9E37_79B9_7F4A_7C15 &+ seed
+    return (0..<length).map { _ in
         rng = rng &* 6364136223846793005 &+ 1442695040888963407
-        // Keep IDs well away from 0 (padding) and special tokens.
-        let id = Int32(1024 + Int(rng >> 48) % 100_000)
-        out.append(id)
+        return Int32(1024 + Int(rng >> 48) % 100_000)
     }
-    return out
 }
 
-
-/// Global KV cache sizes the engine will touch for a run of `promptLen` prompt
-/// tokens generating `newTokens` tokens: the padded-prefill bucket and the
-/// decode-target bucket, both put through the model's own bucketing policy.
-///
-/// The bench pre-loads exactly these before starting a timer. Leaving it to the
-/// background preload instead means a multi-GB `MLModel.load` can land inside
-/// the measured window — and `ensureLoaded` for the decode bucket then races
-/// that preload, so `prefill_time_s` randomly includes a whole model load.
-func requiredCacheSizes(model: CoreMLModel, promptLen: Int, newTokens: Int) -> [Int] {
+/// Prefill `prompt` into `kv` chunk by chunk; returns the last real token's logits.
+func prefill(_ model: CoreMLModel, _ prompt: [Int32], _ kv: KVCacheState) throws -> MLMultiArray {
     let chunk = model.chunkSize
-    let paddedLen = ((promptLen + chunk - 1) / chunk) * chunk
-    let maxSteps = min(newTokens, max(model.effectiveMaxSeqLen - promptLen, 0))
-    let decodeTarget = min(promptLen + maxSteps, model.effectiveMaxSeqLen)
-    let policy = model.cacheSizePolicy
-    return [policy.size(forNeeded: paddedLen), policy.size(forNeeded: decodeTarget)]
+    var logits: MLMultiArray?
+    for start in stride(from: 0, to: prompt.count, by: chunk) {
+        let real = min(chunk, prompt.count - start)
+        let tokens = Array(prompt[start..<start + real]) + [Int32](repeating: 0, count: chunk - real)
+        logits = try autoreleasepool {
+            try model.prefill(tokens: tokens, startPosition: Int32(start), logitsRow: real - 1, kvState: kv)
+        }
+    }
+    return logits!
 }
 
+struct Window: Encodable {
+    let start_ns: UInt64
+    let end_ns: UInt64
+}
+
+struct Phase: Encodable {
+    let tokens: Int
+    let start_ns: UInt64
+    let end_ns: UInt64
+}
 
 struct RunJSON: Encodable {
-    let run_index: Int
-    let context_length: Int
+    let clock = "CLOCK_UPTIME_RAW"
     let compute_units: String
-    let decode_tokens_requested: Int
-    let prefill_time_s: Double
-    let decode_time_s: Double
-    let decode_tokens_generated: Int
-    let prefill_tokens_per_sec: Double
-    let decode_tokens_per_sec: Double
-    let warmup: Bool
+    let context_length: Int
     let load_time_s: Double
-    let total_time_s: Double
+    let idle_pre: Window
+    let prefill: Phase
+    let prefill_prompts: Int
+    let decode: Phase
+    let decode_prompt: Int
+    let idle_post: Window
 }
-
-
-func emitJSON(_ r: RunJSON) {
-    let enc = JSONEncoder()
-    enc.outputFormatting = [.sortedKeys]
-    let data = try! enc.encode(r)
-    FileHandle.standardOutput.write(data)
-    FileHandle.standardOutput.write(Data("\n".utf8))
-}
-
-
-// ── Benchmark ────────────────────────────────────────────────────────────
-
 
 @main
 struct GemmaBenchMain {
     static func main() async {
         let args = parseArgs()
-        let units = parseComputeUnits(args.computeUnitsName)
-        let modelURL = URL(fileURLWithPath: args.modelPath).standardizedFileURL
-
-        guard FileManager.default.fileExists(atPath: modelURL.path) else {
-            FileHandle.standardError.write(Data("error: model not found at \(modelURL.path)\n".utf8))
-            exit(2)
+        let units = computeUnits(args.computeUnits)
+        let n = args.contextLength
+        guard n >= decodePrompt + decodeTokens + 1 else {
+            fail("--context-length must hold \(decodePrompt) + \(decodeTokens) + 1 tokens", code: 2)
         }
 
-        // A bench run's context length is fixed and known up front, so cap the
-        // materialized sizes at the largest cache this run can touch
-        // (prompt + decode + one sampled token, plus warmup slack). Without the
-        // cap every exported size stays resident, which on a 16 GB machine
-        // swaps hard enough to distort the timings we're here to measure.
-        let warmupSlack = args.warmup ? 32 : 0
-        let maxCacheNeeded = args.contextLength + args.decodeTokens + 1 + warmupSlack
-        var maxContext = 64
-        while maxContext < maxCacheNeeded { maxContext *= 2 }
-        maxContext = min(maxContext, GemmaConfig.maxSeqLen)
-
-        // --- Load (compile + load from .mlmodelc cache) ---
-        let loadStart = now()
+        let loadStart = uptimeNs()
         let model: CoreMLModel
         do {
             model = try await CoreMLModel.load(
-                from: modelURL,
+                from: URL(fileURLWithPath: args.modelPath),
                 computeUnits: units,
-                maxContextSize: maxContext,
-                // No background preload: it would run multi-GB MLModel loads
-                // underneath the measured window. We load what we need below,
-                // deterministically, before any timer starts.
+                maxContextSize: n,
+                // Nothing may load underneath a measured window; this run's
+                // one size is loaded (and specialized) right below.
                 backgroundPreload: false
             )
-        } catch {
-            FileHandle.standardError.write(Data("error: load failed: \(error.localizedDescription)\n".utf8))
-            exit(3)
-        }
-
-        // Bring up exactly the sizes this run will touch, so nothing
-        // loads lazily once we are measuring.
-        var neededSizes = Set<Int>()
-        if args.warmup {
-            neededSizes.formUnion(
-                requiredCacheSizes(model: model, promptLen: 16, newTokens: 2)
-            )
-        }
-        neededSizes.formUnion(requiredCacheSizes(
-            model: model, promptLen: args.contextLength, newTokens: args.decodeTokens + 1
-        ))
-        do {
-            for size in neededSizes.sorted() {
-                try await model.ensureLoaded(forGlobalCacheSize: size)
+            guard model.materializedSizes.contains(n) else {
+                fail("the model has no size \(n) (has \(model.materializedSizes))", code: 3)
             }
+            try await model.ensureLoaded(forGlobalCacheSize: n)
         } catch {
-            FileHandle.standardError.write(Data("error: preload failed: \(error.localizedDescription)\n".utf8))
-            exit(3)
+            fail("load failed: \(error.localizedDescription)", code: 3)
         }
-        // Counts the full "model is ready to run" cost, compile + preload.
-        let loadTime = now() - loadStart
+        let loadTime = Double(uptimeNs() - loadStart) / 1e9
 
-        let engine = InferenceEngine(model: model, temperature: 0.0, topP: 1.0)
-
-        // --- Optional warmup: short prefill + 2 decode steps ---
-        if args.warmup {
-            let primer = syntheticPrompt(length: 16, seed: -1)
-            var warmedUp = 0
-            // respectStopTokens: false — the synthetic prompt makes the model
-            // sample a stop token immediately, which would cut the run short.
-            let stream = engine.generate(
-                promptIDs: primer, maxNewTokens: 2, respectStopTokens: false
-            )
-            do {
-                for try await _ in stream { warmedUp += 1 }
-            } catch {
-                FileHandle.standardError.write(Data("error: warmup failed: \(error)\n".utf8))
-                exit(4)
-            }
-            _ = warmedUp
-        }
-
-        // --- Measured run ---
-        let prompt = syntheticPrompt(length: args.contextLength, seed: args.runIndex + 1)
-        let totalStart = now()
-        var firstTokenAt: Double = 0
-        var lastTokenAt: Double = 0
-        var decodeTokensGenerated = 0
-        let stream = engine.generate(
-            promptIDs: prompt,
-            maxNewTokens: args.decodeTokens + 1,       // +1 because engine yields the sample
-                                                       // from prefill logits before any decode.
-            respectStopTokens: false                   // keep decoding through stop tokens so
-                                                       // every cell measures the same step count.
-        )
+        let prompts = max(1, prefillTokens / n)
         do {
-            var first = true
-            for try await _ in stream {
-                if first {
-                    firstTokenAt = now()
-                    first = false
-                } else {
-                    lastTokenAt = now()
-                    decodeTokensGenerated += 1
+            // Warm-up, unmeasured: one prompt chunk and a few decode steps.
+            let scratch = try model.makeEmptyKVState(size: n)
+            var logits = try prefill(model, syntheticPrompt(length: model.chunkSize, seed: 0), scratch)
+            for p in 0..<4 {
+                let t = Sampling.sampleNextToken(logits: logits, temperature: 0)
+                logits = try model.decode(token: t, position: Int32(model.chunkSize + p), kvState: scratch)
+            }
+
+            // Every cache the windows use exists before the first timestamp.
+            let prefillCaches = try (0..<prompts).map { _ in try model.makeEmptyKVState(size: n) }
+            let decodeCache = try model.makeEmptyKVState(size: n)
+            let prefillPrompts = (0..<prompts).map { syntheticPrompt(length: n, seed: UInt64($0 + 1)) }
+            let decodePromptIDs = syntheticPrompt(length: decodePrompt, seed: 1000)
+
+            let idle0 = uptimeNs()
+            try await Task.sleep(for: .seconds(idleSeconds))
+            let idle1 = uptimeNs()
+
+            let p0 = uptimeNs()
+            for (prompt, kv) in zip(prefillPrompts, prefillCaches) {
+                logits = try prefill(model, prompt, kv)
+                _ = Sampling.sampleNextToken(logits: logits, temperature: 0)
+            }
+            let p1 = uptimeNs()
+            try await Task.sleep(for: .seconds(settleSeconds))
+
+            logits = try prefill(model, decodePromptIDs, decodeCache)
+            var token = Sampling.sampleNextToken(logits: logits, temperature: 0)
+            let d0 = uptimeNs()
+            for step in 0..<decodeTokens {
+                logits = try autoreleasepool {
+                    try model.decode(token: token, position: Int32(decodePrompt + step), kvState: decodeCache)
                 }
-                if decodeTokensGenerated >= args.decodeTokens { break }
+                token = Sampling.sampleNextToken(logits: logits, temperature: 0)
             }
+            let d1 = uptimeNs()
+            try await Task.sleep(for: .seconds(settleSeconds))
+
+            let idle2 = uptimeNs()
+            try await Task.sleep(for: .seconds(idleSeconds))
+            let idle3 = uptimeNs()
+
+            let out = RunJSON(
+                compute_units: args.computeUnits,
+                context_length: n,
+                load_time_s: loadTime,
+                idle_pre: Window(start_ns: idle0, end_ns: idle1),
+                prefill: Phase(tokens: prompts * n, start_ns: p0, end_ns: p1),
+                prefill_prompts: prompts,
+                decode: Phase(tokens: decodeTokens, start_ns: d0, end_ns: d1),
+                decode_prompt: decodePrompt,
+                idle_post: Window(start_ns: idle2, end_ns: idle3)
+            )
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.sortedKeys]
+            FileHandle.standardOutput.write(try enc.encode(out))
+            FileHandle.standardOutput.write(Data("\n".utf8))
         } catch {
-            FileHandle.standardError.write(Data("error: generate failed: \(error)\n".utf8))
-            exit(5)
+            fail("run failed: \(error)", code: 5)
         }
-        let totalEnd = now()
-
-        // Guard against degenerate cases where the engine yielded nothing.
-        guard firstTokenAt > 0 else {
-            FileHandle.standardError.write(Data("error: no tokens produced\n".utf8))
-            exit(6)
-        }
-        let prefillTime = firstTokenAt - totalStart
-        let decodeTime = max(lastTokenAt - firstTokenAt, 0.0)
-
-        let prefillTPS = Double(args.contextLength) / max(prefillTime, 1e-9)
-        let decodeTPS = (decodeTokensGenerated > 0)
-            ? Double(decodeTokensGenerated) / max(decodeTime, 1e-9)
-            : 0.0
-
-        emitJSON(RunJSON(
-            run_index: args.runIndex,
-            context_length: args.contextLength,
-            compute_units: args.computeUnitsName,
-            decode_tokens_requested: args.decodeTokens,
-            prefill_time_s: prefillTime,
-            decode_time_s: decodeTime,
-            decode_tokens_generated: decodeTokensGenerated,
-            prefill_tokens_per_sec: prefillTPS,
-            decode_tokens_per_sec: decodeTPS,
-            warmup: args.warmup,
-            load_time_s: loadTime,
-            total_time_s: totalEnd - totalStart
-        ))
     }
 }

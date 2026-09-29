@@ -20,7 +20,7 @@ let package = Package(
         .testTarget(
             name: "GemmaCoreTests",
             dependencies: ["GemmaCore"],
-            resources: [.copy("Fixtures"), .copy("TinyModel.mlpackage")]
+            resources: [.copy("Fixtures"), .copy("TinyModel.mlpackage"), .copy("HostInputs.json")]
         ),
     ]
 )

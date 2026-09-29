@@ -1,4 +1,5 @@
-"""The logit head: int8, one scale per vocab row, in slices the ANE streams fast.
+"""The logit head: int8, one scale per vocab row, in equal slices the ANE streams fast,
+each two matmuls the GPU runs fast.
 
 ``head`` is the only function whose weights are int8 (int4 is too lossy for
 logits) and it has to run on the Neural Engine under ``cpu-and-ne``, which
@@ -16,7 +17,9 @@ import numpy as np
 import pytest
 
 from gemma_chat.config import E2B_CONFIG
-from gemma_chat.decode_coreml import ane_core_payload, head_slices, in_ane_notch, logits_head
+from gemma_chat.decode_coreml import (
+    _HEAD_TAIL_ROWS, ane_core_payload, head_slices, in_ane_notch, logits_head,
+)
 
 MIB = 1 << 20
 
@@ -34,7 +37,7 @@ def test_the_notch_matches_the_measurements(payload_mib, slow):
     assert in_ane_notch(round(payload_mib * MIB)) == slow
 
 
-def test_the_e2b_head_is_nine_slices_clear_of_the_notch():
+def test_the_e2b_head_is_sixteen_equal_slices_clear_of_the_notch():
     vocab, dim = E2B_CONFIG.num_embed, E2B_CONFIG.embed_dim
     slices = head_slices(vocab, dim)
     assert slices[0][0] == 0 and slices[-1][1] == vocab
@@ -42,11 +45,15 @@ def test_the_e2b_head_is_nine_slices_clear_of_the_notch():
     # Eight slices of 32768 rows would be the fewest the row cap allows —
     # and exactly 3 MiB per core.
     assert in_ane_notch(ane_core_payload(vocab // 8, dim))
-    assert len(slices) == 9
+    assert len(slices) == 16
     for a, b in slices:
-        assert b - a <= 32768
+        assert b - a == 16384
         payload = ane_core_payload(b - a, dim)
         assert not in_ane_notch(payload), (a, b, payload / MIB)
+    # Each slice's two matmuls: neither output width a multiple of 32, which
+    # the GPU runs ~3x slower (decode_coreml._HEAD_TAIL_ROWS).
+    for rows in (16384 - _HEAD_TAIL_ROWS, _HEAD_TAIL_ROWS):
+        assert rows % 32 == 16
 
 
 def test_a_small_vocab_is_one_slice():
@@ -62,7 +69,7 @@ def _convert_head(params, cfg):
     from gemma_chat.mil_passes.transpose_matmul_weights import transpose_matmul_weights
 
     spec = jax.ShapeDtypeStruct((1, 1, cfg.embed_dim), jnp.float16)
-    hlo = jax.jit(lambda h: logits_head(params, h, cfg)).trace(spec).lower().compiler_ir("stablehlo")
+    hlo = jax.jit(lambda h: logits_head(params, h)).trace(spec).lower().compiler_ir("stablehlo")
     prog = _hlo_to_mil_streaming(hlo, {}, weight_bits=8)
     prog = ct.convert(
         prog, source="milinternal", minimum_deployment_target=ct.target.iOS18,
@@ -82,7 +89,9 @@ def _convert_head(params, cfg):
 def test_the_head_exports_as_int8_per_channel_slices():
     import dataclasses
 
-    cfg = dataclasses.replace(E2B_CONFIG, num_embed=65536, embed_dim=64)
+    # 256 wide, so each slice's 16-row tail (4096 weights) is past the size
+    # the exporter quantizes from, as E2B's (16 x 1536) is.
+    cfg = dataclasses.replace(E2B_CONFIG, num_embed=65536, embed_dim=256)
     rng = np.random.default_rng(0)
     table = (rng.standard_normal((cfg.num_embed, cfg.embed_dim)) * 0.05).astype(np.float16)
     table[7] *= np.float16(20)  # a row whose scale is far from the others
@@ -92,8 +101,9 @@ def test_the_head_exports_as_int8_per_channel_slices():
 
     prog, model = _convert_head(params, cfg)
     matmuls = [op for op in prog.functions["main"].operations if op.op_type == "matmul"]
-    assert len(matmuls) == len(slices)
-    for op, (a, b) in zip(matmuls, slices):
+    pieces = [p for a, b in slices for p in ((a, b - _HEAD_TAIL_ROWS), (b - _HEAD_TAIL_ROWS, b))]
+    assert len(matmuls) == len(pieces)
+    for op, (a, b) in zip(matmuls, pieces):
         w = op.y.op
         assert w.op_type == "constexpr_blockwise_shift_scale"
         data, scale = w.inputs["data"].val, w.inputs["scale"].val
@@ -104,7 +114,9 @@ def test_the_head_exports_as_int8_per_channel_slices():
         assert op.transpose_y.val
 
     hidden = (rng.standard_normal((1, 1, cfg.embed_dim)) * 2).astype(np.float16)
-    want = np.asarray(logits_head(params, jnp.asarray(hidden), cfg), np.float32)
+    want = np.asarray(logits_head(params, jnp.asarray(hidden)), np.float32)
+    assert want.shape == (len(slices), cfg.num_embed // len(slices))
+    want = want.reshape(-1)
     (name,) = [i.name for i in model.get_spec().description.input]
     (got,) = model.predict({name: hidden}).values()
     got = np.asarray(got, np.float32).reshape(-1)

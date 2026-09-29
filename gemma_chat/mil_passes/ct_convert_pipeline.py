@@ -61,5 +61,11 @@ def build_ct_convert_pass_pipeline() -> ct.PassPipeline:
         # never matched the fusion, and the global sites are kept decomposed
         # for two more Apple defects — see ``materialize._concretize_cache_lengths``.)
         "common::fuse_attention_to_sdpa",
+        # ``scaled_tanh`` has no Neural Engine implementation (macOS 27, M4
+        # Pro: MLComputePlan lists the CPU only, fp16 or not), so fusing a
+        # softcap into it puts that op on the CPU (it did the head's, before
+        # the host took the softcap over).  ``mul -> tanh -> mul`` all run on
+        # the ANE.
+        "common::fuse_logit_softcap",
     ])
     return pipeline

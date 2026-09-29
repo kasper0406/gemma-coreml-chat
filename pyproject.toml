@@ -31,13 +31,12 @@ gemma-export = "gemma_chat.export:main"
 # Materialize a dynamic-shape .mlpackage into a concrete multifunction one
 # (ANE-compatible; one function per power-of-2 cache size):
 gemma-materialize = "gemma_chat.materialize:main"
-# Orchestrates the GemmaBench Swift binary across the backend × context
-# matrix and generates plots (requires Xcode for the Swift build):
+# Measures prefill/decode speed and CPU+GPU+ANE rail energy per token with the
+# GemmaBench Swift binary (requires Xcode for the Swift build):
 gemma-bench = "benchmarks.cli:main"
 
 [dependency-groups]
 dev = [
-    "matplotlib>=3.9",
     "pillow>=12.2.0",
     "pytest>=9.0.3",
 ]

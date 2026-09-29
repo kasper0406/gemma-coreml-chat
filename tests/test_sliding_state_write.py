@@ -1,15 +1,19 @@
-"""The sliding KV caches are CoreML state, so their decode-step write had to be
-reformulated from ``jax.lax.dynamic_update_slice`` to a whole-tensor select
-(a CoreML state update fed by ``slice_update`` does not persist on macOS 26).
+"""The sliding KV caches are CoreML state, so their write had to be
+reformulated from ``jax.lax.dynamic_update_slice`` to a whole-tensor write (a
+CoreML state update fed by ``slice_update`` does not persist on macOS 26): a
+blend with the host's one-hot write selection (``decode_coreml._cache_write``).
 
 These tests are pure JAX / pure Python — no CoreML models are built or loaded.
-They pin down two things:
+They pin down:
 
-1. ``_sliding_ring_write`` is *numerically* the old ``dynamic_update_slice``
-   write, at every position including ring wraparound, and ``decode_step`` as a
-   whole is unchanged by the reformulation.
-2. ``export.py``'s state mapping points at the right traced argument and result
-   indices, which is the part that would silently mis-wire an export.
+1. the ring write is *numerically* the old ``dynamic_update_slice`` write, at
+   every position including ring wraparound, and ``decode_step`` as a whole is
+   unchanged by the reformulation;
+2. the layer chunks compose to the whole model;
+3. ``export.py``'s state mapping points at the right traced argument and result
+   indices, which is the part that would silently mis-wire an export;
+4. the host's masks keep every row's sliding window exact, prefill and decode;
+5. the host's RoPE rows are the reference model's, to one fp16 rounding.
 """
 
 from __future__ import annotations
@@ -24,8 +28,17 @@ import pytest
 from gemma_chat import decode_coreml
 from gemma_chat.cache_spec import build_cache_specs, sliding_ring_length
 from gemma_chat.config import E2B_CONFIG
-from gemma_chat.decode_coreml import _sliding_ring_write, decode_step, empty_pos_ring
+from gemma_chat.decode_coreml import (
+    _cache_write, chunk_host_inputs, decode_step, empty_pos_ring, host_inputs,
+)
 from gemma_chat.model import AttentionType, Gemma4Config, _embed_lookup
+
+
+def _onehot(slots, length):
+    """The host's write selection ``(1, length, len(slots))``: row ``l`` of the
+    step lands in cache row ``slots[l]``."""
+    sel = np.arange(length)[:, None] == np.asarray(slots)[None, :]
+    return jnp.asarray(sel.astype(np.float16)[None])
 
 
 def _dus_ring_write(cache, value, position):
@@ -33,6 +46,17 @@ def _dus_ring_write(cache, value, position):
     return jax.lax.dynamic_update_slice(
         cache, value, (0, position % cache.shape[1], 0, 0)
     )
+
+
+def _dus_cache_write(cache, value, onehot):
+    """``_cache_write`` spelled as the slice updates it replaced, one per row."""
+    sel = np.asarray(onehot)[0]
+    for row in range(sel.shape[1]):
+        for slot in np.nonzero(sel[:, row])[0]:
+            cache = jax.lax.dynamic_update_slice(
+                cache, value[:, row:row + 1], (0, int(slot), 0, 0)
+            )
+    return cache
 
 
 # ── 1. The write itself ────────────────────────────────────────────────────
@@ -53,7 +77,7 @@ def test_ring_write_matches_dynamic_update_slice(window):
             rng.standard_normal((1, 1, nkv, hd)).astype(np.float16)
         )
         pos = jnp.int32(position)
-        got = _sliding_ring_write(cache, value, pos)
+        got = _cache_write(cache, value, _onehot([position % window], window))
         want = _dus_ring_write(cache, value, pos)
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
         assert got.dtype == cache.dtype
@@ -69,7 +93,7 @@ def test_ring_write_only_touches_its_own_slot():
     )
     value = jnp.full((1, 1, nkv, hd), -1.0, dtype=jnp.float16)
 
-    got = np.asarray(_sliding_ring_write(cache, value, jnp.int32(7)))
+    got = np.asarray(_cache_write(cache, value, _onehot([7 % window], window)))
     expected = np.asarray(cache).copy()
     expected[0, 7 % window] = -1.0
     np.testing.assert_array_equal(got, expected)
@@ -160,6 +184,7 @@ def _run_decode(params, cfg, max_seq_len, steps):
     all_logits = []
     for position in range(steps):
         token = jnp.full((1, 1), (position * 7 + 3) % cfg.num_embed, jnp.int32)
+        # decode_step builds the host inputs from the position and the ring.
         token_embed, ple_rows = _host_rows(params, token, cfg)
         logits, kv, ring = decode_step(
             params, token_embed, ple_rows, jnp.int32(position), kv, ring, cfg=cfg,
@@ -177,6 +202,24 @@ def small_ring(monkeypatch):
     return 4
 
 
+def test_chunk_write_matches_dynamic_update_slice():
+    """A prefill chunk wrapping around the ring lands where the slice updates
+    put its rows; slots no row claims keep their contents."""
+    rng = np.random.default_rng(3)
+    R, C, nkv, hd = 12, 4, 1, 2
+    cache = jnp.asarray(rng.standard_normal((1, R, nkv, hd)).astype(np.float16))
+    value = jnp.asarray(rng.standard_normal((1, C, nkv, hd)).astype(np.float16))
+    slots = (10 + np.arange(C)) % R
+    got = _cache_write(cache, value, _onehot(slots, R))
+    np.testing.assert_array_equal(np.asarray(got),
+                                  np.asarray(_dus_cache_write(cache, value, _onehot(slots, R))))
+    # A global row past the end of the cache takes no slot.
+    got = _cache_write(cache, value, _onehot([R - 2, R - 1, R, R + 1], R))
+    want = np.asarray(cache).copy()
+    want[0, R - 2:] = np.asarray(value)[0, :2]
+    np.testing.assert_array_equal(np.asarray(got), want)
+
+
 def test_decode_step_unchanged_by_the_reformulation(monkeypatch, small_ring):
     """Same logits and same caches as the dynamic_update_slice version.
 
@@ -190,7 +233,7 @@ def test_decode_step_unchanged_by_the_reformulation(monkeypatch, small_ring):
 
     new_logits, new_kv, new_ring = _run_decode(params, cfg, max_seq_len, steps)
 
-    monkeypatch.setattr(decode_coreml, "_sliding_ring_write", _dus_ring_write)
+    monkeypatch.setattr(decode_coreml, "_cache_write", _dus_cache_write)
     old_logits, old_kv, old_ring = _run_decode(params, cfg, max_seq_len, steps)
 
     for step, (a, b) in enumerate(zip(new_logits, old_logits)):
@@ -290,7 +333,8 @@ def test_chunk_io_plan_maps_every_argument_and_result():
     is_global = {s: spec.attn_type == AttentionType.GLOBAL for s, spec in enumerate(specs)}
     for k, chunk in enumerate(decode_coreml.layer_chunks(cfg)):
         plan = _chunk_io_plan(cfg, chunk, first=k == 0, tokens=1, N=24)
-        leading = (["hidden"] if k else []) + ["token_embed", "ple_rows", "position"]
+        host = list(chunk_host_inputs(chunk, cfg))
+        leading = (["hidden"] if k else []) + ["token_embed", "ple_rows"] + host
         base = 1 + len(leading)  # N first: every chunk holds a global layer
         assert plan.has_global
         assert plan.input_names[:base] == ["N"] + leading
@@ -309,7 +353,12 @@ def test_chunk_io_plan_maps_every_argument_and_result():
                     assert plan.states[arg].output == written
         state_outputs = {spec.output for spec in plan.states.values()} - {None}
         assert plan.output_names == [r for i, r in enumerate(results) if i not in state_outputs]
-        assert plan.input_names[-1] == "sliding_pos_ring"
+        # The global cache length is dim 3 of the global mask, dim 1 of the
+        # global write selection.
+        if "mask_global" in host:
+            assert plan.flexible["mask_global"] == 3
+        if "write_global" in host:
+            assert plan.flexible["write_global"] == 1
         # Every traced argument is either state or a named input (``N`` is
         # JAX's own, not in ``arg_specs``).
         assert len(plan.arg_specs) + 1 == len(plan.input_names) + len(plan.states)
@@ -368,17 +417,19 @@ class _Runtime:
         self.caches, self.size = fresh, size
         self.grown.append(size)
 
-    def _run(self, step, tokens, start, extra):
+    def _run(self, step, tokens, start):
         cfg, d = self.cfg, self.cfg.per_layer_input_dim
-        count = tokens.shape[1]
-        self.ring = decode_coreml.ring_with_positions(self.ring, start + jnp.arange(count))
+        positions = start + np.arange(tokens.shape[1])
+        self.ring = decode_coreml.ring_with_positions(self.ring, jnp.asarray(positions))
+        host = host_inputs(positions, np.asarray(self.ring), self.size, cfg)
         token_embed, ple_rows = _host_rows(self.params, tokens, cfg)
         hidden = token_embed
         for chunk in decode_coreml.layer_chunks(cfg):
             cols = ple_rows[:, :, chunk.layers.start * d:chunk.layers.stop * d]
             hidden, written = step(
-                self.params, chunk, hidden, token_embed, cols, jnp.int32(start),
-                {s: self.caches[s] for s in chunk.slots}, self.ring, cfg, **extra,
+                self.params, chunk, hidden, token_embed, cols,
+                {n: jnp.asarray(host[n]) for n in chunk_host_inputs(chunk, cfg)},
+                {s: self.caches[s] for s in chunk.slots}, cfg,
             )
             self.caches.update(written)
         return hidden
@@ -391,15 +442,14 @@ class _Runtime:
         padded = jnp.concatenate([ids, jnp.zeros((1, padded_len - n), jnp.int32)], axis=1)
         self.grow_to_fit(padded_len)
         for start in range(offset // C * C, padded_len, C):
-            hidden = self._run(decode_coreml.prefill_chunk, padded[:, start:start + C],
-                               start, {"chunk_size": C})
+            hidden = self._run(decode_coreml.prefill_chunk, padded[:, start:start + C], start)
         real = n - (padded_len - C)
-        return decode_coreml.logits_head(self.params, hidden[:, real - 1:real], self.cfg)
+        return decode_coreml.logits_head(self.params, hidden[:, real - 1:real]).reshape(-1)
 
     def decode(self, token, position):
         self.grow_to_fit(position + 1)
-        hidden = self._run(decode_coreml.decode_chunk, token, position, {})
-        return decode_coreml.logits_head(self.params, hidden, self.cfg)
+        hidden = self._run(decode_coreml.decode_chunk, token, position)
+        return decode_coreml.logits_head(self.params, hidden).reshape(-1)
 
 
 @pytest.mark.parametrize("starts", [(0,), (0, 3, 5)])
@@ -451,6 +501,38 @@ def test_every_row_attends_exactly_its_window(monkeypatch, small_ring, starts, p
     converse(prompt + reply + turn_two, prompt + reply, reply_two)
 
     positions = sorted(got)
-    err = np.abs(np.stack([np.asarray(got[p], np.float32) for p in positions])
-                 - want[positions]).max(axis=-1)
+    # The head's logits are raw; the host soft-caps them, as the model does.
+    cap = cfg.final_logit_softcap
+    raw = np.stack([np.asarray(got[p], np.float32) for p in positions])
+    err = np.abs(cap * np.tanh(raw / cap) - want[positions]).max(axis=-1)
     assert err.max() < 0.1, f"max |logit error| at {positions}: {np.round(err, 3)}"
+
+
+# ── 6. RoPE rows ───────────────────────────────────────────────────────────
+
+
+def test_host_rope_rows_are_the_reference_models():
+    """``host_inputs``' cos | sin rows against ``model._apply_rope``'s own (fp32
+    angles, cos/sin in fp32, cast to fp16), over the whole position range: the
+    host rounds fp64 cos/sin of the same fp32 angle once, so the two agree but
+    for the odd value that sits on an fp16 rounding boundary — at most one fp16
+    step apart, and rarely."""
+    from gemma_chat.decode_coreml import _rope_params
+    from gemma_chat.model import rope_angles
+
+    cfg = E2B_CONFIG
+    positions = np.concatenate([
+        np.arange(4096), np.random.default_rng(0).integers(4096, 65536, 4096),
+    ])
+    host = host_inputs(positions, empty_pos_ring(cfg), 128, cfg)
+    for kind, frac in (("sliding", cfg.rope_fraction_sliding), ("global", cfg.rope_fraction_global)):
+        base, hd, half = _rope_params(cfg, kind)
+        angles = rope_angles(jnp.asarray(positions), base, hd, frac)
+        want = np.concatenate([np.asarray(jnp.cos(angles).astype(jnp.float16)),
+                               np.asarray(jnp.sin(angles).astype(jnp.float16))], axis=-1)
+        got = host[f"rope_{kind}"][0, :, 0, :]
+        assert got.shape == (len(positions), 2 * half)
+        diff = np.abs(got.astype(np.float32) - want.astype(np.float32))
+        step = np.spacing(np.abs(want)).astype(np.float32)
+        assert (diff <= step).all(), f"{kind}: {np.max(diff / step)} fp16 steps apart"
+        assert (diff > 0).mean() < 1e-3, f"{kind}: {(diff > 0).mean():.2e} of the values differ"

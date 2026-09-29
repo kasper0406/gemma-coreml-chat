@@ -1,25 +1,26 @@
-"""The global KV caches are written with a whole-tensor select, not a slice.
+"""The global KV caches are written with a whole-tensor blend, not a slice.
 
 ``jax.lax.dynamic_update_slice`` lowers to a MIL ``slice_update`` whose ``begin``
 is a runtime tensor, and MPSGraph's handler for that reads the index back to the
 CPU mid-encode (``GPURegionRuntime::waitAndReadIntTensorData`` →
 ``waitUntilCompleted``).  Six global caches × one such write per step drained the
-GPU pipeline six times per decode, ~17 ms of the ~79 ms step.  Both write
-helpers in ``gemma_chat.decode_coreml`` therefore build the update out of a mask
-and a select instead — the shape of write the sliding caches already used
-because a Core ML state update fed by ``slice_update`` silently does not persist
-(see ``tests/test_sliding_state_write.py`` and ``mil_passes.global_cache_states``).
+GPU pipeline six times per decode, ~17 ms of the ~79 ms step.  The write
+(``gemma_chat.decode_coreml._cache_write``) therefore blends the host's one-hot
+write selection into the whole cache instead — the shape of write the sliding
+caches also need, because a Core ML state update fed by ``slice_update``
+silently does not persist (see ``tests/test_sliding_state_write.py`` and
+``mil_passes.global_cache_states``).
 
 Three things are pinned down here:
 
-1. the helpers are *numerically* the ``dynamic_update_slice`` they replaced;
-2. the converted graph contains no ``slice_update`` at all — with the old
-   formulation converted alongside as a control, to show the check would catch a
-   regression;
-3. **this test builds, compiles and RUNS a CoreML model**: a select-shaped write
+1. the write is *numerically* the ``dynamic_update_slice`` it replaced;
+2. the converted graph contains no ``slice_update`` (with the old formulation
+   converted alongside as a control, to show the check would catch a
+   regression), and no integer arithmetic;
+3. **this test builds, compiles and RUNS a CoreML model**: the blended write
    still persists through ``coreml_update_state``, and rows written by earlier
    calls are still there for later ones.  That last part is the trap the sliding
-   caches hit, so it is checked on the real ``_chunk_write`` output rather than a
+   caches hit, so it is checked on the real ``_cache_write`` output rather than a
    hand-built stand-in.
 """
 
@@ -34,7 +35,7 @@ import numpy as np
 import pytest
 from stablehlo_coreml.converter import convert as hlo_to_mil
 
-from gemma_chat.decode_coreml import _chunk_write, _row_write
+from gemma_chat.decode_coreml import _cache_write
 from gemma_chat.mil_passes.ct_convert_pipeline import build_ct_convert_pass_pipeline
 from gemma_chat.mil_passes.global_cache_states import global_kv_caches_to_states
 
@@ -42,6 +43,14 @@ LEN = 8        # "materialized" global cache length
 NKV = 1
 HEAD_DIM = 2
 CHUNK = 2      # tokens per prefill chunk
+
+
+def _onehot(slots, length=LEN):
+    """The host's write selection: row ``l`` of the step lands in ``slots[l]``
+    (a slot past the cache selects nothing)."""
+    sel = np.arange(length)[:, None] == np.asarray(slots)[None, :]
+    return sel.astype(np.float16)[None]
+
 
 # ── 1. The writes themselves ───────────────────────────────────────────────
 
@@ -57,7 +66,7 @@ def test_row_write_matches_dynamic_update_slice(length):
             rng.standard_normal((1, 1, NKV, HEAD_DIM)).astype(np.float16)
         )
         pos = jnp.int32(position)
-        got = _row_write(cache, value, pos)
+        got = _cache_write(cache, value, jnp.asarray(_onehot([position], length)))
         want = jax.lax.dynamic_update_slice(cache, value, (0, pos, 0, 0))
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
         assert got.shape == cache.shape and got.dtype == cache.dtype
@@ -74,8 +83,7 @@ def test_chunk_write_matches_dynamic_update_slice(start):
     value = jnp.asarray(
         rng.standard_normal((1, CHUNK, NKV, HEAD_DIM)).astype(np.float16)
     )
-    slots = jnp.arange(CHUNK, dtype=jnp.int32) + start
-    got = _chunk_write(cache, value, slots)
+    got = _cache_write(cache, value, jnp.asarray(_onehot(np.arange(CHUNK) + start)))
     want = jax.lax.dynamic_update_slice(cache, value, (0, jnp.int32(start), 0, 0))
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
@@ -91,9 +99,7 @@ def test_chunk_write_drops_rows_past_the_end():
         1, LEN, NKV, HEAD_DIM
     )
     value = jnp.full((1, CHUNK, NKV, HEAD_DIM), -1.0, jnp.float16)
-    slots = jnp.array([LEN - 1, LEN], jnp.int32)
-
-    got = np.asarray(_chunk_write(cache, value, slots))
+    got = np.asarray(_cache_write(cache, value, jnp.asarray(_onehot([LEN - 1, LEN]))))
     expected = np.asarray(cache).copy()
     expected[0, LEN - 1] = -1.0
     np.testing.assert_array_equal(got, expected)
@@ -127,7 +133,7 @@ def _decode_args():
     return (
         jnp.zeros((1, LEN, NKV, HEAD_DIM), jnp.float16),  # cache
         jnp.zeros((1, 1, NKV, HEAD_DIM), jnp.float16),    # value
-        jnp.zeros((1,), jnp.int32),                       # position
+        jnp.zeros((1, LEN, 1), jnp.float16),              # write selection
     )
 
 
@@ -135,7 +141,15 @@ def _prefill_args():
     return (
         jnp.zeros((1, LEN, NKV, HEAD_DIM), jnp.float16),      # cache
         jnp.zeros((1, CHUNK, NKV, HEAD_DIM), jnp.float16),    # value
-        jnp.zeros((1,), jnp.int32),                           # start_position
+        jnp.zeros((1, LEN, CHUNK), jnp.float16),              # write selection
+    )
+
+
+def _position_args():
+    return (
+        jnp.zeros((1, LEN, NKV, HEAD_DIM), jnp.float16),  # cache
+        jnp.zeros((1, 1, NKV, HEAD_DIM), jnp.float16),    # value
+        jnp.zeros((1,), jnp.int32),                       # position
     )
 
 
@@ -144,16 +158,15 @@ def _entry_sum(cache):
     return jnp.sum(cache.astype(jnp.float32)).reshape(1)
 
 
-def decode_write(cache, value, position):
-    return _entry_sum(cache), _row_write(cache, value, position[0])
+def decode_write(cache, value, write):
+    return _entry_sum(cache), _cache_write(cache, value, write)
 
 
-def prefill_write(k_0, value, start_position):
+def prefill_write(k_0, value, write):
     """``k_0`` is named like an exported cache, which is what
     ``global_kv_caches_to_states`` converts; the second sum reads the updated
     cache after the write, as the attention does, so the write is not a sink."""
-    slots = start_position[0] + jnp.arange(CHUNK, dtype=jnp.int32)
-    updated = _chunk_write(k_0, value, slots)
+    updated = _cache_write(k_0, value, write)
     return _entry_sum(k_0), _entry_sum(updated), updated
 
 
@@ -172,13 +185,14 @@ def slice_update_write(cache, value, position):
 def test_write_leaves_no_slice_update_in_the_graph(fn, args):
     counts = _op_types(_convert(fn, *args))
     assert counts["slice_update"] == 0
-    assert counts["select"] == 1
+    # No position arithmetic: the host computed the selection.
+    assert not {"select", "equal", "range_1d", "fill"} & set(counts)
 
 
 def test_the_old_formulation_would_have_been_caught():
     """Control: ``dynamic_update_slice`` really does produce the op we banned,
     with the runtime ``begin`` that costs the pipeline stall."""
-    prog = _convert(slice_update_write, *_decode_args())
+    prog = _convert(slice_update_write, *_position_args())
     updates = [
         op for op in prog.functions["main"].operations
         if op.op_type == "slice_update"
@@ -212,14 +226,14 @@ def state_model():
     )
 
 
-def test_the_state_is_written_from_the_select(state_model):
+def test_the_state_is_written_from_the_blend(state_model):
     func = state_model._mil_program.functions["main"]
     updates = [op for op in func.operations if op.op_type == "coreml_update_state"]
     assert len(updates) == 1
     add = updates[0].value.op
     assert add.op_type == "add"
     # The zero add is load-bearing; see mil_passes/global_cache_states.
-    assert {add.x.op.op_type, add.y.op.op_type} == {"fill_like", "select"}
+    assert {add.x.op.op_type, add.y.op.op_type} == {"fill_like", "add"}
     assert not any(op.op_type == "slice_update" for op in func.operations)
 
 
@@ -236,7 +250,7 @@ def test_chunk_rows_accumulate_across_predictions(state_model):
         result = state_model.predict(
             {
                 "value": np.full((1, CHUNK, NKV, HEAD_DIM), step + 1, np.float16),
-                "start_position": np.array([step * CHUNK], np.int32),
+                "write": _onehot(step * CHUNK + np.arange(CHUNK)),
             },
             state=state,
         )
@@ -248,7 +262,7 @@ def test_chunk_rows_accumulate_across_predictions(state_model):
     result = state_model.predict(
         {
             "value": np.ones((1, CHUNK, NKV, HEAD_DIM), np.float16),
-            "start_position": np.array([0], np.int32),
+            "write": _onehot(np.arange(CHUNK)),
         },
         state=fresh,
     )
@@ -258,7 +272,7 @@ def test_chunk_rows_accumulate_across_predictions(state_model):
     result = state_model.predict(
         {
             "value": np.zeros((1, CHUNK, NKV, HEAD_DIM), np.float16),
-            "start_position": np.array([3 * CHUNK], np.int32),
+            "write": _onehot(3 * CHUNK + np.arange(CHUNK)),
         },
         state=state,
     )

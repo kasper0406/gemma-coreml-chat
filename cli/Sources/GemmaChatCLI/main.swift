@@ -52,7 +52,7 @@ struct GemmaChatCLI {
         let modelURL = URL(fileURLWithPath: modelPath).standardizedFileURL
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             print("Error: model not found at \(modelPath)")
-            return
+            exit(1)
         }
 
         print("Loading model from \(modelPath) (compute: \(computeUnitsLabel(computeUnits)), max context: \(maxContext))...")
@@ -69,7 +69,7 @@ struct GemmaChatCLI {
             // localizedDescription, not the raw value: the load errors carry
             // the fix ("re-run gemma-export") in their message.
             print("Error loading model: \(error.localizedDescription)")
-            return
+            exit(1)
         }
 
         let loadTime = CFAbsoluteTimeGetCurrent() - loadStart
@@ -104,7 +104,7 @@ struct GemmaChatCLI {
             } catch {
                 print("Error loading tokenizer: \(error)")
                 print("Hint: re-export the model with `uv run gemma-export` to embed the tokenizer.")
-                return
+                exit(1)
             }
         }
 

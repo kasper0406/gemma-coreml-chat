@@ -11,7 +11,8 @@
 ///   final one normed;
 /// - `state_<N>`: declares every KV cache; only used to make the `MLState`;
 ///
-/// plus the size-independent `head` (final hidden `[1, 1, D]` → logits).
+/// plus the size-independent `head` (final hidden `[1, 1, D]` → raw logits;
+/// ``Sampling`` applies the final softcap).
 /// A `--decode-only` export has no `prefill_*` functions.
 ///
 /// **Every** KV cache is CoreML state, and Core ML shares states across the
@@ -19,16 +20,17 @@
 /// serves every chunk of size N (each chunk declares only the caches its
 /// layers touch). The inputs besides the state are the embedding rows
 /// (`token_embed`, and each chunk's columns of `ple_rows` — looked up on the
-/// host, see ``HostEmbeddings``), the position and the int32
-/// `sliding_pos_ring`, which the host keeps up to date itself (see
-/// ``KVCacheState``). The runtime selects the size through
-/// ``KVCacheSizePolicy``, the only place bucketing lives.
+/// host, see ``HostEmbeddings``) and the step's RoPE rows, attention masks and
+/// cache-write selections, which the host computes from the positions and its
+/// sliding ring (see ``HostInputs`` and ``KVCacheState``): no function takes a
+/// position. The runtime selects the size through ``KVCacheSizePolicy``, the
+/// only place bucketing lives.
 ///
 /// State buffer shapes are baked into each size's functions, so an `MLState`
 /// belongs to exactly one size: ``makeEmptyKVState(size:)`` creates it and
 /// ``grownToFit(_:needed:)`` migrates the contents when the conversation
-/// outgrows it. Artifacts from before the layer chunks, the cache states or
-/// the host lookups are rejected at load — re-run `gemma-export`.
+/// outgrows it. Artifacts from before the layer chunks, the cache states, the
+/// host lookups or the host inputs are rejected at load — re-run `gemma-export`.
 ///
 /// Every loaded function is shared: all conversations of a size run the same
 /// chunk functions, and every size runs the same `head`. Core ML's synchronous
@@ -53,8 +55,6 @@ public final class CoreMLModel: @unchecked Sendable {
         static let hiddenOut = "hidden_out"
         static let tokenEmbed = HostEmbeddings.tokenInputName
         static let pleRows = HostEmbeddings.perLayerInputName
-        static let position = "position"
-        static let ring = "sliding_pos_ring"
         static let logits = "logits"
     }
 
@@ -62,8 +62,8 @@ public final class CoreMLModel: @unchecked Sendable {
     struct ChunkIO {
         /// False for chunk 0, whose hidden state is `token_embed` itself.
         let takesHidden: Bool
-        /// Whether the chunk has a sliding-window layer to mask.
-        let takesRing: Bool
+        /// The ``HostInputs`` this chunk takes.
+        let hostInputs: [String]
         /// `[1, L, columns]`: this chunk's slice of the per-layer rows.
         let pleRowsShape: [NSNumber]
     }
@@ -74,6 +74,10 @@ public final class CoreMLModel: @unchecked Sendable {
         /// `[1, L, D]`, the shape of `token_embed` and of every chunk's
         /// hidden state in and out.
         let hiddenShape: [NSNumber]
+        /// Every host input the chunks take, with its shape at the size the
+        /// phase was classified at (``HostInputs/cacheLengthDim(_:)`` says
+        /// which dimension follows the cache size).
+        let hostShapes: [String: [Int]]
         /// Tokens per call (L).
         var tokenLength: Int { hiddenShape[1].intValue }
     }
@@ -90,8 +94,10 @@ public final class CoreMLModel: @unchecked Sendable {
     /// looping decode.
     let prefillIO: PhaseIO
     let headIO: HeadIO
-    /// `sliding_pos_ring`'s shape, `[1, sliding_window]`.
-    let ringShape: [NSNumber]
+    /// Rows of the sliding ring (and of every sliding cache).
+    let ringLength: Int
+    /// RoPE timescales per rope input (``HostInputs/timescales(for:half:)``).
+    private let ropeTimescales: [String: [Float]]
     /// Every KV cache state, as `state_<N>` declares them, sorted for a
     /// deterministic migration order.
     let stateNames: [String]
@@ -166,7 +172,7 @@ public final class CoreMLModel: @unchecked Sendable {
         prefillIO: PhaseIO,
         decodeIO: PhaseIO,
         headIO: HeadIO,
-        ringShape: [NSNumber],
+        ringLength: Int,
         stateNames: [String],
         embeddings: HostEmbeddings,
         head: SerialFunction,
@@ -182,7 +188,14 @@ public final class CoreMLModel: @unchecked Sendable {
         self.prefillIO = prefillIO
         self.decodeIO = decodeIO
         self.headIO = headIO
-        self.ringShape = ringShape
+        self.ringLength = ringLength
+        var timescales: [String: [Float]] = [:]
+        for io in [decodeIO, prefillIO] {
+            for (name, shape) in io.hostShapes where name.hasPrefix("rope_") {
+                timescales[name] = HostInputs.timescales(for: name, half: shape[3] / 2)
+            }
+        }
+        self.ropeTimescales = timescales
         self.stateNames = stateNames
         self.embeddings = embeddings
         self.head = head
@@ -231,13 +244,13 @@ public final class CoreMLModel: @unchecked Sendable {
     /// first for anything but the bootstrap size, which `load` brings up.
     ///
     /// Make a new one per conversation. Reusing one across a reset would leave
-    /// stale K/V that a re-populated `sliding_pos_ring` marks valid again.
+    /// stale K/V that a re-populated sliding ring marks valid again.
     public func makeEmptyKVState(size requested: Int? = nil) throws -> KVCacheState {
         let target = cacheSizePolicy.size(forNeeded: requested ?? materializedSizes[0])
         guard let function = loadedFunction(named: Self.stateFunctionName(size: target)) else {
             throw KVCacheError.functionNotLoaded(size: target)
         }
-        return try KVCacheState(size: target, caches: function.makeState(), ringShape: ringShape)
+        return KVCacheState(size: target, caches: function.makeState(), ringLength: ringLength)
     }
 
     /// Return a cache big enough for `needed` tokens, migrating `kv` into a
@@ -572,12 +585,12 @@ public final class CoreMLModel: @unchecked Sendable {
 
         let stateNames = loaded[stateName]!.model.modelDescription.stateDescriptionsByName.keys.sorted()
         let headIO = try classifyHead(model: head.model)
-        var ringShape: [NSNumber]?
+        var ringLength: Int?
         func classify(_ phase: Phase) throws -> PhaseIO {
             let names = (0..<layerChunkCount).map { chunkFunctionName(phase, chunk: $0, size: bootSize) }
             let io = try classifyPhase(
                 models: chunkModels[phase]!.map(\.model), names: names, stateNames: Set(stateNames),
-                ringShape: &ringShape
+                size: bootSize, ringLength: &ringLength
             )
             guard io.hiddenShape[2] == headIO.inputShape[2] else {
                 throw CoreMLModelError.unexpectedSignature(
@@ -591,10 +604,10 @@ public final class CoreMLModel: @unchecked Sendable {
         // In decode-only mode, prefill metadata is borrowed from decode: the
         // per-token loop in `decodeOnlyPrefill` runs the decode chunks.
         let prefillIO = effectiveDecodeOnly ? decodeIO : try classify(.prefill)
-        guard let ringShape else {
+        guard let ringLength else {
             throw CoreMLModelError.unexpectedSignature(
                 function: chunkFunctionName(.decode, chunk: 0, size: bootSize),
-                detail: "no layer chunk takes `\(Feature.ring)`"
+                detail: "no layer chunk takes `\(HostInputs.maskSliding)`"
             )
         }
         // After the signatures, so an artifact that still takes token ids
@@ -604,13 +617,13 @@ public final class CoreMLModel: @unchecked Sendable {
             try checkEmbeddingShapes(io, against: embeddings)
         }
         let chunkSize = effectiveDecodeOnly ? 1 : prefillIO.tokenLength
-        Log.info("[CoreML] \(layerChunkCount) layer chunks; decode hidden=\(decodeIO.hiddenShape.map(\.intValue)), prefill chunk=\(chunkSize), head logits=\(headIO.logitsShape.map(\.intValue)) dtype=\(headIO.logitsDataType.rawValue), ring=\(ringShape.map(\.intValue)), \(stateNames.count) cache states")
+        Log.info("[CoreML] \(layerChunkCount) layer chunks; decode hidden=\(decodeIO.hiddenShape.map(\.intValue)), prefill chunk=\(chunkSize), head logits=\(headIO.logitsShape.map(\.intValue)) dtype=\(headIO.logitsDataType.rawValue), ring=\(ringLength), \(stateNames.count) cache states")
 
         let instance = CoreMLModel(
             prefillIO: prefillIO,
             decodeIO: decodeIO,
             headIO: headIO,
-            ringShape: ringShape,
+            ringLength: ringLength,
             stateNames: stateNames,
             embeddings: embeddings,
             head: head,
@@ -1090,9 +1103,9 @@ public final class CoreMLModel: @unchecked Sendable {
                     token: token, position: startPosition + Int32(i), kvState: kvState
                 )
                 if i == logitsRow {
-                    // Copy: the decode logits live in a backing that a later
-                    // step overwrites.
-                    row = try PredictionBuffer.extractRow(0, from: logits, what: "decode logits")
+                    // Copy all of them, `(slices, rows)` like head's: the decode
+                    // logits live in a backing that a later step overwrites.
+                    row = try PredictionBuffer.copy(logits, what: "decode logits")
                 }
             }
         }
@@ -1138,8 +1151,8 @@ public final class CoreMLModel: @unchecked Sendable {
         kvState: KVCacheState
     ) throws -> MLMultiArray {
         try embeddings.fill(tokens: tokens, tokenEmbed: step.tokenEmbed, pleRows: step.pleRows)
-        kvState.setPosition(position)
         kvState.markRing(start: position, count: tokens.count)
+        try fillHostInputs(step.host, start: Int(position), ring: kvState.ring)
         for (k, model) in models.enumerated() {
             let result = try model.prediction(
                 from: step.chunkInputs[k], using: kvState.caches, options: step.chunkOptions[k]
@@ -1157,6 +1170,23 @@ public final class CoreMLModel: @unchecked Sendable {
         return step.hidden[models.count - 1]
     }
 
+    /// The step's ``HostInputs`` for positions `start ..< start + L`, from the
+    /// ring after they were marked.
+    private func fillHostInputs(_ host: [String: MLMultiArray], start: Int, ring: [Int32]) throws {
+        for (name, array) in host {
+            switch name {
+            case HostInputs.ropeSliding, HostInputs.ropeGlobal:
+                try HostInputs.fillRope(array, start: start, timescale: ropeTimescales[name]!)
+            case HostInputs.maskSliding:
+                try HostInputs.fillSlidingMask(array, start: start, ring: ring)
+            case HostInputs.maskGlobal:
+                try HostInputs.fillGlobalMask(array, start: start)
+            default:
+                try HostInputs.fillWrite(array, start: start, wraps: name == HostInputs.writeSliding)
+            }
+        }
+    }
+
     /// `head` on `step.headInput`, into the cache's next logits backing.
     private func runHead(_ step: StepScratch, kvState: KVCacheState) throws -> MLMultiArray {
         let (backing, options) = try kvState.nextLogits(headIO)
@@ -1172,22 +1202,24 @@ public final class CoreMLModel: @unchecked Sendable {
 
     // MARK: - I/O Classification
 
-    /// Read one phase's chunk signatures, rejecting artifacts that predate
-    /// stateful KV caches or host-side embedding lookups.
+    /// Read one phase's chunk signatures at cache size `size`, rejecting
+    /// artifacts that predate stateful KV caches, host-side embedding lookups
+    /// or host inputs.
     ///
     /// Each chunk takes `token_embed` and its `ple_rows` columns (fp16
-    /// `[1, L, …]`), the int32 `position`, the int32 `sliding_pos_ring` if it
-    /// has a sliding layer, and — every chunk but the first — the previous
-    /// chunk's `hidden`; it returns `hidden_out`. Anything named
-    /// `k_<n>` / `v_<n>` on the signature means the caches still cross the
-    /// boundary. Every state a chunk declares must be one `state_<N>` declares,
-    /// since the chunks run on the `MLState` made from it.
+    /// `[1, L, …]`), some of the fp16 ``HostInputs`` (see there for their
+    /// shapes), and — every chunk but the first — the previous chunk's
+    /// `hidden`; it returns `hidden_out`. Anything named `k_<n>` / `v_<n>` on
+    /// the signature means the caches still cross the boundary. Every state a
+    /// chunk declares must be one `state_<N>` declares, since the chunks run on
+    /// the `MLState` made from it.
     static func classifyPhase(
         models: [MLModel], names: [String], stateNames: Set<String>,
-        ringShape: inout [NSNumber]?
+        size: Int, ringLength: inout Int?
     ) throws -> PhaseIO {
         var chunks: [ChunkIO] = []
         var hiddenShape: [NSNumber]?
+        var hostShapes: [String: [Int]] = [:]
         for (k, (model, function)) in zip(models, names).enumerated() {
             let description = model.modelDescription
             let inputs = description.inputDescriptionsByName
@@ -1233,33 +1265,62 @@ public final class CoreMLModel: @unchecked Sendable {
             }
             hiddenShape = expected
 
-            let takesRing = inputs[Feature.ring] != nil
-            if let ring = inputs[Feature.ring]?.multiArrayConstraint {
-                guard ring.dataType == .int32, ringShape == nil || ringShape == ring.shape else {
-                    throw CoreMLModelError.unexpectedSignature(
-                        function: function, detail: "`\(Feature.ring)` is not the int32 ring the other chunks take"
-                    )
+            let host = inputs.keys.filter(HostInputs.all.contains).sorted()
+            let known = [Feature.tokenEmbed, Feature.pleRows] + (takesHidden ? [Feature.hidden] : []) + host
+            guard Set(inputs.keys) == Set(known) else {
+                if inputs["position"] != nil {
+                    throw CoreMLModelError.modelPredatesHostInputs(function: function)
                 }
-                ringShape = ring.shape
-            }
-            let known = [Feature.tokenEmbed, Feature.pleRows, Feature.position]
-                + (takesHidden ? [Feature.hidden] : []) + (takesRing ? [Feature.ring] : [])
-            guard Set(inputs.keys) == Set(known),
-                  inputs[Feature.position]?.multiArrayConstraint?.dataType == .int32 else {
                 throw CoreMLModelError.unexpectedSignature(
                     function: function,
-                    detail: "expected inputs \(known.sorted()) with an int32 `\(Feature.position)`, got \(inputs.keys.sorted())"
+                    detail: "expected inputs \(known.sorted()) (plus host inputs from \(HostInputs.all.sorted())), got \(inputs.keys.sorted())"
                 )
             }
-            chunks.append(ChunkIO(takesHidden: takesHidden, takesRing: takesRing, pleRowsShape: pleRows))
+            for name in host {
+                let c = inputs[name]!.multiArrayConstraint
+                let shape = c?.shape.map(\.intValue) ?? []
+                guard c?.dataType == .float16,
+                      let want = hostInputShape(name, shape: shape, tokens: expected[1].intValue, size: size),
+                      shape == want, hostShapes[name].map({ $0 == shape }) ?? true else {
+                    throw CoreMLModelError.unexpectedSignature(
+                        function: function, detail: "`\(name)` is \(shape), not the fp16 host input this runtime builds"
+                    )
+                }
+                hostShapes[name] = shape
+                if name == HostInputs.maskSliding || name == HostInputs.writeSliding {
+                    let rows = name == HostInputs.maskSliding ? shape[3] : shape[1]
+                    guard ringLength == nil || ringLength == rows else {
+                        throw CoreMLModelError.unexpectedSignature(
+                            function: function, detail: "`\(name)` covers \(rows) ring slots, not \(ringLength!)"
+                        )
+                    }
+                    ringLength = rows
+                }
+            }
+            chunks.append(ChunkIO(takesHidden: takesHidden, hostInputs: host, pleRowsShape: pleRows))
         }
         guard let hiddenShape, !chunks.isEmpty else {
             throw CoreMLModelError.unexpectedSignature(function: names.first ?? "?", detail: "no layer chunks")
         }
-        return PhaseIO(chunks: chunks, hiddenShape: hiddenShape)
+        return PhaseIO(chunks: chunks, hiddenShape: hiddenShape, hostShapes: hostShapes)
     }
 
-    /// `head`: fp16 `hidden` `[1, 1, D]` in, float `logits` out.
+    /// The shape host input `name` must have for `tokens` rows at cache size
+    /// `size`, given the one it declares (which fixes the RoPE width and the
+    /// ring length); nil for a malformed one.
+    private static func hostInputShape(_ name: String, shape: [Int], tokens: Int, size: Int) -> [Int]? {
+        guard shape.count == (name.hasPrefix("write_") ? 3 : 4) else { return nil }
+        switch name {
+        case HostInputs.ropeSliding, HostInputs.ropeGlobal:
+            return shape[3] > 0 && shape[3] % 2 == 0 ? [1, tokens, 1, shape[3]] : nil
+        case HostInputs.maskSliding: return shape[3] > 0 ? [1, 1, tokens, shape[3]] : nil
+        case HostInputs.maskGlobal: return [1, 1, tokens, size]
+        case HostInputs.writeSliding: return shape[1] > 0 ? [1, shape[1], tokens] : nil
+        default: return [1, size, tokens]
+        }
+    }
+
+    /// `head`: fp16 `hidden` `[1, 1, D]` in, raw float `logits` out.
     static func classifyHead(model: MLModel) throws -> HeadIO {
         let description = model.modelDescription
         guard let input = description.inputDescriptionsByName[Feature.hidden]?.multiArrayConstraint,
@@ -1380,6 +1441,9 @@ public enum CoreMLModelError: Error, LocalizedError {
     /// The function takes token ids rather than embedding rows, i.e. the
     /// artifact was exported before the lookups moved to the host.
     case modelPredatesHostEmbeddings(function: String, inputs: [String])
+    /// The function takes a position, i.e. the artifact was exported before
+    /// the RoPE rows, masks and cache writes moved to the host.
+    case modelPredatesHostInputs(function: String)
     /// The function's inputs/outputs are not the shape this runtime expects.
     case unexpectedSignature(function: String, detail: String)
     /// `MLModel.load` failed for one function.
@@ -1401,6 +1465,8 @@ public enum CoreMLModelError: Error, LocalizedError {
             "Function '\(function)' passes KV caches through its signature (\(cacheFeatures.isEmpty ? "no state features at all" : cacheFeatures.joined(separator: ", "))) — this model predates global-cache states. Re-run `uv run gemma-export`."
         case .modelPredatesHostEmbeddings(let function, let inputs):
             "Function '\(function)' takes \(inputs.joined(separator: ", ")) instead of the fp16 `token_embed` / `ple_rows` embedding rows — this model predates host-side embedding lookups. Re-run `uv run gemma-export`."
+        case .modelPredatesHostInputs(let function):
+            "Function '\(function)' takes a `position` instead of the host-computed RoPE rows, masks and cache writes — this model predates them. Re-run `uv run gemma-export`."
         case .unexpectedSignature(let function, let detail):
             "Function '\(function)' has an unexpected signature: \(detail)"
         case .functionLoadFailed(let function, let computeUnits, let underlying):

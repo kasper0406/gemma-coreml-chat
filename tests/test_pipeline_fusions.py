@@ -125,8 +125,8 @@ def exact_gelu(x):
 
 
 def logit_softcap(x):
-    """``decode_coreml``'s final logit softcap, cap=30."""
-    cap = jnp.float32(30.0)
+    """``decode_coreml``'s final logit softcap, cap=30, in fp16."""
+    cap = 30.0
     return jnp.tanh(x / cap) * cap
 
 
@@ -219,14 +219,13 @@ def test_tile_feeding_select_is_preserved():
 
 # ── softcap / norm / activation fusion ───────────────────────────────────
 
-def test_logit_softcap_fuses_to_scaled_tanh():
+def test_logit_softcap_stays_mul_tanh_mul():
+    """The pipeline drops ``fuse_logit_softcap``: ``scaled_tanh`` has no Neural
+    Engine implementation, while ``mul -> tanh -> mul`` runs on it."""
     _, prog = _convert(logit_softcap, jnp.ones((1, 8, 256), jnp.float16))
 
-    assert _count(prog, "scaled_tanh") == 1
-    assert _count(prog, "tanh") == 0
-    op = next(op for op in _ops(prog) if op.op_type == "scaled_tanh")
-    assert abs(float(op.inputs["alpha"].val) - 30.0) < 1e-4
-    assert abs(float(op.inputs["beta"].val) - 1.0 / 30.0) < 1e-4
+    assert _count(prog, "scaled_tanh") == 0
+    assert _count(prog, "tanh") == 1
 
 
 def _rmsnorm_const_scale(x):

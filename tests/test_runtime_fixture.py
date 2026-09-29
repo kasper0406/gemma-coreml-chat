@@ -4,14 +4,16 @@
 what only the runtime can get wrong — concurrent conversations sharing one
 set of functions, position validation — without a multi-GB export.  It has
 the signatures ``gemma-export`` produces (``state_<N>``, ``decode_c0_<N>`` and
-``prefill_c0_<N>`` for two sizes, ``head``, an ``Embeddings/`` directory) but
-none of the model: a chunk marks the rows of its positions in a global cache
-state and returns
+``prefill_c0_<N>`` for two sizes taking every host input, ``head``, an
+``Embeddings/`` directory) but none of the model: a chunk marks the rows its
+``write_global`` selects in a global cache state and returns
 
-    hidden_out = token_embed + ple_rows[..., :D] + (rows marked) + (live ring slots)
+    hidden_out = token_embed + ple_rows[..., :D] + (rows marked)
+                 + (a digest of the RoPE rows, the masks and the ring writes)
 
-so every step's output depends on the state, the ring and the inputs, and a
-step that ran on the wrong state or a torn input shows up in the logits.
+so every step's output depends on the state, the ring, the positions and the
+inputs, and a step that ran on the wrong state or a torn input shows up in the
+logits.
 
 The checked-in copy lives at ``GemmaCore/Tests/GemmaCoreTests/TinyModel.mlpackage``;
 regenerate it with ``uv run python tests/test_runtime_fixture.py``.
@@ -42,8 +44,9 @@ FIXTURE = (
 D = 64          # token_embed / hidden width
 PLE = 96        # ple_rows width (one chunk)
 VOCAB = 8
-RING = 6        # sliding_pos_ring length
+RING = 6        # sliding ring length
 HEAD_DIM = 4
+ROPE = (4, 2)   # rope_sliding / rope_global widths (cos | sin)
 CHUNK = 4       # prefill tokens per call
 SIZES = (512, 1024)
 
@@ -53,35 +56,42 @@ def _chunk(tokens: int, size: int):
         input_specs=[
             mb.TensorSpec((1, tokens, D), dtype=types.fp16),
             mb.TensorSpec((1, tokens, PLE), dtype=types.fp16),
-            mb.TensorSpec((1,), dtype=types.int32),
-            mb.TensorSpec((1, RING), dtype=types.int32),
+            mb.TensorSpec((1, tokens, 1, ROPE[0]), dtype=types.fp16),   # rope_sliding
+            mb.TensorSpec((1, tokens, 1, ROPE[1]), dtype=types.fp16),   # rope_global
+            mb.TensorSpec((1, 1, tokens, RING), dtype=types.fp16),      # mask_sliding
+            mb.TensorSpec((1, 1, tokens, size), dtype=types.fp16),      # mask_global
+            mb.TensorSpec((1, RING, tokens), dtype=types.fp16),         # write_sliding
+            mb.TensorSpec((1, size, tokens), dtype=types.fp16),         # write_global
             mb.StateTensorSpec((1, size, 1, HEAD_DIM), dtype=types.fp16),
         ],
         opset_version=ct.target.iOS18,
     )
-    def prog(token_embed, ple_rows, position, sliding_pos_ring, k_1):
+    def prog(token_embed, ple_rows, rope_sliding, rope_global, mask_sliding, mask_global,
+             write_sliding, write_global, k_1):
+        def total(x, scale=1.0):
+            return mb.mul(x=mb.reduce_sum(x=mb.cast(x=x, dtype="fp32"), keep_dims=False),
+                          y=np.float32(scale))
+
         cache = mb.read_state(input=k_1)
-        rows = mb.reshape(
-            x=mb.range_1d(start=np.int32(0), end=np.int32(size), step=np.int32(1)),
-            shape=[1, size, 1, 1],
-        )
-        first = mb.reshape(x=position, shape=[1, 1, 1, 1])
-        mine = mb.logical_and(
-            x=mb.greater_equal(x=rows, y=first),
-            y=mb.less(x=rows, y=mb.add(x=first, y=np.int32(tokens))),
+        taken = mb.reshape(
+            x=mb.reduce_sum(x=write_global, axes=[2], keep_dims=True), shape=[1, size, 1, 1],
         )
         written = mb.coreml_update_state(
-            state=k_1,
-            value=mb.select(cond=mine, a=np.float16(1), b=cache),
+            state=k_1, value=mb.add(x=mb.sub(x=cache, y=mb.mul(x=cache, y=taken)), y=taken),
         )
-        marked = mb.reduce_sum(x=mb.cast(x=written, dtype="fp32"), keep_dims=False)
-        live = mb.reduce_sum(
-            x=mb.cast(x=mb.greater_equal(x=sliding_pos_ring, y=np.int32(0)), dtype="fp32"),
-            keep_dims=False,
-        )
-        bias = mb.cast(x=mb.add(x=mb.real_div(x=marked, y=np.float32(HEAD_DIM)), y=live), dtype="fp16")
+        slots = np.arange(RING, dtype=np.float16).reshape(1, RING, 1)
+        digest = [
+            total(written, 1.0 / HEAD_DIM),                       # rows marked
+            total(mask_sliding, -1e-4), total(mask_global, -1e-4),  # hidden entries
+            total(rope_sliding), total(rope_global),
+            total(mb.mul(x=write_sliding, y=slots), 0.01),         # ring slots written
+        ]
+        bias = digest[0]
+        for d in digest[1:]:
+            bias = mb.add(x=bias, y=d)
         ple = mb.slice_by_index(x=ple_rows, begin=[0, 0, 0], end=[1, tokens, D])
-        return mb.add(x=mb.add(x=token_embed, y=ple), y=bias, name="hidden_out")
+        return mb.add(x=mb.add(x=token_embed, y=ple), y=mb.cast(x=bias, dtype="fp16"),
+                      name="hidden_out")
 
     return prog
 
@@ -109,8 +119,8 @@ def _head():
         opset_version=ct.target.iOS18,
     )
     def prog(hidden):
-        logits = mb.reshape(x=mb.matmul(x=hidden, y=weight), shape=[VOCAB])
-        return mb.cast(x=logits, dtype="fp32", name="logits")
+        # fp16 (slices, rows), as the exported head returns them.
+        return mb.reshape(x=mb.matmul(x=hidden, y=weight), shape=[2, VOCAB // 2], name="logits")
 
     return prog
 
