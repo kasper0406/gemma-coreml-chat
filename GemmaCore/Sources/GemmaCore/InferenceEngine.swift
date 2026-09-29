@@ -241,7 +241,7 @@ public struct InferenceEngine: Sendable {
 
         // A full prefill starts from position 0, so it needs a *fresh* cache:
         // any surviving sliding K/V would be read back as valid once
-        // `sliding_pos_ring` is repopulated.
+        // the sliding ring is repopulated.
         let emptyKV = try model.makeEmptyKVState(size: size)
         let (logits, kv) = try await continuePrefill(ids: ids, fromOffset: 0, kvState: emptyKV)
         guard let logits else {

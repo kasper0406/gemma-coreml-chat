@@ -16,8 +16,8 @@ order), but the exported CoreML model does not: all 15 pairs are CoreML
 during StableHLO→MIL conversion by `export.py`; the global pairs cannot be
 (their dim 1 is symbolic, which state cannot be) and are converted by
 `mil_passes.global_cache_states` once materialization has made every function's
-cache length concrete.  `sliding_pos_ring` stays I/O, because CoreML states
-must be floating point.
+cache length concrete.  Which position each sliding slot holds is the host's
+business (``decode_coreml.host_inputs``); no function takes it.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from gemma_chat.model import AttentionType, Gemma4Config
 
 
 def sliding_ring_length(cfg: Gemma4Config = E2B_CONFIG) -> int:
-    """Rows of an exported sliding cache (and of ``sliding_pos_ring``).
+    """Rows of an exported sliding cache (and of the host's sliding ring).
 
     The window plus one prefill chunk: a chunk is written into the ring before
     its rows attend, and ``CHUNK_SIZE`` spare rows are what keep it from

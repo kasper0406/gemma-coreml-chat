@@ -1,8 +1,9 @@
 /// `CoreMLModel` against `TinyModel.mlpackage`: a package with the exported
 /// function set and signatures but no model (see `tests/test_runtime_fixture.py`,
-/// which writes it). Its chunks mark the global-cache rows of their positions
-/// and fold the count, the live ring slots and the inputs into the hidden
-/// state, so a step on the wrong state or a torn input changes the logits.
+/// which writes it). Its chunks mark the global-cache rows their write
+/// selection picks and fold the count and a digest of every host input into
+/// the hidden state, so a step on the wrong state or a torn input changes the
+/// logits.
 
 import CoreML
 import Foundation
@@ -22,12 +23,10 @@ final class CoreMLModelTests: XCTestCase {
         return model
     }
 
-    private static func ring(_ kv: KVCacheState) -> [Int32] {
-        kv.ring.withUnsafeBufferPointer(ofType: Int32.self) { Array($0) }
-    }
+    private static func ring(_ kv: KVCacheState) -> [Int32] { kv.ring }
 
     private static func floats(_ logits: MLMultiArray) -> [Float] {
-        logits.withUnsafeBufferPointer(ofType: Float.self) { Array($0) }
+        logits.withUnsafeBufferPointer(ofType: Float16.self) { $0.map(Float.init) }
     }
 
     /// A conversation: one prefill chunk, then `steps` decode steps; every

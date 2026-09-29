@@ -156,8 +156,8 @@ class RMSNormNoScale(nnx.Module):
         return x32 * jax.lax.rsqrt(variance + 1e-6)
 
 
-def _apply_rope(x, positions, base_frequency, rope_fraction=1.0):
-    """Apply rotary position embeddings to input tensor.
+def rope_angles(positions, base_frequency, head_dim, rope_fraction=1.0):
+    """RoPE rotation angles, fp32: ``positions.shape + (rope_dim // 2,)``.
 
     Matches HF Gemma4's rotate_half / apply_rotary_pos_emb semantics:
     - For full RoPE (rope_fraction=1.0, sliding layers):
@@ -169,36 +169,22 @@ def _apply_rope(x, positions, base_frequency, rope_fraction=1.0):
         (0, head_dim//2) … (half_dim-1, head_dim//2+half_dim-1); all other
         dims are unchanged (cos=1, sin=0 from zero frequencies).
 
-    Precision: the *angles* are computed in fp32 — ``positions`` reaches 65535
-    and fp16 cannot represent integers past 2048, so the sinusoid argument has
-    to be fp32 — but ``sin``/``cos`` are cast down to ``x``'s dtype before the
-    rotation.  That keeps the rotation in the activation dtype and makes this
-    function dtype-preserving; letting it promote fp16 → fp32 used to leak fp32
-    through q into SDPA, the attention output and o_proj (see the note in
-    ``decode_coreml``).  Both factors are in [-1, 1], where fp16 carries ~5e-4
-    absolute error — an order of magnitude finer than the bf16 cos/sin the HF
-    and JAX Gemma reference implementations rotate with.
+    Pair ``i`` turns by ``position / base_frequency ** (2 i / head_dim)`` — HF
+    divides by the full head_dim, not rope_dim, even for partial RoPE.  The
+    angle is fp32: ``positions`` reaches 65535, which fp16 cannot represent.
     """
-    head_dim = x.shape[-1]
-    rope_dim = int(head_dim * rope_fraction)
-    if rope_dim == 0:
-        return x
-
-    half_dim = rope_dim // 2   # number of angle pairs that are non-trivial
-    head_half = head_dim // 2  # midpoint used by HF's rotate_half
-
-    # HF divides by the full head_dim, not rope_dim, even when using partial RoPE.
+    half_dim = int(head_dim * rope_fraction) // 2
     freq_exponent = 2.0 * jnp.arange(half_dim, dtype=jnp.float32) / head_dim
     timescale = base_frequency ** freq_exponent
+    return positions[..., jnp.newaxis].astype(jnp.float32) / timescale
 
-    # positions: (B, L) -> (B, L, 1)
-    positions = positions[..., jnp.newaxis].astype(jnp.float32)
-    sinusoid_inp = positions / timescale[jnp.newaxis, jnp.newaxis, :]
 
-    # Expand sin/cos for broadcasting with heads: (B, L, 1, half_dim).
-    # Cast to x's dtype so the rotation below stays in the activation dtype.
-    sin = jnp.sin(sinusoid_inp)[:, :, jnp.newaxis, :].astype(x.dtype)
-    cos = jnp.cos(sinusoid_inp)[:, :, jnp.newaxis, :].astype(x.dtype)
+def rope_rotate(x, cos, sin):
+    """Rotate ``x``'s RoPE pairs by ``cos`` / ``sin`` (``(..., half_dim)``,
+    broadcasting against ``x[..., :half_dim]``) — see :func:`rope_angles` for
+    the pairing.  Stays in the dtype of its inputs."""
+    head_half = x.shape[-1] // 2   # midpoint used by HF's rotate_half
+    half_dim = cos.shape[-1]       # number of angle pairs that are non-trivial
 
     # x1: first half_dim dims;  x2: paired dims at offset head_half
     x1 = x[..., :half_dim]
@@ -207,8 +193,8 @@ def _apply_rope(x, positions, base_frequency, rope_fraction=1.0):
     x1_rot = x1 * cos - x2 * sin
     x2_rot = x2 * cos + x1 * sin
 
-    if rope_dim == head_dim:
-        # Full RoPE: half_dim == head_half, no unchanged interior/tail.
+    if half_dim == head_half:
+        # Full RoPE: no unchanged interior/tail.
         # Avoid zero-size slices that cause shape errors in CoreML tracing.
         return jnp.concatenate([x1_rot, x2_rot], axis=-1)
 
@@ -220,6 +206,22 @@ def _apply_rope(x, positions, base_frequency, rope_fraction=1.0):
         x2_rot,
         x[..., head_half + half_dim:],     # unchanged tail    (dims head_half+half_dim … end)
     ], axis=-1)
+
+
+def _apply_rope(x, positions, base_frequency, rope_fraction=1.0):
+    """Apply rotary position embeddings to ``x`` (B, L, H, head_dim).
+
+    ``sin``/``cos`` of the fp32 angles are cast to ``x``'s dtype before the
+    rotation, which keeps this function dtype-preserving.  (The exported model
+    takes those rows from the host instead — ``decode_coreml``.)
+    """
+    angles = rope_angles(positions, base_frequency, x.shape[-1], rope_fraction)
+    if angles.shape[-1] == 0:
+        return x
+    # (B, L, 1, half_dim): broadcasts over the heads.
+    cos = jnp.cos(angles)[:, :, jnp.newaxis, :].astype(x.dtype)
+    sin = jnp.sin(angles)[:, :, jnp.newaxis, :].astype(x.dtype)
+    return rope_rotate(x, cos, sin)
 
 
 class GemmaAttention(nnx.Module):

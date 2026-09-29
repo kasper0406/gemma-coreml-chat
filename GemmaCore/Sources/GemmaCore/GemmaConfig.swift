@@ -28,4 +28,18 @@ public enum GemmaConfig {
 
     /// Pad token ID, used to fill the tail of a short prefill chunk.
     public static let padTokenID: Int32 = 0
+
+    // The architecture constants the host needs to build each step's RoPE rows
+    // and sliding mask (``HostInputs``), which no CoreML feature states. Gemma 4
+    // E2B and E4B share them; `tests/test_gemma_config_swift.py` checks them
+    // against every variant in gemma_chat/config.py.
+
+    /// Positions a sliding-window layer attends to, the query's own included.
+    public static let slidingWindow = 512
+    /// RoPE base frequency and head dimension of the sliding-window layers.
+    public static let slidingRopeBase = 10_000.0
+    public static let slidingHeadDim = 256
+    /// RoPE base frequency and head dimension of the global layers.
+    public static let globalRopeBase = 1_000_000.0
+    public static let globalHeadDim = 512
 }

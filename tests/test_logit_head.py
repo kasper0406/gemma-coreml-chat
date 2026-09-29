@@ -1,4 +1,4 @@
-"""The logit head: int8, one scale per vocab row, in slices the ANE streams fast.
+"""The logit head: int8, one scale per vocab row, in equal slices the ANE streams fast.
 
 ``head`` is the only function whose weights are int8 (int4 is too lossy for
 logits) and it has to run on the Neural Engine under ``cpu-and-ne``, which
@@ -34,7 +34,7 @@ def test_the_notch_matches_the_measurements(payload_mib, slow):
     assert in_ane_notch(round(payload_mib * MIB)) == slow
 
 
-def test_the_e2b_head_is_nine_slices_clear_of_the_notch():
+def test_the_e2b_head_is_sixteen_equal_slices_clear_of_the_notch():
     vocab, dim = E2B_CONFIG.num_embed, E2B_CONFIG.embed_dim
     slices = head_slices(vocab, dim)
     assert slices[0][0] == 0 and slices[-1][1] == vocab
@@ -42,9 +42,9 @@ def test_the_e2b_head_is_nine_slices_clear_of_the_notch():
     # Eight slices of 32768 rows would be the fewest the row cap allows —
     # and exactly 3 MiB per core.
     assert in_ane_notch(ane_core_payload(vocab // 8, dim))
-    assert len(slices) == 9
+    assert len(slices) == 16
     for a, b in slices:
-        assert b - a <= 32768
+        assert b - a == 16384
         payload = ane_core_payload(b - a, dim)
         assert not in_ane_notch(payload), (a, b, payload / MIB)
 
@@ -105,6 +105,8 @@ def test_the_head_exports_as_int8_per_channel_slices():
 
     hidden = (rng.standard_normal((1, 1, cfg.embed_dim)) * 2).astype(np.float16)
     want = np.asarray(logits_head(params, jnp.asarray(hidden), cfg), np.float32)
+    assert want.shape == (len(slices), cfg.num_embed // len(slices))
+    want = want.reshape(-1)
     (name,) = [i.name for i in model.get_spec().description.input]
     (got,) = model.predict({name: hidden}).values()
     got = np.asarray(got, np.float32).reshape(-1)

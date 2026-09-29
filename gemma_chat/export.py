@@ -15,7 +15,7 @@ the whole package off it.  The package holds, per cache size ``N``:
 
 and, size-independent:
 
-* ``head`` — final-normed hidden ``[1, 1, D]`` → fp32 logits, used by decode
+* ``head`` — final-normed hidden ``[1, 1, D]`` → fp16 logits ``(slices, rows)``, used by decode
   and (on the row the runtime picks) prefill.
 
 Matmul weights are quantized with per-channel scales (blockwise ones are not
@@ -33,9 +33,12 @@ All 15 KV caches are Core ML **state**.  The sliding ones are static-shaped, so
 the StableHLO→MIL converter binds them directly (:func:`_chunk_io_plan`); the
 global ones carry a symbolic length through conversion — a state cannot have a
 flexible shape — and become state once materialization has given every
-function a concrete cache length (``mil_passes.global_cache_states``).  The
-int32 ``sliding_pos_ring`` stays an input (states must be floating point) and
-the runtime updates it itself.
+function a concrete cache length (``mil_passes.global_cache_states``).
+
+No function takes a position: the host computes the RoPE rows, the attention
+masks and the cache-write selections of every step and passes them in as fp16
+(``decode_coreml.host_inputs``), so the graph holds no integer or fp32
+arithmetic the Neural Engine would have to hand to the CPU.
 
 ``--no-materialize`` keeps the dynamic-shape functions, which do not load (a
 RangeDim program that declares states fails with E5RT/BNNS errors); it is only
@@ -130,7 +133,8 @@ from gemma_chat.config import CHUNK_SIZE, HF_MODEL_ID, MAX_SEQ_LEN, VARIANTS
 from gemma_chat.model import Gemma4Transformer, Gemma4Config, AttentionType
 from gemma_chat.weight_mapper import load_params
 from gemma_chat.decode_coreml import (
-    LayerChunk, decode_chunk, layer_chunks, logits_head, prefill_chunk,
+    LayerChunk, chunk_host_inputs, decode_chunk, host_input_shape, layer_chunks,
+    logits_head, prefill_chunk,
 )
 from gemma_chat.cache_spec import build_cache_specs, sliding_ring_length
 from gemma_chat import host_embeddings
@@ -189,15 +193,16 @@ class _IOPlan:
     leading dimension-variable argument ``N`` (present iff ``has_global``).
     ``states`` maps traced-argument indices (counting ``N``) to
     :class:`StateSpec`; ``input_names`` / ``output_names`` name the remaining
-    inputs and outputs, in order.  ``flexible`` are the input names whose dim 1
-    is the symbolic global cache length (their ``_out`` outputs too).
+    inputs and outputs, in order.  ``flexible`` maps every input with the
+    symbolic global cache length to the dim that has it (a cache's ``_out``
+    output has it too, in dim 1).
     """
     arg_specs: list
     has_global: bool
     states: dict[int, StateSpec]
     input_names: list[str]
     output_names: list[str]
-    flexible: list[str]
+    flexible: dict[str, int]
 
 
 def _cache_spec_for(config: Gemma4Config, slot: int, N):
@@ -218,9 +223,10 @@ def _chunk_io_plan(
 ) -> _IOPlan:
     """The signature of one layer-chunk function.
 
-    Arguments, in order: ``[N] + leading + [k_s, v_s for s in chunk.slots] +
-    [sliding_pos_ring]``, where ``leading`` is ``[hidden]`` (all but the first
-    chunk) ``+ [token_embed, ple_rows, position]``.  Results:
+    Arguments, in order: ``[N] + leading + host + [k_s, v_s for s in
+    chunk.slots]``, where ``leading`` is ``[hidden]`` (all but the first chunk)
+    ``+ [token_embed, ple_rows]`` and ``host`` the chunk's host inputs
+    (``decode_coreml.chunk_host_inputs``).  Results:
     ``[hidden_out] + [k_s_out, v_s_out for s in chunk.writes]``.
 
     Sliding caches become state here — written back from their result if the
@@ -231,26 +237,29 @@ def _chunk_io_plan(
     """
     d = config.per_layer_input_dim
     D = config.embed_dim
-    leading = (["hidden"] if not first else []) + ["token_embed", "ple_rows", "position"]
+    host = chunk_host_inputs(chunk, config)
+    leading = (["hidden"] if not first else []) + ["token_embed", "ple_rows"] + list(host)
     arg_specs = (
         ([jax.ShapeDtypeStruct((1, tokens, D), jnp.float16)] if not first else [])
         + [
             jax.ShapeDtypeStruct((1, tokens, D), jnp.float16),
             jax.ShapeDtypeStruct((1, tokens, len(chunk.layers) * d), jnp.float16),
-            jax.ShapeDtypeStruct((1,), jnp.int32),
         ]
     )
+    flexible: dict[str, int] = {}
+    for name in host:
+        shape = host_input_shape(name, config, tokens, N)
+        arg_specs.append(jax.ShapeDtypeStruct(shape, jnp.float16))
+        symbolic = [i for i, dim in enumerate(shape) if dim is N]
+        if symbolic:
+            flexible[name] = symbolic[0]
     has_global = any(_is_global_slot(config, s) for s in chunk.slots)
-    uses_ring = any(
-        config.attention_types[i] == AttentionType.LOCAL_SLIDING for i in chunk.layers
-    )
     base = (1 if has_global else 0) + len(leading)
     written = {s: 1 + 2 * j for j, s in enumerate(chunk.writes)}  # k result index
 
     states: dict[int, StateSpec] = {}
     input_names = (["N"] if has_global else []) + leading
     output_names = ["hidden_out"]
-    flexible: list[str] = []
     for j, slot in enumerate(chunk.slots):
         for half, prefix in enumerate(("k", "v")):
             name = f"{prefix}_{slot}"
@@ -258,14 +267,11 @@ def _chunk_io_plan(
             out = written[slot] + half if slot in written else None
             if _is_global_slot(config, slot):
                 input_names.append(name)
-                flexible.append(name)
+                flexible[name] = 1
                 if out is not None:
                     output_names.append(name + "_out")
             else:
                 states[base + 2 * j + half] = StateSpec(output=out, name=name)
-    if uses_ring:
-        arg_specs.append(jax.ShapeDtypeStruct((1, sliding_ring_length(config)), jnp.int32))
-        input_names.append("sliding_pos_ring")
     return _IOPlan(arg_specs, has_global, states, input_names, output_names, flexible)
 
 
@@ -274,7 +280,7 @@ def _state_io_plan(config: Gemma4Config, N) -> _IOPlan:
     slots = range(len(build_cache_specs(config, 1)))
     has_global = any(_is_global_slot(config, s) for s in slots)
     base = 1 if has_global else 0
-    arg_specs, states, flexible = [], {}, []
+    arg_specs, states, flexible = [], {}, {}
     input_names = ["N"] if has_global else []
     for slot in slots:
         for half, prefix in enumerate(("k", "v")):
@@ -282,7 +288,7 @@ def _state_io_plan(config: Gemma4Config, N) -> _IOPlan:
             arg_specs.append(_cache_spec_for(config, slot, N))
             if _is_global_slot(config, slot):
                 input_names.append(name)
-                flexible.append(name)
+                flexible[name] = 1
             else:
                 states[base + 2 * slot + half] = StateSpec(output=None, name=name)
     return _IOPlan(arg_specs, has_global, states, input_names, ["probe"], flexible)
@@ -430,14 +436,15 @@ def _mil_to_mlpackage(
     output_path: Path,
     input_names: list[str] | None = None,
     output_names: list[str] | None = None,
-    flexible_shapes: dict[str, tuple[int, int]] | None = None,
+    flexible_shapes: dict[str, tuple[int, int, int]] | None = None,
 ) -> None:
     """Run ct.convert → rename → flex shapes → save.
 
-    flexible_shapes: maps input names (after renaming) to ``(lower, upper)``
-        bounds for dimension 1. Applied directly to the protobuf spec after
-        rename. This bypasses ``ct.convert(inputs=...)`` which cannot match
-        names generated by the stablehlo converter.
+    flexible_shapes: maps input names (after renaming) to ``(dim, lower,
+        upper)``: the one flexible dimension and its bounds.  A ``<name>_out``
+        output gets the same range.  Applied directly to the protobuf spec
+        after rename. This bypasses ``ct.convert(inputs=...)`` which cannot
+        match names generated by the stablehlo converter.
     """
     import threading
     import traceback as _tb
@@ -495,7 +502,7 @@ def _mil_to_mlpackage(
         def _apply_flex(feature_desc, lookup):
             if feature_desc.name not in lookup:
                 return
-            lo, hi = lookup[feature_desc.name]
+            flex_dim, lo, hi = lookup[feature_desc.name]
             arr = feature_desc.type.multiArrayType
             # Fix empty output shapes: set shape to [1, lo, ...] default
             if len(arr.shape) == 0:
@@ -508,7 +515,7 @@ def _mil_to_mlpackage(
             arr.ClearField("shapeRange")
             for dim_idx, dim_size in enumerate(arr.shape):
                 sr = arr.shapeRange.sizeRanges.add()
-                if dim_idx == 1:
+                if dim_idx == flex_dim:
                     sr.lowerBound = lo
                     sr.upperBound = hi
                 else:
@@ -547,7 +554,7 @@ def _export_function(fn, plan: _IOPlan, output_path: Path, weight_bits: int = 4)
         mil_program, output_path,
         input_names=plan.input_names,
         output_names=plan.output_names,
-        flexible_shapes={name: (1, MAX_SEQ_LEN) for name in plan.flexible},
+        flexible_shapes={name: (dim, 1, MAX_SEQ_LEN) for name, dim in plan.flexible.items()},
     )
     jax.clear_caches()
     _release_malloc()
@@ -631,15 +638,16 @@ def export_phase(
             # function only sees the arguments in ``plan.arg_specs``.
             def chunk_fn(*args, chunk=chunk, first=k == 0):
                 if first:
-                    token_embed, ple_rows, position, *rest = args
+                    token_embed, ple_rows, *rest = args
                     hidden = token_embed
                 else:
-                    hidden, token_embed, ple_rows, position, *rest = args
+                    hidden, token_embed, ple_rows, *rest = args
+                names = chunk_host_inputs(chunk, config)
+                host = dict(zip(names, rest))
+                rest = rest[len(names):]
                 caches = {s: (rest[2 * j], rest[2 * j + 1]) for j, s in enumerate(chunk.slots)}
-                ring = rest[2 * len(chunk.slots)] if len(rest) > 2 * len(chunk.slots) else None
                 hidden, written = step(
-                    params, chunk, hidden, token_embed, ple_rows, position[0],
-                    caches, ring, cfg=config,
+                    params, chunk, hidden, token_embed, ple_rows, host, caches, cfg=config,
                 )
                 return (hidden,) + tuple(c for s in chunk.writes for c in written[s])
 
@@ -648,7 +656,7 @@ def export_phase(
         if phase == "decode":
             head_plan = _IOPlan(
                 [jax.ShapeDtypeStruct((1, 1, config.embed_dim), jnp.float16)],
-                False, {}, ["hidden"], ["logits"], [],
+                False, {}, ["hidden"], ["logits"], {},
             )
             # int8: int4 is too lossy for the logits (see ``logits_head``).
             _export_function(
