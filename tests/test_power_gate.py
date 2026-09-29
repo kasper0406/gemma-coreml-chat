@@ -151,6 +151,19 @@ def test_judge_window_uses_only_samples_overlapping_it_and_requires_coverage():
     assert any("unsampled" in r for r in runner.judge_window(dead, 2.0, 15.0, LIMITS))
 
 
+def test_a_drifting_phase_drops_the_run_though_the_whole_run_averages_fine():
+    # The review's example: a 40 s run at 40% whose 5 s prefill sits at 59%,
+    # with spike / drift limits 60 / 55.  The whole-run mean is 42.4%.
+    span = {"idle_pre": (0.0, 4.0), "prefill": (4.0, 9.0), "decode": (9.0, 36.0),
+            "idle_post": (36.0, 40.0)}
+    samples = [_s(float(k), 59 if 4 < k <= 9 else 40) for k in range(1, 41)]
+    assert runner.judge_window(samples, 0.0, 40.0, LIMITS) == []
+    reasons = runner.judge_run(samples, span, LIMITS)
+    assert len(reasons) == 1 and reasons[0].startswith("prefill:") and "averaged 59.0%" in reasons[0]
+    quiet = [_s(float(k), 40) for k in range(1, 41)]
+    assert runner.judge_run(quiet, span, LIMITS) == []
+
+
 # ── one run, end to end with fakes ──────────────────────────────────────────
 
 def _tiled(t0, elapsed_ns, n):

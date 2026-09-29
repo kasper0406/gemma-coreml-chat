@@ -77,7 +77,8 @@ Mode, the calibrated display/session state and three samples within the
 limits; otherwise it pauses 15 s and retries, and gives the run up after 15
 minutes. During every run a monitor keeps sampling: a run whose span from the
 start of `idle_pre` to the end of `idle_post` saw a spike, drift, or more than
-2 s unsampled is not kept. A `top` or `ps` failure, or output that does not
+2 s unsampled, or any one of its windows (`idle_pre`, `prefill`, `decode`,
+`idle_post`) drifted on its own, is not kept. A `top` or `ps` failure, or output that does not
 parse, fails the gate or the run. The calibration and every gate record land
 in `results.json`. The runner refuses to start at all on battery.
 

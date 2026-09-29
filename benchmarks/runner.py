@@ -18,7 +18,8 @@ Method (see benchmarks/README.md for the why):
   same display/session state and quiet samples, and pauses and retries
   otherwise (giving the run up after :data:`GATE_TIMEOUT_S`); during every
   run a monitor keeps sampling, and a run whose measured span saw a spike,
-  a drifted mean or an unsampled stretch is not kept.  Nothing is exempt;
+  a drifted mean or an unsampled stretch, or one of whose windows drifted on
+  its own, is not kept.  Nothing is exempt;
   busy processes are logged.
 * **Anchor** — a run whose power samples have contradictory stamps, a
   malformed document, or an anchor wider than :data:`ANCHOR_MAX_FRACTION`
@@ -268,6 +269,13 @@ def cpu_limits(totals: list[float]) -> dict:
     }
 
 
+def _drift(samples: list[dict], limits: dict) -> list[str]:
+    mean = statistics.fmean(s["total"] for s in samples)
+    if mean > limits["drift"]:
+        return [f"background CPU averaged {mean:.1f}% > {limits['drift']:.1f}%"]
+    return []
+
+
 def judge_cpu(samples: list[dict], limits: dict) -> list[str]:
     """Reasons ``samples`` are not quiet against ``limits`` (empty if they are)."""
     if not samples:
@@ -279,18 +287,20 @@ def judge_cpu(samples: list[dict], limits: dict) -> list[str]:
         who = ", ".join(f"{b['command']} {b['cpu']:.0f}%" for b in worst["busy"][:4])
         reasons.append(f"{len(spikes)} background CPU spike(s) up to {worst['total']:.0f}% "
                        f"> {limits['spike']:.0f}% ({who})")
-    mean = statistics.fmean(s["total"] for s in samples)
-    if mean > limits["drift"]:
-        reasons.append(f"background CPU averaged {mean:.1f}% > {limits['drift']:.1f}%")
-    return reasons
+    return reasons + _drift(samples, limits)
+
+
+def _overlapping(samples: list[dict], start: float, end: float) -> list[dict]:
+    """The one-second samples that overlap ``[start, end)``, in time order."""
+    return sorted((s for s in samples if s["end"] - 1.0 < end and s["end"] > start),
+                  key=lambda s: s["end"])
 
 
 def judge_window(samples: list[dict], start: float, end: float, limits: dict) -> list[str]:
     """Reasons the background was not quiet throughout ``[start, end)``:
     a stretch longer than :data:`MAX_SAMPLE_GAP_S` with no sample covering it,
     or the samples overlapping it failing :func:`judge_cpu`."""
-    inside = sorted((s for s in samples if s["end"] - 1.0 < end and s["end"] > start),
-                    key=lambda s: s["end"])
+    inside = _overlapping(samples, start, end)
     covered, gap = start, 0.0
     for s in inside:
         gap = max(gap, s["end"] - 1.0 - covered)
@@ -299,6 +309,20 @@ def judge_window(samples: list[dict], start: float, end: float, limits: dict) ->
     reasons = judge_cpu(inside, limits)
     if gap > MAX_SAMPLE_GAP_S:
         reasons.append(f"background CPU unsampled for {gap:.1f} s of the window")
+    return reasons
+
+
+def judge_run(samples: list[dict], span: dict[str, tuple[float, float]],
+              limits: dict) -> list[str]:
+    """Reasons a run's background was not quiet: :func:`judge_window` over
+    its whole measured span (``idle_pre`` start to ``idle_post`` end), and
+    drift in each measured window on its own — a phase can drift while the
+    whole run's average does not."""
+    reasons = judge_window(samples, span["idle_pre"][0], span["idle_post"][1], limits)
+    for w in WINDOWS:
+        inside = _overlapping(samples, *span[w])
+        reasons += [f"{w}: {r}" for r in (_drift(inside, limits) if inside
+                                          else ["no background CPU samples"])]
     return reasons
 
 
@@ -499,8 +523,7 @@ def run_one(exe: Path, config: BenchmarkConfig, c: Configuration, repetition: in
         b = rec.bench
         span = {w: (b[w]["start_ns"] / 1e9 + offset, b[w]["end_ns"] / 1e9 + offset)
                 for w in WINDOWS}
-        reasons = judge_window(monitor.samples, span["idle_pre"][0], span["idle_post"][1],
-                               calibration["limits"])
+        reasons = judge_run(monitor.samples, span, calibration["limits"])
         if monitor.error:
             reasons.append(f"background monitor failed: {monitor.error}")
         if reasons:
