@@ -67,7 +67,12 @@ are logged). After priming, a calibration takes 60 samples of the idle
 background and records the display/session state (display on, screen locked)
 it saw; its median *m* and robust spread *σ* (1.4826·MAD, at least 1 point of
 a core) set the limits: a sample above *m* + 4σ is a spike, a mean above
-*m* + 2σ is drift. Before every run the gate wants AC power, no Low Power
+*m* + 2σ is drift. σ only describes a steady baseline, so a calibration whose
+10th–90th percentiles span more than 10 points (or half its median, if
+larger) is refused and retaken (for up to 15 minutes), and the limits are
+capped whatever σ says: drift at the calibration's 90th percentile + 2 and at
+*m* + 10, a spike at *m* + 25. Those caps are the gate's sensitivity: a
+sustained rise of a tenth of a core over the idle median never passes. Before every run the gate wants AC power, no Low Power
 Mode, the calibrated display/session state and three samples within the
 limits; otherwise it pauses 15 s and retries, and gives the run up after 15
 minutes. During every run a monitor keeps sampling: a run whose span from the

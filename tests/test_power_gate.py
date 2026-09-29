@@ -95,12 +95,32 @@ def test_limits_follow_the_baseline_spread():
     assert lim["median"] == 45.0
     assert lim["sigma"] == pytest.approx(1.4826 * 3.0)
     assert lim["spike"] == pytest.approx(45.0 + runner.SPIKE_SIGMAS * lim["sigma"])
-    assert lim["drift"] == pytest.approx(45.0 + runner.DRIFT_SIGMAS * lim["sigma"])
+    # m + 2σ = 53.9 is above the 90th percentile + margin: that caps it.
+    assert lim["drift"] == pytest.approx(48.0 + runner.DRIFT_MARGIN)
 
 
 def test_limits_have_a_floor_for_a_perfectly_steady_baseline():
     lim = runner.cpu_limits([30.0] * 60)
     assert lim["sigma"] == runner.SIGMA_FLOOR
+    assert lim["drift"] == pytest.approx(30.0 + runner.DRIFT_SIGMAS)
+
+
+def test_a_bimodal_baseline_is_refused():
+    # The review's example: σ from the MAD would be ~30 points, so the limits
+    # would be 148.6% / 89.3% and a sustained 80% would pass.
+    with pytest.raises(ValueError, match="unsteady"):
+        runner.cpu_limits([10.0] * 30 + [50.0] * 30)
+
+
+def test_limits_never_exceed_the_sensitivity_caps():
+    # A busy but steady baseline (median 60, spread 30 < half the median):
+    # σ ≈ 11 would put the spike at ~105% and the drift at ~82%.
+    totals = [45.0 + 30.0 * k / 59 for k in range(60)]
+    lim = runner.cpu_limits(totals)
+    med = lim["median"]
+    assert lim["spike"] == pytest.approx(med + runner.SPIKE_MAX_EXCESS)
+    assert lim["drift"] == pytest.approx(med + runner.DRIFT_MAX_EXCESS)
+    assert lim["drift"] < lim["p90"] + runner.DRIFT_MARGIN
 
 
 LIMITS = {"spike": 60.0, "drift": 55.0}

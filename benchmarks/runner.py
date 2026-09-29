@@ -51,17 +51,32 @@ from benchmarks.power import RAILS, PowerMonitor
 # Path to the Swift bench package under the repo.
 _SWIFT_BENCH_PKG = Path(__file__).resolve().parent / "swift" / "bench"
 
-# Background CPU (the processes outside the harness's own tree, in percent of
-# one core, from one-second ``top`` samples) is judged against an idle
-# baseline measured once per invocation: CALIBRATION_SAMPLES samples give its
-# median m and robust spread σ = 1.4826·MAD, floored at SIGMA_FLOOR so a
-# perfectly steady baseline does not reject a one-point wobble.  A sample
-# above m + SPIKE_SIGMAS·σ is a spike; a window whose samples average above
-# m + DRIFT_SIGMAS·σ has drifted.
+# Background CPU (the processes outside the harness, in percent of one core,
+# from one-second ``top`` samples) is judged against an idle baseline measured
+# once per invocation: CALIBRATION_SAMPLES samples give its median m and robust
+# spread σ = 1.4826·MAD, floored at SIGMA_FLOOR so a perfectly steady baseline
+# does not reject a one-point wobble.  A sample above m + SPIKE_SIGMAS·σ is a
+# spike; a window whose samples average above m + DRIFT_SIGMAS·σ has drifted.
 CALIBRATION_SAMPLES = 60
 SIGMA_FLOOR = 1.0
 SPIKE_SIGMAS = 4.0
 DRIFT_SIGMAS = 2.0
+# σ only means something for a steady, unimodal baseline: 30 samples at 10%
+# and 30 at 50% (WindowServer switching modes, say) give σ ≈ 30 and would let
+# a sustained 80% through.  So a calibration whose 10th–90th percentile range
+# exceeds CALIBRATION_MAX_SPREAD points, or CALIBRATION_MAX_REL_SPREAD of its
+# median if that is larger, is refused and retaken.  And whatever σ says, the
+# drift limit never exceeds the calibration's 90th percentile + DRIFT_MARGIN
+# (a window busier than nine in ten idle samples plus a wobble has drifted),
+# and neither limit exceeds the median by more than DRIFT_MAX_EXCESS /
+# SPIKE_MAX_EXCESS.  Those two set the gate's sensitivity: a sustained rise of
+# a tenth of a core over the idle median, or a one-second one of a quarter
+# core, never passes.
+CALIBRATION_MAX_SPREAD = 10.0
+CALIBRATION_MAX_REL_SPREAD = 0.5
+DRIFT_MARGIN = 2.0
+DRIFT_MAX_EXCESS = 10.0
+SPIKE_MAX_EXCESS = 25.0
 # Consecutive samples the gate wants inside the limits before a run starts.
 GATE_SAMPLES = 3
 GATE_RETRY_S = 15
@@ -230,16 +245,26 @@ def background_cpu() -> dict:
 
 
 def cpu_limits(totals: list[float]) -> dict:
-    """The baseline's distribution and the limits derived from it."""
+    """The baseline's distribution and the limits derived from it.  Raises
+    ``ValueError`` for a baseline too spread out to calibrate against."""
+    ordered = sorted(totals)
+
+    def q(p: float) -> float:
+        return ordered[int(p * (len(ordered) - 1))]
+
     med = statistics.median(totals)
+    spread, allowed = q(0.9) - q(0.1), max(CALIBRATION_MAX_SPREAD, CALIBRATION_MAX_REL_SPREAD * med)
+    if spread > allowed:
+        raise ValueError(f"unsteady idle background: its 10th–90th percentiles "
+                         f"({q(0.1):.1f}–{q(0.9):.1f}%) span more than {allowed:.1f} points")
     mad = statistics.median(abs(t - med) for t in totals)
     sigma = max(1.4826 * mad, SIGMA_FLOOR)
-    ordered = sorted(totals)
     return {
         "n": len(totals), "median": med, "sigma": sigma,
-        "mean": statistics.fmean(totals), "p95": ordered[int(0.95 * (len(ordered) - 1))],
+        "mean": statistics.fmean(totals), "p10": q(0.1), "p90": q(0.9), "p95": q(0.95),
         "max": ordered[-1],
-        "spike": med + SPIKE_SIGMAS * sigma, "drift": med + DRIFT_SIGMAS * sigma,
+        "spike": min(med + SPIKE_SIGMAS * sigma, med + SPIKE_MAX_EXCESS),
+        "drift": min(med + DRIFT_SIGMAS * sigma, q(0.9) + DRIFT_MARGIN, med + DRIFT_MAX_EXCESS),
     }
 
 
@@ -279,24 +304,35 @@ def judge_window(samples: list[dict], start: float, end: float, limits: dict) ->
 
 def calibrate() -> dict:
     """Measure the idle background: the state it was taken in and the
-    distribution of :data:`CALIBRATION_SAMPLES` one-second samples."""
-    state = session_state()
-    print(f"Calibrating the idle background ({CALIBRATION_SAMPLES} × 1 s, {state}) …",
-          flush=True)
-    samples = [background_cpu() for _ in range(CALIBRATION_SAMPLES)]
-    if session_state() != state:
-        raise SystemExit(f"display/session state changed during calibration "
-                         f"({state} → {session_state()}); leave the machine alone")
-    limits = cpu_limits([s["total"] for s in samples])
+    distribution of :data:`CALIBRATION_SAMPLES` one-second samples.  A
+    calibration whose state changed or whose baseline is unsteady
+    (:func:`cpu_limits`) is retaken, for up to :data:`GATE_TIMEOUT_S`."""
+    deadline = time.monotonic() + GATE_TIMEOUT_S
+    while True:
+        state = session_state()
+        print(f"Calibrating the idle background ({CALIBRATION_SAMPLES} × 1 s, {state}) …",
+              flush=True)
+        samples = [background_cpu() for _ in range(CALIBRATION_SAMPLES)]
+        totals = [s["total"] for s in samples]
+        try:
+            if session_state() != state:
+                raise ValueError(f"display/session state changed ({state} → {session_state()})")
+            limits = cpu_limits(totals)
+            break
+        except ValueError as e:
+            if time.monotonic() > deadline:
+                raise SystemExit(f"no usable idle calibration: {e}; leave the machine alone")
+            print(f"  calibration refused: {e} — retrying in {GATE_RETRY_S}s", flush=True)
+            time.sleep(GATE_RETRY_S)
     load: dict[str, float] = {}
     for s in samples:
         for b in s["busy"]:
             load[b["command"]] = load.get(b["command"], 0.0) + b["cpu"] / len(samples)
     print(f"  background CPU median {limits['median']:.1f}% σ {limits['sigma']:.1f} "
-          f"p95 {limits['p95']:.1f} → spike > {limits['spike']:.1f}%, "
+          f"p10–p90 {limits['p10']:.1f}–{limits['p90']:.1f} → spike > {limits['spike']:.1f}%, "
           f"drift > {limits['drift']:.1f}%", flush=True)
     return {
-        "state": state, "limits": limits, "totals": [s["total"] for s in samples],
+        "state": state, "limits": limits, "totals": totals,
         "mean_busy": dict(sorted(load.items(), key=lambda kv: -kv[1])[:10]),
     }
 
