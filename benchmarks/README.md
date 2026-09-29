@@ -69,33 +69,33 @@ not the parent's other children) — from one-second `top` samples of all
 processes; nothing else is exempt, and busy processes are logged.
 
 After priming, a calibration takes 60 samples of the idle background, polling
-the machine state with each; it wants AC power and no Low Power Mode, and
-that state unchanged throughout. The samples' median *m* and robust spread
-*σ* (1.4826·MAD, at least 1 point of a core) set the limits: a sample above
-*m* + 4σ is a spike, a mean above *m* + 2σ is drift. σ only describes a
-steady baseline, so a calibration whose 10th–90th percentiles span more than
-10 points (or half its median, if larger) is refused, and the limits are
-capped whatever σ says: drift at the calibration's 90th percentile + 2 and at
-*m* + 10, a spike at *m* + 25. Those caps are the gate's sensitivity: a
-sustained rise of a tenth of a core over the idle median never passes. A
-refused calibration is retaken, for up to 15 minutes.
+the machine state with each; it wants AC power, no Low Power Mode, and that
+state readable and unchanged throughout. One rule, in points of one core:
+the calibration is used only if its mean is at most 25 and its busiest
+sample at most 55 (25 + 30), else it is retaken, for up to 15 minutes.
+Against its mean *m*, a window averaging above *m* + 5 has drifted and a
+sample above *m* + 30 is a spike. The 5 is the sensitivity — sustained
+interference of a twentieth of a core or more is caught; the 30 tolerates
+brief housekeeping (a one-second burst) but not a third of a core; the 25
+refuses a machine that is not idle to begin with.
 
 Before every run the gate wants the calibrated machine state and three
 samples within the limits; otherwise it pauses 15 s and retries, and gives
 the run up after 15 minutes. During every run a monitor polls the machine
 state and takes a CPU sample back to back (a poll every ~2 s) from before the
 bench launches until after it exits, load and warm-up included. A run is not
-kept if any poll differs from the calibrated state, or if its span from the
-start of `idle_pre` to the end of `idle_post` saw a spike, drift, or more
-than 2 s unsampled, or any one of its windows (`idle_pre`, `prefill`,
-`decode`, `idle_post`) drifted on its own. Load and warm-up are exempt from
-the CPU check only: nothing is measured there, and the CoreML/ANE daemons
-that load and compile for the bench (`aned`, `ANECompilerService`, …) are
-outside the harness, so their CPU there is the workload's; whatever the load
-leaves running shows up in `idle_pre`. A `top` or `ps` failure, or output
-that does not parse, fails the gate or the run. The calibration and every
-gate record land in `results.json`, and every run's CPU samples and state
-polls with it. The runner refuses to start at all on battery.
+kept if any poll failed or differed from the calibrated state, if its span
+from the start of `idle_pre` to the end of `idle_post` saw a spike or more
+than 2 s unsampled, or if any one of its windows (`idle_pre`, `prefill`,
+`decode`, `idle_post`) drifted. Load and warm-up are exempt from the CPU
+check only: nothing is measured there, and the CoreML/ANE daemons that load
+and compile for the bench (`aned`, `ANECompilerService`, …) are outside the
+harness, so their CPU there is the workload's; whatever the load leaves
+running shows up in `idle_pre`. A state or process command that fails,
+times out or prints nothing parseable fails the calibration, the gate or
+the run. The calibration and every gate record land in `results.json`, and
+every run's CPU samples and state polls with it. The runner refuses to
+start at all on battery.
 
 **Anchor** — a run is not kept if its power samples' stamps admit no common
 start (a dropped sample or a clock step), a `powermetrics` document was

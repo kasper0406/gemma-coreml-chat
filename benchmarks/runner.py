@@ -19,10 +19,10 @@ Method (see benchmarks/README.md for the why):
   that state and quiet samples, and pauses and retries otherwise (giving
   the run up after :data:`GATE_TIMEOUT_S`).  During every run a monitor
   polls the state and samples the CPU from launch to exit; a run is not
-  kept if the state changed at any poll, or if its measured span saw a
-  spike, a drifted mean or an unsampled stretch, or one of its windows
-  drifted on its own (:func:`judge_run`; load and warm-up are exempt from
-  the CPU check only).  No other process is exempt; busy ones are logged.
+  kept if a poll failed or differed from the calibrated state, or if its
+  measured span saw a spike or an unsampled stretch, or one of its windows
+  drifted (:func:`judge_run`; load and warm-up are exempt from the CPU
+  check only).  No other process is exempt; busy ones are logged.
 * **Anchor** — a run whose power samples have contradictory stamps, a
   malformed document, or an anchor wider than :data:`ANCHOR_MAX_FRACTION`
   of its shortest window is not kept.
@@ -54,32 +54,22 @@ from benchmarks.power import RAILS, PowerMonitor
 # Path to the Swift bench package under the repo.
 _SWIFT_BENCH_PKG = Path(__file__).resolve().parent / "swift" / "bench"
 
-# Background CPU (every process but the harness, in percent of one core,
-# from one-second ``top`` samples) is judged against an idle baseline measured
-# once per invocation: CALIBRATION_SAMPLES samples give its median m and robust
-# spread σ = 1.4826·MAD, floored at SIGMA_FLOOR so a perfectly steady baseline
-# does not reject a one-point wobble.  A sample above m + SPIKE_SIGMAS·σ is a
-# spike; a window whose samples average above m + DRIFT_SIGMAS·σ has drifted.
+# Background CPU — every process but the harness, in points of one core (100
+# = one core busy), from one-second ``top`` samples — is judged by one rule.
+# An idle calibration of CALIBRATION_SAMPLES samples is used only if its mean
+# is at most IDLE_CEILING and its busiest sample at most IDLE_CEILING +
+# SPIKE_EXCESS; otherwise it is retaken.  Against its mean m, a window whose
+# samples average above m + DRIFT_EXCESS has drifted, and a sample above
+# m + SPIKE_EXCESS is a spike.  DRIFT_EXCESS is the sensitivity: sustained
+# interference of 5 points (a twentieth of a core) or more is caught.
+# SPIKE_EXCESS tolerates brief housekeeping — a one-second burst of up to 30
+# points — but not a burst of a third of a core.  IDLE_CEILING: an idle Mac
+# with its display asleep uses well under a quarter of a core; one that uses
+# more is not idle.
 CALIBRATION_SAMPLES = 60
-SIGMA_FLOOR = 1.0
-SPIKE_SIGMAS = 4.0
-DRIFT_SIGMAS = 2.0
-# σ only means something for a steady, unimodal baseline: 30 samples at 10%
-# and 30 at 50% (WindowServer switching modes, say) give σ ≈ 30 and would let
-# a sustained 80% through.  So a calibration whose 10th–90th percentile range
-# exceeds CALIBRATION_MAX_SPREAD points, or CALIBRATION_MAX_REL_SPREAD of its
-# median if that is larger, is refused and retaken.  And whatever σ says, the
-# drift limit never exceeds the calibration's 90th percentile + DRIFT_MARGIN
-# (a window busier than nine in ten idle samples plus a wobble has drifted),
-# and neither limit exceeds the median by more than DRIFT_MAX_EXCESS /
-# SPIKE_MAX_EXCESS.  Those two set the gate's sensitivity: a sustained rise of
-# a tenth of a core over the idle median, or a one-second one of a quarter
-# core, never passes.
-CALIBRATION_MAX_SPREAD = 10.0
-CALIBRATION_MAX_REL_SPREAD = 0.5
-DRIFT_MARGIN = 2.0
-DRIFT_MAX_EXCESS = 10.0
-SPIKE_MAX_EXCESS = 25.0
+IDLE_CEILING = 25.0
+DRIFT_EXCESS = 5.0
+SPIKE_EXCESS = 30.0
 # Longest any one machine-state or process-list command may take.
 COMMAND_TIMEOUT_S = 30
 # Consecutive samples the gate wants inside the limits before a run starts.
@@ -275,28 +265,15 @@ def background_cpu() -> dict:
     }
 
 
-def cpu_limits(totals: list[float]) -> dict:
-    """The baseline's distribution and the limits derived from it.  Raises
-    ``ValueError`` for a baseline too spread out to calibrate against."""
-    ordered = sorted(totals)
-
-    def q(p: float) -> float:
-        return ordered[int(p * (len(ordered) - 1))]
-
-    med = statistics.median(totals)
-    spread, allowed = q(0.9) - q(0.1), max(CALIBRATION_MAX_SPREAD, CALIBRATION_MAX_REL_SPREAD * med)
-    if spread > allowed:
-        raise ValueError(f"unsteady idle background: its 10th–90th percentiles "
-                         f"({q(0.1):.1f}–{q(0.9):.1f}%) span more than {allowed:.1f} points")
-    mad = statistics.median(abs(t - med) for t in totals)
-    sigma = max(1.4826 * mad, SIGMA_FLOOR)
-    return {
-        "n": len(totals), "median": med, "sigma": sigma,
-        "mean": statistics.fmean(totals), "p10": q(0.1), "p90": q(0.9), "p95": q(0.95),
-        "max": ordered[-1],
-        "spike": min(med + SPIKE_SIGMAS * sigma, med + SPIKE_MAX_EXCESS),
-        "drift": min(med + DRIFT_SIGMAS * sigma, q(0.9) + DRIFT_MARGIN, med + DRIFT_MAX_EXCESS),
-    }
+def idle_limits(totals: list[float]) -> dict:
+    """The calibration's mean and busiest sample, and the limits its mean
+    sets.  Raises ``ValueError`` for a baseline that is not idle."""
+    mean, top = statistics.fmean(totals), max(totals)
+    if mean > IDLE_CEILING or top > IDLE_CEILING + SPIKE_EXCESS:
+        raise ValueError(f"not idle: background CPU mean {mean:.1f}% (at most {IDLE_CEILING:.0f}), "
+                         f"busiest sample {top:.1f}% (at most {IDLE_CEILING + SPIKE_EXCESS:.0f})")
+    return {"n": len(totals), "mean": mean, "max": top,
+            "drift": mean + DRIFT_EXCESS, "spike": mean + SPIKE_EXCESS}
 
 
 def _drift(samples: list[dict], limits: dict) -> list[str]:
@@ -306,18 +283,21 @@ def _drift(samples: list[dict], limits: dict) -> list[str]:
     return []
 
 
+def _spikes(samples: list[dict], limits: dict) -> list[str]:
+    spikes = [s for s in samples if s["total"] > limits["spike"]]
+    if not spikes:
+        return []
+    worst = max(spikes, key=lambda s: s["total"])
+    who = ", ".join(f"{b['command']} {b['cpu']:.0f}%" for b in worst["busy"][:4])
+    return [f"{len(spikes)} background CPU spike(s) up to {worst['total']:.0f}% "
+            f"> {limits['spike']:.0f}% ({who})"]
+
+
 def judge_cpu(samples: list[dict], limits: dict) -> list[str]:
     """Reasons ``samples`` are not quiet against ``limits`` (empty if they are)."""
     if not samples:
         return ["no background CPU samples"]
-    reasons = []
-    spikes = [s for s in samples if s["total"] > limits["spike"]]
-    if spikes:
-        worst = max(spikes, key=lambda s: s["total"])
-        who = ", ".join(f"{b['command']} {b['cpu']:.0f}%" for b in worst["busy"][:4])
-        reasons.append(f"{len(spikes)} background CPU spike(s) up to {worst['total']:.0f}% "
-                       f"> {limits['spike']:.0f}% ({who})")
-    return reasons + _drift(samples, limits)
+    return _spikes(samples, limits) + _drift(samples, limits)
 
 
 def _overlapping(samples: list[dict], start: float, end: float) -> list[dict]:
@@ -326,38 +306,31 @@ def _overlapping(samples: list[dict], start: float, end: float) -> list[dict]:
                   key=lambda s: s["end"])
 
 
-def judge_window(samples: list[dict], start: float, end: float, limits: dict) -> list[str]:
-    """Reasons the background was not quiet throughout ``[start, end)``:
-    a stretch longer than :data:`MAX_SAMPLE_GAP_S` with no sample covering it,
-    or the samples overlapping it failing :func:`judge_cpu`."""
-    inside = _overlapping(samples, start, end)
-    covered, gap = start, 0.0
-    for s in inside:
-        gap = max(gap, s["end"] - 1.0 - covered)
-        covered = max(covered, s["end"])
-    gap = max(gap, end - covered)
-    reasons = judge_cpu(inside, limits)
-    if gap > MAX_SAMPLE_GAP_S:
-        reasons.append(f"background CPU unsampled for {gap:.1f} s of the window")
-    return reasons
-
-
 def judge_run(samples: list[dict], span: dict[str, tuple[float, float]],
               limits: dict) -> list[str]:
-    """Reasons a run's background was not quiet: :func:`judge_window` over
-    its whole measured span (``idle_pre`` start to ``idle_post`` end), and
-    drift in each measured window on its own — a phase can drift while the
-    whole run's average does not.
+    """Reasons a run's background was not quiet: over its measured span
+    (``idle_pre`` start to ``idle_post`` end) a spike, or a stretch longer
+    than :data:`MAX_SAMPLE_GAP_S` that no sample covers; in any one measured
+    window, drift.
 
     Load and warm-up, before ``idle_pre``, are not judged here (their machine
     state is): nothing is measured there, and the CoreML/ANE daemons that
     load and compile for the bench (``aned``, ``ANECompilerService``, …) are
     outside the harness, so their CPU there is the workload's, not
     background.  Whatever the load leaves running shows up in ``idle_pre``."""
-    reasons = judge_window(samples, span["idle_pre"][0], span["idle_post"][1], limits)
+    start, end = span["idle_pre"][0], span["idle_post"][1]
+    inside = _overlapping(samples, start, end)
+    covered, gap = start, 0.0
+    for s in inside:
+        gap = max(gap, s["end"] - 1.0 - covered)
+        covered = max(covered, s["end"])
+    gap = max(gap, end - covered)
+    reasons = _spikes(inside, limits)
+    if gap > MAX_SAMPLE_GAP_S:
+        reasons.append(f"background CPU unsampled for {gap:.1f} s of the measured span")
     for w in WINDOWS:
-        inside = _overlapping(samples, *span[w])
-        reasons += [f"{w}: {r}" for r in (_drift(inside, limits) if inside
+        in_w = _overlapping(samples, *span[w])
+        reasons += [f"{w}: {r}" for r in (_drift(in_w, limits) if in_w
                                           else ["no background CPU samples"])]
     return reasons
 
@@ -365,10 +338,9 @@ def judge_run(samples: list[dict], span: dict[str, tuple[float, float]],
 def calibrate() -> dict:
     """Measure the idle background: the machine state it was taken in (AC
     power, no Low Power Mode, polled with every sample and unchanged
-    throughout) and the distribution of :data:`CALIBRATION_SAMPLES`
-    one-second samples.  A calibration that fails either, or whose baseline
-    is unsteady (:func:`cpu_limits`), is retaken, for up to
-    :data:`GATE_TIMEOUT_S`."""
+    throughout) and :data:`CALIBRATION_SAMPLES` one-second samples.  A
+    calibration that fails either, or that is not idle (:func:`idle_limits`),
+    is retaken, for up to :data:`GATE_TIMEOUT_S`."""
     deadline = time.monotonic() + GATE_TIMEOUT_S
     while True:
         print(f"Calibrating the idle background ({CALIBRATION_SAMPLES} × 1 s) …", flush=True)
@@ -383,7 +355,7 @@ def calibrate() -> dict:
             if changed := judge_state(states, state):
                 raise ValueError(changed[0])
             totals = [s["total"] for s in samples]
-            limits = cpu_limits(totals)
+            limits = idle_limits(totals)
             break
         except (ValueError, RuntimeError) as e:
             if time.monotonic() > deadline:
@@ -394,9 +366,8 @@ def calibrate() -> dict:
     for s in samples:
         for b in s["busy"]:
             load[b["command"]] = load.get(b["command"], 0.0) + b["cpu"] / len(samples)
-    print(f"  background CPU median {limits['median']:.1f}% σ {limits['sigma']:.1f} "
-          f"p10–p90 {limits['p10']:.1f}–{limits['p90']:.1f} → spike > {limits['spike']:.1f}%, "
-          f"drift > {limits['drift']:.1f}%", flush=True)
+    print(f"  background CPU mean {limits['mean']:.1f}% (busiest {limits['max']:.1f}%) → "
+          f"drift > {limits['drift']:.1f}%, spike > {limits['spike']:.1f}%", flush=True)
     return {
         "state": state, "limits": limits, "totals": totals,
         "mean_busy": dict(sorted(load.items(), key=lambda kv: -kv[1])[:10]),

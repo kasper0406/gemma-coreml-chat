@@ -87,40 +87,22 @@ def test_top_is_asked_for_every_process(monkeypatch):
     assert "-n" not in seen["cmd"]
 
 
-# ── limits from the idle baseline ───────────────────────────────────────────
+# ── the rule: an idle calibration, and limits from its mean ────────────────
 
-def test_limits_follow_the_baseline_spread():
-    totals = [40.0, 42.0, 44.0, 46.0, 48.0, 200.0]   # one outlier barely moves them
-    lim = runner.cpu_limits(totals)
-    assert lim["median"] == 45.0
-    assert lim["sigma"] == pytest.approx(1.4826 * 3.0)
-    assert lim["spike"] == pytest.approx(45.0 + runner.SPIKE_SIGMAS * lim["sigma"])
-    # m + 2σ = 53.9 is above the 90th percentile + margin: that caps it.
-    assert lim["drift"] == pytest.approx(48.0 + runner.DRIFT_MARGIN)
+def test_the_limits_are_the_calibration_mean_plus_fixed_excesses():
+    lim = runner.idle_limits([8.0] * 30 + [12.0] * 30)
+    assert lim["mean"] == 10.0 and lim["max"] == 12.0
+    assert lim["drift"] == 10.0 + runner.DRIFT_EXCESS
+    assert lim["spike"] == 10.0 + runner.SPIKE_EXCESS
 
 
-def test_limits_have_a_floor_for_a_perfectly_steady_baseline():
-    lim = runner.cpu_limits([30.0] * 60)
-    assert lim["sigma"] == runner.SIGMA_FLOOR
-    assert lim["drift"] == pytest.approx(30.0 + runner.DRIFT_SIGMAS)
-
-
-def test_a_bimodal_baseline_is_refused():
-    # The review's example: σ from the MAD would be ~30 points, so the limits
-    # would be 148.6% / 89.3% and a sustained 80% would pass.
-    with pytest.raises(ValueError, match="unsteady"):
-        runner.cpu_limits([10.0] * 30 + [50.0] * 30)
-
-
-def test_limits_never_exceed_the_sensitivity_caps():
-    # A busy but steady baseline (median 60, spread 30 < half the median):
-    # σ ≈ 11 would put the spike at ~105% and the drift at ~82%.
-    totals = [45.0 + 30.0 * k / 59 for k in range(60)]
-    lim = runner.cpu_limits(totals)
-    med = lim["median"]
-    assert lim["spike"] == pytest.approx(med + runner.SPIKE_MAX_EXCESS)
-    assert lim["drift"] == pytest.approx(med + runner.DRIFT_MAX_EXCESS)
-    assert lim["drift"] < lim["p90"] + runner.DRIFT_MARGIN
+@pytest.mark.parametrize("totals", [
+    [2.0] * 54 + [90.0] * 6,                      # mean 10.8, but a sample above C + S
+    [runner.IDLE_CEILING + 1.0] * 60,             # steady, but not idle
+])
+def test_a_calibration_that_is_not_idle_is_refused(totals):
+    with pytest.raises(ValueError, match="not idle"):
+        runner.idle_limits(totals)
 
 
 LIMITS = {"spike": 60.0, "drift": 55.0}
@@ -139,29 +121,29 @@ def test_judge_cpu_catches_spikes_and_drift():
     assert runner.judge_cpu([], LIMITS) == ["no background CPU samples"]
 
 
-def test_judge_window_uses_only_samples_overlapping_it_and_requires_coverage():
-    # Back-to-back samples every 1.5 s from t=0.5; a spike before the window.
-    samples = [_s(0.5, 90)] + [_s(1.0 + 1.5 * k, 45) for k in range(1, 12)]
-    assert runner.judge_window(samples, 2.0, 15.0, LIMITS) == []
-    # The same window with a spike inside it.
-    spiky = samples[:5] + [_s(8.5, 90)] + samples[6:]
-    assert any("spike" in r for r in runner.judge_window(spiky, 2.0, 15.0, LIMITS))
-    # A monitor that died half-way leaves the rest of the window unsampled.
-    dead = samples[:6]
-    assert any("unsampled" in r for r in runner.judge_window(dead, 2.0, 15.0, LIMITS))
+SPAN = {"idle_pre": (0.0, 4.0), "prefill": (4.0, 9.0), "decode": (9.0, 36.0),
+        "idle_post": (36.0, 40.0)}
 
 
-def test_a_drifting_phase_drops_the_run_though_the_whole_run_averages_fine():
-    # The review's example: a 40 s run at 40% whose 5 s prefill sits at 59%,
-    # with spike / drift limits 60 / 55.  The whole-run mean is 42.4%.
-    span = {"idle_pre": (0.0, 4.0), "prefill": (4.0, 9.0), "decode": (9.0, 36.0),
-            "idle_post": (36.0, 40.0)}
-    samples = [_s(float(k), 59 if 4 < k <= 9 else 40) for k in range(1, 41)]
-    assert runner.judge_window(samples, 0.0, 40.0, LIMITS) == []
-    reasons = runner.judge_run(samples, span, LIMITS)
-    assert len(reasons) == 1 and reasons[0].startswith("prefill:") and "averaged 59.0%" in reasons[0]
+def test_a_run_needs_every_window_quiet_no_spike_and_full_coverage():
     quiet = [_s(float(k), 40) for k in range(1, 41)]
-    assert runner.judge_run(quiet, span, LIMITS) == []
+    assert runner.judge_run(quiet, SPAN, LIMITS) == []
+    # A spike before the measured span does not count; one inside it does.
+    assert runner.judge_run([_s(-2.0, 90)] + quiet, SPAN, LIMITS) == []
+    spiky = quiet[:20] + [_s(21.0, 90, ["mds_stores"])] + quiet[21:]
+    reasons = runner.judge_run(spiky, SPAN, LIMITS)
+    assert len(reasons) == 1 and "spike" in reasons[0] and "mds_stores" in reasons[0]
+    # A monitor that died half-way leaves the rest unsampled.
+    reasons = runner.judge_run(quiet[:20], SPAN, LIMITS)
+    assert any("unsampled" in r for r in reasons) and any(r.startswith("idle_post:") for r in reasons)
+
+
+def test_a_rise_in_the_prefill_window_alone_drops_the_run():
+    # 40 s at 40% whose 5 s prefill sits at 59% (drift limit 55): the whole
+    # run averages 42.4%, but the prefill window has drifted.
+    samples = [_s(float(k), 59 if 4 < k <= 9 else 40) for k in range(1, 41)]
+    reasons = runner.judge_run(samples, SPAN, LIMITS)
+    assert len(reasons) == 1 and reasons[0].startswith("prefill:") and "averaged 59.0%" in reasons[0]
 
 
 # ── one run, end to end with fakes ──────────────────────────────────────────
@@ -353,12 +335,12 @@ def test_a_failed_monitor_drops_the_run(monkeypatch, tmp_path):
     assert not rec.kept and "monitor failed" in rec.error
 
 
-def test_calibration_refuses_a_state_change_or_an_unsteady_baseline(monkeypatch):
+def test_calibration_refuses_a_state_change_or_a_busy_baseline(monkeypatch):
     monkeypatch.setattr(runner, "GATE_TIMEOUT_S", -1)
-    totals = iter([10.0, 50.0] * 30)
+    totals = iter([2.0] * 54 + [90.0] * 6)
     monkeypatch.setattr(runner, "background_cpu", lambda: _s(1.0, next(totals)))
     monkeypatch.setattr(runner, "machine_state", lambda: STATE)
-    with pytest.raises(SystemExit, match="unsteady"):
+    with pytest.raises(SystemExit, match="not idle"):
         runner.calibrate()
     polls = iter([STATE] * 30 + [STATE | {"display_on": True}] * 31)
     monkeypatch.setattr(runner, "background_cpu", lambda: _s(1.0, 12.0))
@@ -367,7 +349,7 @@ def test_calibration_refuses_a_state_change_or_an_unsteady_baseline(monkeypatch)
         runner.calibrate()
     monkeypatch.setattr(runner, "machine_state", lambda: STATE)
     cal = runner.calibrate()
-    assert cal["state"] == STATE and cal["limits"]["median"] == 12.0
+    assert cal["state"] == STATE and cal["limits"]["mean"] == 12.0
 
 
 def test_the_gate_checks_the_machine_state(monkeypatch):
