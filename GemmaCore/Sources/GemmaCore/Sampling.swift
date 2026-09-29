@@ -87,6 +87,7 @@ public enum Sampling {
         uniform: Float
     ) -> Int32 {
         scratch.withLock { s in
+            // Greedy deliberately takes the raw logits' argmax: the softcap is monotonic and only ties values for |raw| > ~300 (measured max 47).
             if temperature <= 0 { return s.argmax(logits) }
             s.nucleus(logits, temperature: temperature, topP: topP)
             var accum: Float = 0
