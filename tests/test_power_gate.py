@@ -331,3 +331,12 @@ def test_same_named_packages_get_distinct_ids_and_sample_files(monkeypatch, tmp_
                          context_length=c.context_length, repetition=0) for c in configs])
     assert [r["config_id"] for r in rows] == ids
     assert json.loads(Path(sorted(files)[0]).read_text())["samples"]
+
+
+def test_the_cli_refuses_a_missing_package_before_measuring(monkeypatch, tmp_path):
+    from benchmarks import cli
+    monkeypatch.setattr(cli, "check_power_available", lambda: pytest.fail("got past the check"))
+    monkeypatch.setattr("sys.argv", ["gemma-bench", "--models", str(tmp_path / "none.mlpackage")])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 2

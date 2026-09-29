@@ -42,11 +42,15 @@ def main() -> None:
         p.error(f"unknown compute units {bad}")
     if args.runs < 3:
         p.error("--runs must be at least 3")
+    models = [Path(m).resolve() for m in _csv(args.models)]
+    missing = [str(m) for m in models if not m.exists()]
+    if missing:
+        p.error(f"no such model package: {', '.join(missing)}")
     if not check_power_available():
         sys.exit("powermetrics needs passwordless sudo — see benchmarks/README.md")
 
     config = BenchmarkConfig(
-        models=[str(Path(m).resolve()) for m in _csv(args.models)],
+        models=[str(m) for m in models],
         compute_units=units,
         context_lengths=[int(n) for n in _csv(args.context_lengths)],
         runs=args.runs,
