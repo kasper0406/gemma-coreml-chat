@@ -225,8 +225,9 @@ def _process_tree(root: int) -> set[int]:
 def background_cpu() -> dict:
     """One one-second sample of every process except the harness: this
     process, its descendants (the bench binary, ``powermetrics``, ``top``
-    itself) and its parent process (not the parent's other children).  Fails closed: a ``top`` or ``ps``
-    failure or unparseable output raises ``RuntimeError``."""
+    itself) and its parent process (not the parent's other children).
+    Fails closed: a ``top`` or ``ps`` failure or unparseable output raises
+    ``RuntimeError``."""
     own = _process_tree(os.getpid()) | {os.getppid()}
     proc = subprocess.Popen(
         ["top", "-l", "2", "-s", "1", "-o", "cpu", "-stats", "pid,cpu,command"],
