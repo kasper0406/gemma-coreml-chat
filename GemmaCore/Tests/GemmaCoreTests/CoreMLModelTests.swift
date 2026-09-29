@@ -74,6 +74,30 @@ final class CoreMLModelTests: XCTestCase {
         XCTAssertEqual(Self.ring(kv).filter { $0 >= 0 }, [0])
     }
 
+    /// A conversation that outgrows its cache migrates into the next size's
+    /// state and carries on exactly as one that ran at that size from the
+    /// start: the fixture's chunks fold the count of marked global-cache rows
+    /// into every step's logits, so a row lost in the copy would show.
+    func testGrowingTheCacheMigratesItsContents() async throws {
+        let model = try await Self.load()
+        let (small, large) = (model.materializedSizes[0], model.materializedSizes[1])
+        let tokens = (0..<Int32(small + 40)).map { ($0 * 5 + 1) % 8 }
+
+        let reference = try model.makeEmptyKVState(size: large)
+        var grown = try model.makeEmptyKVState(size: small)
+        for (p, token) in tokens.enumerated() {
+            if p == small {
+                XCTAssertEqual(grown.size, small)
+                grown = try await model.grownToFit(grown, needed: p + 1)
+                XCTAssertEqual(grown.size, large)
+                XCTAssertEqual(Self.ring(grown), Self.ring(reference))
+            }
+            let want = Self.floats(try model.decode(token: token, position: Int32(p), kvState: reference))
+            let got = Self.floats(try model.decode(token: token, position: Int32(p), kvState: grown))
+            if p >= small { XCTAssertEqual(got, want, "step \(p)") }
+        }
+    }
+
     /// Every conversation shares the loaded functions — the chunks of its
     /// size, and `head` across sizes — and Core ML's synchronous prediction
     /// is not safe to call concurrently on one `MLModel`. Conversations at

@@ -69,9 +69,13 @@ graph — the RoPE ``cos``/``sin`` rows, the sliding and global attention masks,
 and which cache rows a step writes — the host computes per step and passes in
 as fp16 (:func:`host_inputs` is the reference, :data:`HOST_INPUTS` the names).
 The Neural Engine has no integer or fp32 arithmetic, so those int32 range /
-compare / modulo chains and the fp32 ``sin``/``cos`` ran on the CPU, and every
-step hopped CPU↔ANE around them (17 hops per decode step, ~200 CPU ops, the
-state reads and layer 0's projections dragged along).  As inputs they cost the
+compare / modulo chains and the fp32 ``sin``/``cos`` ran on the CPU.
+MLComputePlan (cpu-and-ne, M4 Pro, macOS 27) preferred the CPU for 201 ops of
+``decode_c0_512`` — 61 the ANE does not support, 140 it does but the plan kept
+next to them: the state reads, layer 0's projections — and 142 of
+``prefill_c0_512`` (58 + 84); the head's fp32 softcap added 2 unsupported
+ones.  In graph op order the preferred device changed CPU↔ANE 17 times in
+decode (a static count of the plan, not measured runtime hops).  As inputs they cost the
 host microseconds and the graph nothing: the masks are *added* to the scores
 (the ANE ignores ``scaled_dot_product_attention``'s mask, so attention stays
 decomposed — see ``mil_passes.ct_convert_pipeline``), and the writes are
