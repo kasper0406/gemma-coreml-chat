@@ -12,8 +12,8 @@ import XCTest
 final class SamplingTests: XCTestCase {
     // MARK: - Reference
 
-    /// The sampler's semantics, spelled out: probabilities through the same
-    /// vDSP steps, a full sort by (probability desc, token id asc), the
+    /// The sampler's semantics, spelled out: the softcap and probabilities
+    /// through the same vDSP steps, a full sort by (probability desc, token id asc), the
     /// shortest prefix whose running Float sum reaches topP (the whole
     /// vocabulary if it never does), renormalized. A distribution with no
     /// finite maximum or sum is a point mass on the largest non-NaN logit.
@@ -23,14 +23,18 @@ final class SamplingTests: XCTestCase {
         let pointMass = [(id: Int32(firstLargest(logits)), prob: Float(1))]
         let n = vDSP_Length(logits.count)
         var probs = logits
-        var invTemp = 1.0 / temperature
-        vDSP_vsmul(probs, 1, &invTemp, &probs, 1, n)
+        let cap = Float(GemmaConfig.finalLogitSoftcap)
+        var invCap = 1 / cap
+        vDSP_vsmul(probs, 1, &invCap, &probs, 1, n)
+        var count32 = Int32(logits.count)
+        probs.withUnsafeMutableBufferPointer { vvtanhf($0.baseAddress!, $0.baseAddress!, &count32) }
+        var scale = cap * (1 / temperature)
+        vDSP_vsmul(probs, 1, &scale, &probs, 1, n)
         var maxVal: Float = 0
         vDSP_maxv(probs, 1, &maxVal, n)
         guard maxVal.isFinite else { return pointMass }
         var negMax = -maxVal
         vDSP_vsadd(probs, 1, &negMax, &probs, 1, n)
-        var count32 = Int32(logits.count)
         probs.withUnsafeMutableBufferPointer { vvexpf($0.baseAddress!, $0.baseAddress!, &count32) }
         var sum: Float = 0
         vDSP_sve(probs, 1, &sum, n)
@@ -256,20 +260,24 @@ final class SamplingTests: XCTestCase {
     }
 
     func testZeroAndSubnormalTailIsWalkedInIdOrder() throws {
-        // Probabilities 1, e^-80 (normal), e^-95 (subnormal) and exactly 0;
-        // topP 2 is never reached, forcing the walk through every band.
-        let levels: [Float] = [-80, -95, -150, -.infinity]
+        // Probabilities 1, e^-80 (normal), e^-95 (subnormal) and exactly 0
+        // (e^-115, e^-120); topP 2 is never reached, forcing the walk through
+        // every band. At T = 1/4 the soft-capped logits span 240 nats; each
+        // raw logit is the one the softcap takes to its level.
+        let temperature: Float = 0.25
+        let cap = Float(GemmaConfig.finalLogitSoftcap)
+        let levels: [Float] = [-80, -95, -115, -120].map { cap * atanh($0 * 0.25 / cap) }
         var logits = (0..<4000).map { levels[$0 % levels.count] }
         logits[1234] = 0
         for topP: Float in [0.9, 1.0, 2.0] {
-            try assertMatchesReference("tail", logits, fp16: false, temperature: 1.0, topP: topP)
+            try assertMatchesReference("tail", logits, fp16: false, temperature: temperature, topP: topP)
         }
-        let nucleus = Sampling.nucleus(logits: try Self.array(logits, fp16: false), temperature: 1.0, topP: 2.0)
+        let nucleus = Sampling.nucleus(logits: try Self.array(logits, fp16: false), temperature: temperature, topP: 2.0)
         XCTAssertEqual(nucleus.count, logits.count)
         XCTAssertEqual(nucleus.first?.id, 1234)
         XCTAssert(nucleus.contains { $0.prob.isSubnormal })
         let zeros = nucleus.filter { $0.prob == 0 }.map(\.id)
-        XCTAssertEqual(zeros.count, logits.filter { $0 <= -150 }.count)
+        XCTAssertEqual(zeros.count, logits.filter { $0 <= levels[2] }.count)
         XCTAssertEqual(zeros, zeros.sorted())
         XCTAssertEqual(Array(nucleus.suffix(zeros.count)).map(\.id), zeros)
     }
@@ -321,20 +329,15 @@ final class SamplingTests: XCTestCase {
         }
     }
 
-    func testNonFiniteLogitsArePointMassOnLargestLogit() throws {
+    /// A NaN logit makes the distribution degenerate: a point mass on the
+    /// largest non-NaN logit, greedy or not.
+    func testNaNLogitsArePointMassOnLargestLogit() throws {
         var rng = Rng(state: 10)
         let base = (0..<1000).map { _ in rng.normal() }
         let finiteTop = Self.firstLargest(base)
         var cases: [(String, [Float], Int)] = [
-            ("all -inf", [Float](repeating: -.infinity, count: 1000), 0),
             ("all NaN", [Float](repeating: .nan, count: 1000), 0),
         ]
-        for k in [0, 10, 500, 999] {
-            var posInf = base
-            posInf[k] = .infinity
-            posInf[(k + 7) % 1000] = .infinity
-            cases.append(("+inf at \(k)", posInf, min(k, (k + 7) % 1000)))
-        }
         for k in stride(from: 0, to: 1000, by: 37) where k != finiteTop {
             var nan = base
             nan[k] = .nan
@@ -351,6 +354,43 @@ final class SamplingTests: XCTestCase {
                 }
             }
             if temperature1Nucleus(input) != [Int32(expected)] { XCTFail("nucleus, \(name)") }
+        }
+    }
+
+    /// The softcap maps ±inf to ±cap, so infinite logits are ordinary ones:
+    /// greedy picks the first +inf, sampling ties the +inf tokens at the cap.
+    func testInfiniteLogitsAreSoftCapped() throws {
+        var rng = Rng(state: 11)
+        let base = (0..<1000).map { _ in rng.normal() }
+        for k in [0, 10, 500, 999] {
+            var logits = base
+            logits[k] = .infinity
+            logits[(k + 7) % 1000] = .infinity
+            let input = try Self.array(logits, fp16: false)
+            XCTAssertEqual(Sampling.sampleNextToken(logits: input, temperature: 0, topP: 0.9, uniform: 0.5),
+                           Int32(min(k, (k + 7) % 1000)))
+            try assertMatchesReference("+inf at \(k)", logits, fp16: false, temperature: 1.0, topP: 0.9)
+            let nucleus = Sampling.nucleus(logits: input, temperature: 1.0, topP: 0.9)
+            XCTAssertEqual(Set(nucleus.map(\.id)), [Int32(k), Int32((k + 7) % 1000)])
+        }
+        let allNegative = [Float](repeating: -.infinity, count: 1000)
+        try assertMatchesReference("all -inf", allNegative, fp16: false, temperature: 1.0, topP: 0.5)
+        XCTAssertEqual(Sampling.nucleus(logits: try Self.array(allNegative, fp16: false),
+                                        temperature: 1.0, topP: 1.0).count, 1000)
+    }
+
+    /// The probabilities are those of the soft-capped logits, in fp32: logits
+    /// 60 and 30 are 30·tanh(2) and 30·tanh(1) apart, not 30.
+    func testProbabilitiesAreThoseOfTheSoftCappedLogits() throws {
+        let logits: [Float] = [60, 30, 0, -45]
+        let capped = logits.map { 30 * tanh(Double($0) / 30) }
+        let weights = capped.map { exp($0 - capped[0]) }
+        let total = weights.reduce(0, +)
+        // topP 2 is never reached: the whole vocabulary.
+        let nucleus = Sampling.nucleus(logits: try Self.array(logits, fp16: false), temperature: 1.0, topP: 2.0)
+        XCTAssertEqual(nucleus.map(\.id), [0, 1, 2, 3])
+        for (i, entry) in nucleus.enumerated() {
+            XCTAssertEqual(Double(entry.prob), weights[i] / total, accuracy: 1e-5 * weights[i] / total)
         }
     }
 

@@ -11,7 +11,8 @@
 ///   final one normed;
 /// - `state_<N>`: declares every KV cache; only used to make the `MLState`;
 ///
-/// plus the size-independent `head` (final hidden `[1, 1, D]` → logits).
+/// plus the size-independent `head` (final hidden `[1, 1, D]` → raw logits;
+/// ``Sampling`` applies the final softcap).
 /// A `--decode-only` export has no `prefill_*` functions.
 ///
 /// **Every** KV cache is CoreML state, and Core ML shares states across the
@@ -1319,7 +1320,7 @@ public final class CoreMLModel: @unchecked Sendable {
         }
     }
 
-    /// `head`: fp16 `hidden` `[1, 1, D]` in, float `logits` out.
+    /// `head`: fp16 `hidden` `[1, 1, D]` in, raw float `logits` out.
     static func classifyHead(model: MLModel) throws -> HeadIO {
         let description = model.modelDescription
         guard let input = description.inputDescriptionsByName[Feature.hidden]?.multiArrayConstraint,

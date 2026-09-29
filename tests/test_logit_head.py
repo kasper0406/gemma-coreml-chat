@@ -62,7 +62,7 @@ def _convert_head(params, cfg):
     from gemma_chat.mil_passes.transpose_matmul_weights import transpose_matmul_weights
 
     spec = jax.ShapeDtypeStruct((1, 1, cfg.embed_dim), jnp.float16)
-    hlo = jax.jit(lambda h: logits_head(params, h, cfg)).trace(spec).lower().compiler_ir("stablehlo")
+    hlo = jax.jit(lambda h: logits_head(params, h)).trace(spec).lower().compiler_ir("stablehlo")
     prog = _hlo_to_mil_streaming(hlo, {}, weight_bits=8)
     prog = ct.convert(
         prog, source="milinternal", minimum_deployment_target=ct.target.iOS18,
@@ -104,7 +104,7 @@ def test_the_head_exports_as_int8_per_channel_slices():
         assert op.transpose_y.val
 
     hidden = (rng.standard_normal((1, 1, cfg.embed_dim)) * 2).astype(np.float16)
-    want = np.asarray(logits_head(params, jnp.asarray(hidden), cfg), np.float32)
+    want = np.asarray(logits_head(params, jnp.asarray(hidden)), np.float32)
     assert want.shape == (len(slices), cfg.num_embed // len(slices))
     want = want.reshape(-1)
     (name,) = [i.name for i in model.get_spec().description.input]

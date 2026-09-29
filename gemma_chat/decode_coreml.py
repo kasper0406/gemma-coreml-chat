@@ -710,9 +710,7 @@ def head_slices(vocab: int, dim: int) -> List[Tuple[int, int]]:
     The fewest *equal* slices of at most ``_HEAD_MAX_ROWS`` rows (a multiple
     of 16, so every core gets whole rows) whose per-core payload stays clear
     of the ANE's DMA notch.  Equal, because the head returns them as the rows
-    of one ``(slices, rows)`` array: the Neural Engine runs the softcap on
-    that, but not on one ``vocab``-long row (MLComputePlan lists only the CPU
-    for elementwise ops that wide).  For E2B's 262144 x 1536 head that is 16
+    of one ``(slices, rows)`` array.  For E2B's 262144 x 1536 head that is 16
     slices of 16384 rows, 1.5 MiB per core: 8 would be exactly 3 MiB.
     """
     for slices in range(-(-vocab // _HEAD_MAX_ROWS), vocab + 1):
@@ -724,16 +722,20 @@ def head_slices(vocab: int, dim: int) -> List[Tuple[int, int]]:
     raise ValueError(f"no equal split of a {vocab}-row head clears the ANE's DMA notch")
 
 
-def logits_head(params, hidden, cfg: Gemma4Config = E2B_CONFIG):
+def logits_head(params, hidden):
     """The tied logit head: final-normed hidden (1, 1, D) fp16 → fp16 logits
     ``(slices, rows)``, which read row-major are the ``vocab`` logits in order.
 
     Its own function in the export, shared by decode and prefill (the host
     picks the prefill row it needs).  One fp16 matmul per vocab slice
-    (:func:`head_slices`), stacked, and the softcap — all fp16, which is what
-    keeps the head on the Neural Engine (it has no fp32): an fp32 softcap put
-    the cast and the ``tanh`` on the CPU.  The capped logits lie in
-    ``(-30, 30)``, where fp16's spacing is at most 1/64.
+    (:func:`head_slices`), stacked — nothing else, so the whole head runs on
+    the Neural Engine.  The logits are *raw*: the host applies the final
+    softcap, ``cap * tanh(x / cap)``, in fp32 when it samples (GemmaCore's
+    ``Sampling``; greedy skips it, the softcap being monotone).  In the graph
+    it would have to be fp16 — the Neural Engine has no fp32, and an fp32
+    softcap put the cast and the ``tanh`` on the CPU; on the host it costs
+    ~0.2 ms per sampled token.  The raw logits are fp16 either way (the
+    matmuls' output), as they were when the softcap ran in fp32 in the graph.
 
     The export stores each slice as int8 with one scale per vocab row
     (``export._export_function(weight_bits=8)``): per-channel scales are what
@@ -746,8 +748,7 @@ def logits_head(params, hidden, cfg: Gemma4Config = E2B_CONFIG):
     logits = jnp.concatenate([
         jnp.dot(h, table[a:b].T) for a, b in head_slices(*table.shape)
     ])                                                         # (slices, rows)
-    cap = cfg.final_logit_softcap
-    return logits if cap is None else jnp.tanh(logits / cap) * cap
+    return logits
 
 
 def decode_step(params, token_embed, ple_rows, position, kv_flat, sliding_pos_ring,
@@ -776,7 +777,7 @@ def decode_step(params, token_embed, ple_rows, position, kv_flat, sliding_pos_ri
             {s: caches[s] for s in chunk.slots}, cfg,
         )
         caches.update(written)
-    logits = logits_head(params, hidden, cfg)
+    logits = logits_head(params, hidden)
     kv_new = [c for s in sorted(caches) for c in caches[s]]
     return logits, kv_new, ring
 

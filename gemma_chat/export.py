@@ -15,8 +15,8 @@ the whole package off it.  The package holds, per cache size ``N``:
 
 and, size-independent:
 
-* ``head`` — final-normed hidden ``[1, 1, D]`` → fp16 logits ``(slices, rows)``, used by decode
-  and (on the row the runtime picks) prefill.
+* ``head`` — final-normed hidden ``[1, 1, D]`` → raw fp16 logits ``(slices, rows)`` (the host
+  applies the softcap), used by decode and (on the row the runtime picks) prefill.
 
 Matmul weights are quantized with per-channel scales (blockwise ones are not
 ANE-eligible): int4 in the layer chunks, int8 in ``head``, whose vocab is
@@ -668,7 +668,7 @@ def export_phase(
             )
             # int8: int4 is too lossy for the logits (see ``logits_head``).
             _export_function(
-                lambda hidden: logits_head(params, hidden, config),
+                lambda hidden: logits_head(params, hidden),
                 head_plan, output_dir / "head.mlpackage", weight_bits=8,
             )
 

@@ -42,4 +42,8 @@ public enum GemmaConfig {
     /// RoPE base frequency and head dimension of the global layers.
     public static let globalRopeBase = 1_000_000.0
     public static let globalHeadDim = 512
+
+    /// The final logit softcap, `cap * tanh(x / cap)`. `head` returns raw
+    /// logits; ``Sampling`` applies it in fp32.
+    public static let finalLogitSoftcap = 30.0
 }

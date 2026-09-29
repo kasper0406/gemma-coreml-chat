@@ -444,12 +444,12 @@ class _Runtime:
         for start in range(offset // C * C, padded_len, C):
             hidden = self._run(decode_coreml.prefill_chunk, padded[:, start:start + C], start)
         real = n - (padded_len - C)
-        return decode_coreml.logits_head(self.params, hidden[:, real - 1:real], self.cfg).reshape(-1)
+        return decode_coreml.logits_head(self.params, hidden[:, real - 1:real]).reshape(-1)
 
     def decode(self, token, position):
         self.grow_to_fit(position + 1)
         hidden = self._run(decode_coreml.decode_chunk, token, position)
-        return decode_coreml.logits_head(self.params, hidden, self.cfg).reshape(-1)
+        return decode_coreml.logits_head(self.params, hidden).reshape(-1)
 
 
 @pytest.mark.parametrize("starts", [(0,), (0, 3, 5)])
@@ -501,8 +501,10 @@ def test_every_row_attends_exactly_its_window(monkeypatch, small_ring, starts, p
     converse(prompt + reply + turn_two, prompt + reply, reply_two)
 
     positions = sorted(got)
-    err = np.abs(np.stack([np.asarray(got[p], np.float32) for p in positions])
-                 - want[positions]).max(axis=-1)
+    # The head's logits are raw; the host soft-caps them, as the model does.
+    cap = cfg.final_logit_softcap
+    raw = np.stack([np.asarray(got[p], np.float32) for p in positions])
+    err = np.abs(cap * np.tanh(raw / cap) - want[positions]).max(axis=-1)
     assert err.max() < 0.1, f"max |logit error| at {positions}: {np.round(err, 3)}"
 
 
