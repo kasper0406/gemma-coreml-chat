@@ -354,24 +354,16 @@ def calibrate() -> dict:
                 states.append(machine_state())
             if changed := judge_state(states, state):
                 raise ValueError(changed[0])
-            totals = [s["total"] for s in samples]
-            limits = idle_limits(totals)
+            limits = idle_limits([s["total"] for s in samples])
             break
         except (ValueError, RuntimeError) as e:
             if time.monotonic() > deadline:
                 raise SystemExit(f"no usable idle calibration: {e}; leave the machine alone")
             print(f"  calibration refused: {e} — retrying in {GATE_RETRY_S}s", flush=True)
             time.sleep(GATE_RETRY_S)
-    load: dict[str, float] = {}
-    for s in samples:
-        for b in s["busy"]:
-            load[b["command"]] = load.get(b["command"], 0.0) + b["cpu"] / len(samples)
     print(f"  background CPU mean {limits['mean']:.1f}% (busiest {limits['max']:.1f}%) → "
           f"drift > {limits['drift']:.1f}%, spike > {limits['spike']:.1f}%", flush=True)
-    return {
-        "state": state, "limits": limits, "totals": totals,
-        "mean_busy": dict(sorted(load.items(), key=lambda kv: -kv[1])[:10]),
-    }
+    return {"state": state, "limits": limits, "samples": samples}
 
 
 def quiet_gate(calibration: dict) -> dict:
